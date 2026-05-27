@@ -1,0 +1,38 @@
+Source: flag-attention
+Section: python
+Priority: optional
+Maintainer: FlagOS Contributors <contact@flagos.io>
+Build-Depends: debhelper-compat (= 13),
+               dh-python,
+               python3-all,
+               python3-setuptools,
+               python3-setuptools-scm,
+               python3-wheel,
+               pybuild-plugin-pyproject
+Standards-Version: 4.6.2
+Homepage: https://github.com/flagos-ai/FlagAttention
+Vcs-Browser: https://github.com/flagos-ai/FlagAttention
+Vcs-Git: https://github.com/flagos-ai/FlagAttention.git
+Rules-Requires-Root: no
+
+Package: python3-flag-attention
+Architecture: all
+Depends: python3:any, ${misc:Depends}, python3-pytest
+# python3-pytest is a runtime Depends (not just for tests) because
+# flag_attn/__init__.py imports flag_attn.testing → testing/piecewise.py
+# which does `import pytest` at module scope. Upstream should lazy-import,
+# but for now we keep the consumer install working.
+# Triton (FlagOS-built or upstream) is NOT a hard Depends: the upstream
+# python3-triton is too old (Ubuntu noble ships 2.0; PyPI is 2.4+), and the
+# right install path for users is pip. python3-flagtree-nvidia is the only
+# distro-distributable option, so we Recommend it.
+Recommends: python3-flagtree-nvidia
+Description: FlagAttention — memory-efficient attention operators (Triton)
+ FlagAttention is a collection of memory-efficient attention operators
+ implemented in the Triton language. It targets large-language-model
+ training and inference workloads where the standard PyTorch attention
+ path is memory-bound.
+ .
+ Triton (provided here by python3-flagtree-nvidia or upstream
+ python3-triton) is required at runtime; without it the kernels
+ cannot JIT-compile.

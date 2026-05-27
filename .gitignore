@@ -51,6 +51,8 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# RPM packaging specs live under packaging/rpm/specs/ and must be tracked.
+!packaging/rpm/specs/*.spec
 
 # Installer logs
 pip-log.txt

@@ -1,0 +1,43 @@
+#!/usr/bin/make -f
+export DH_VERBOSE = 1
+export PYBUILD_NAME = flag_attn
+# NOTE: when bumping versions, update BOTH this value AND debian/changelog
+# (and packaging/rpm/specs/flag-attention.spec). The native source tarball
+# does not carry git metadata, so setuptools_scm falls back to this value.
+export SETUPTOOLS_SCM_PRETEND_VERSION ?= 0.3.0
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+# Smoke "find_spec" test: verify the built module is at the expected
+# path AND importable up to the find_spec level (i.e. its __init__.py
+# is locatable). Doesn't actually `import flag_attn` because that would
+# trigger module-level `import torch` / `import triton` etc., none of
+# which are installed in the build container — and shouldn't be, since
+# those are install-time runtime dependencies of the user, not of our
+# package builder. Catches: wrong install path, missing __init__.py,
+# .dist-info misconfig, dh_python install-target bugs.
+#
+# Note: an earlier version used `import flag_attn` followed by
+# `; exit 0`. The semicolon meant exit-0 ran unconditionally even when
+# the import raised — silent test pass. Fixed with `&&` here.
+override_dh_auto_test:
+	@echo "=== smoke find_spec test ==="
+	# Use found_dir + break (not `&& exit 0` inside the loop) so future
+	# multi-Python builds verify every interpreter rather than stopping
+	# at the first match.
+	@found_dir=""; \
+	for d in .pybuild/cpython3_*/build; do \
+	    if [ -d "$$d/flag_attn" ]; then \
+	        found_dir="$$d"; \
+	        break; \
+	    fi; \
+	done; \
+	if [ -z "$$found_dir" ]; then \
+	    echo "ERROR: could not find a built flag_attn module"; \
+	    exit 1; \
+	fi; \
+	echo "Found build dir: $$found_dir"; \
+	PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$$found_dir" python3 -c \
+	    "import importlib.util; s = importlib.util.find_spec('flag_attn'); assert s and s.origin, 'flag_attn not findable'; print('OK: flag_attn at', s.origin)"
+
