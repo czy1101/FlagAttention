@@ -52,7 +52,7 @@ def attention(q,
     if return_total_attention:
         tot_attn = torch.sum(P, dim=-2)
 
-    # Applies dropout 
+    # Applies dropout
     dropout_scaling = 1.0 / (1 - dropout_p)
     if dropout_mask is not None:
         P = P.masked_fill(~dropout_mask, 0.0)
