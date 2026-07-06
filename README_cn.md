@@ -55,6 +55,12 @@ git clone https://github.com/FlagOpen/FlagAttention && cd FlagAttention
 pip install -e .
 ```
 
+如果当前环境中尚未提供 Triton，可安装 Triton extra：
+
+```sh
+pip install -e ".[triton]"
+```
+
 ### 构建并安装
 
 遵循现代 python 打包惯例，FlagAttention 通过 [`pyproject.toml`](https://pip.pypa.io/en/stable/reference/build-system/pyproject-toml/) 文件来配置，因此没有 `setup.py`. 推荐使用 python 的 `build` 包来构建发行版，包括源码发行版(sdist) 和二进制发行版(whl).

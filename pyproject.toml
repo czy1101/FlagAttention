@@ -14,13 +14,12 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 
-# Not specifing triton version here because torch has its own required triton version
-# FlagAttention needs a recent version of triton (triton nightly or 2.2.0) to run.
-dependencies = [
-    "triton>=2.2.0"
-]
+dependencies = []
 
 [project.optional-dependencies]
+triton = [
+    "triton>=2.2.0",
+]
 test = [
     "pytest>=7.1.0",
 ]

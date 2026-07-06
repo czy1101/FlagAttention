@@ -59,6 +59,12 @@ git clone https://github.com/FlagOpen/FlagAttention && cd FlagAttention
 pip install -e .
 ```
 
+If Triton is not already available in the environment, install the Triton extra:
+
+```sh
+pip install -e ".[triton]"
+```
+
 ### Build a Distribution & Install
 
 Following modern Python packaging convention(PEP-517), FlagAttention is configured by [`pyproject.toml`](https://pip.pypa.io/en/stable/reference/build-system/pyproject-toml/), and no `setup.py` is provided. To build a distribution, either a source distribution or a binary distribution, python package `build` is recommended.
