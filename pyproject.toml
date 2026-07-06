@@ -6,7 +6,7 @@ authors = [
 ]
 description = "A collection of memory efficient attention operators implemented in triton language."
 readme = {file= "README.md", content-type="text/markdown"}
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 license = {text = "LICENSE.txt"}
 classifiers = [
     "Development Status :: 3 - Alpha",

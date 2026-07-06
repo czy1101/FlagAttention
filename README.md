@@ -6,17 +6,21 @@
 
 [中文版](./README_cn.md)
 
-FlagAttention is a project for memory-efficient attention operators implemented in the [Triton language](https://github.com/openai/triton). Motivated by the need for non-standard attention operators in language modeling, it starts as an extension of multi-head attention.
+FlagAttention is a project for memory-efficient attention operators implemented in the [Triton language](https://github.com/triton-lang/triton). Motivated by the need for non-standard attention operators in language modeling, it starts as an extension of multi-head attention.
 
 It saves memory footprint and traffic like [FlashAttention](https://arxiv.org/abs/2205.14135) and [FlashAttention v2](https://tridao.me/publications/flash2/flash2.pdf). Implemented in the Triton language, it is easier to understand and modify. The original implementation of FlashAttention in CUDA([flash-attention](https://github.com/Dao-AILab/flash-attention)) provides a good example of how to design an algorithm that takes different levels of memory into account. By tiling and re-computation, FlashAttention avoids materializing the attention scores, whose capacity is proportional to the square of the sequence length. However, custom transformation to the attention scores is not possible when using FlashAttention, unless it is supported by FlashAttention out-of-the-box.
 While extending FlashAttention requires proficiency in CUDA programming, FlagAttention implemented in the Triton language is easier to modify.
 
-FlagAttention now offers two operators.
+For standard attention workloads, modern alternatives such as [FlashAttention-3](https://arxiv.org/abs/2407.08608), PyTorch `scaled_dot_product_attention`, and [FlexAttention](https://arxiv.org/abs/2412.05496) are also worth considering. FlagAttention remains useful when the attention score computation, KV-cache layout, or inference path needs project-specific customization.
 
-1. **flash_attention**: FlashAttention implemented in the Triton language.
-2. **piecewise_attention**. Currently employed for NLPE(Non-Linearized position embedding) in both training and inference of the [Aquila-2-34B](https://github.com/FlagAI-Open/Aquila2) model.
+FlagAttention now offers several operators.
 
-When further customization is required, FlagAttention servers as an example.
+1. **flash_attention**: FlashAttention v2-style attention implemented in the Triton language, with support for MQA/GQA, dropout, and auxiliary outputs.
+2. **piecewise_attention**: An extension used for NLPE(Non-Linearized position embedding) in both training and inference of the [Aquila-2-34B](https://github.com/FlagAI-Open/Aquila2) model.
+3. **flash_attention_split_kv**: A split-KV flash decoding operator for long KV sequences and grouped-query layouts.
+4. **paged_attention**: A paged KV-cache attention operator for inference.
+
+When further customization is required, FlagAttention serves as an example.
 
 ## Changelog
 
@@ -33,15 +37,23 @@ Optimization of operators.
 
 ## Requirements
 
-FlagAttention requires Pytorch and Triton. To use the new features of Triton, a nightly release is recommended.
+FlagAttention requires Python 3.10+, PyTorch, and a Triton-compatible runtime. The package does not install Triton by default, so environments that already provide Triton APIs, for example through Triton itself or a compatible fork, can install FlagAttention without pulling another Triton package.
 
+For a standard Triton installation, use either the optional extra:
 
 ```sh
-# install a nightly release of Triton
-pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly
+pip install -e ".[triton]"
 ```
 
-FlagAttention requires Ampere Nvidia GPUs(e.g. A100, RTX-3090, ...) and CUDA Toolkit 11.6 or above. Other GPUs may work but have not been tested yet.
+or install Triton directly:
+
+```sh
+pip install triton
+```
+
+Triton nightly builds are only recommended when you need a specific unreleased Triton feature or bug fix.
+
+FlagAttention requires a CUDA-capable GPU supported by PyTorch and Triton. It has been tested on Ampere Nvidia GPUs(e.g. A100, RTX-3090, ...). Other GPUs may work but have not been tested yet. When installing PyTorch, choose a build that matches your driver and CUDA runtime; PyTorch pip wheels commonly bundle the CUDA runtime and do not require a full local CUDA Toolkit installation for normal use.
 
 ## Installation
 
@@ -115,7 +127,7 @@ Benchmarks are included to quantify the achieved `TFLOP/s`, which serves as a me
 The benchmarking process involves comparing the Triton implementations with counterparts in Pytorch. When the input size is large, resulting in memory exhaustion in the Pytorch implementation, the FLOP/s is considered zero.
 
 ```sh
-cd benchmarks/
+cd benchmark/
 python flash_benchmark.py
 python piecewise_benchmark.py
 ```

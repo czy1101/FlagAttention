@@ -7,14 +7,18 @@
 [English](./README.md)
 
 
-FlagAttention 是一个用 Triton 语言(https://github.com/openai/triton)实现的内存高效 Attention 算子项目。FlagAttention 由语言模型中对非标准 attention 算子的需求驱动，对 multihead attention 算子进行扩展。
+FlagAttention 是一个用 Triton 语言(https://github.com/triton-lang/triton)实现的内存高效 Attention 算子项目。FlagAttention 由语言模型中对非标准 attention 算子的需求驱动，对 multihead attention 算子进行扩展。
 
 FlagAttention 和 [FlashAttention](https://arxiv.org/abs/2205.14135) 和 [FlashAttention v2](https://tridao.me/publications/flash2/flash2.pdf) 一样内存高效，可以节省内存占用和访存。因为使用 Triton 语言实现，它更容易理解和修改。原版的 CUDA 实现的 [FlashAttention](https://github.com/Dao-AILab/flash-attention) 提供了如何设计算法以考虑不同内存层级的良好范例。通过分块和重计算的技巧， FlashAttention 避免了实体化 attention score 这个容量和文本长度的平方成正比的中间变量。但是使用 FlashAttention 的时候，无法对 attention score 进行自定义的变换，除非这个变换本身就被 FlashAttention 支持。对 FlashAttention 算子进行扩展需要熟练的 CUDA 编程技巧， 但用 Triton 语言实现的 FlagAttention 则更好修改。
 
-FlagAttention 目前提供了两个算子。
+对于标准 attention 场景，也可以考虑 [FlashAttention-3](https://arxiv.org/abs/2407.08608)、PyTorch `scaled_dot_product_attention` 和 [FlexAttention](https://arxiv.org/abs/2412.05496) 等较新的方案。FlagAttention 更适合 attention score 计算、KV cache 布局或推理路径需要项目内定制的场景。
 
-1. flash_attention. 用 Triton 语言实现的 FlashAttention.
+FlagAttention 目前提供了多个算子。
+
+1. flash_attention. 用 Triton 语言实现的 FlashAttention v2 风格 attention，支持 MQA/GQA、dropout 和辅助输出。
 2. piecewise_attention. 这个算子用于实现 NLPE(non linear position embedding)，目前用于 [Aquila-2-34B](https://github.com/FlagAI-Open/Aquila2) 模型的训练和推理。
+3. flash_attention_split_kv. 面向长 KV 序列和 grouped-query 布局的 split-KV flash decoding 算子。
+4. paged_attention. 面向推理场景的 paged KV-cache attention 算子。
 
 如果需要更多的定制，FlagAttention 中的算子实现也可以作为参考。
 
@@ -32,12 +36,23 @@ FlagAttention 目前提供了两个算子。
 
 ## 依赖
 
-FlagAttention 依赖 Torch 和 Triton。 为了使用 Triton 的新功能，建议使用 nightly 版。
+FlagAttention 依赖 Python 3.10+、PyTorch 和兼容 Triton API 的运行环境。该包默认不会安装 Triton，因此如果环境中已经通过 Triton 本身或兼容 fork 提供了 Triton API，可以直接安装 FlagAttention，而不会额外拉取 Triton 包。
+
+标准 Triton 安装可以使用 optional extra：
 
 ```sh
-pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly
+pip install -e ".[triton]"
 ```
-FlagAttention 需要 Ampere 架构的 Nvidia GPU (e.g. A100, RTX-3090, ...) 以及 CUDA Toolkit 11.6 及以上的版本运行。其他的 GPU 可能也能运行，但暂未测试。
+
+也可以直接安装 Triton：
+
+```sh
+pip install triton
+```
+
+只有在需要特定的未发布 Triton 功能或 bug fix 时，才建议使用 Triton nightly 版本。
+
+FlagAttention 需要 PyTorch 和 Triton 支持的 CUDA GPU。项目已在 Ampere 架构的 Nvidia GPU (e.g. A100, RTX-3090, ...) 上测试。其他 GPU 可能也能运行，但暂未测试。安装 PyTorch 时，应选择与驱动和 CUDA runtime 匹配的 PyTorch build；常见的 PyTorch pip wheel 会自带 CUDA runtime，普通使用不一定需要本机安装完整 CUDA Toolkit。
 
 ## 安装
 
@@ -111,7 +126,7 @@ pytest .
 我们对比了算子的 Triton 实现和 PyTorch 实现的性能。当输入规模较大时，PyTorch 参考实现会遇到内存不足的问题，这种情况下，FLOPs/s 记为 0.
 
 ```sh
-cd benchmarks/
+cd benchmark/
 python flash_benchmark.py
 python piecewise_benchmark.py
 ```
