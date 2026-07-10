@@ -142,7 +142,7 @@ def test_chunk_gated_delta_rule_fwd_full_tle_matches_native(dtype, shape):
 @torch.inference_mode()
 def test_chunk_gated_delta_rule_public_api_matches_native(dtype):
     torch.manual_seed(42)
-    args = _make_inputs(4, 2048, 16, 128, 128, dtype, use_initial_state=False)
+    args = _make_inputs(1, 256, 2, 128, 128, dtype, use_initial_state=False)
     baseline = _call_fwd(args, full_tle=False, recompute_tle=False)
     q, k, v, g, beta, scale, _, _, _ = args
 

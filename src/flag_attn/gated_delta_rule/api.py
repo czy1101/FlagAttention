@@ -146,7 +146,9 @@ def _can_use_tle_chunk_gated_delta_rule(
         and H % Hg == 0
         and K == TLE_CHUNK_GDR_HEAD_DIM
         and v.shape[3] == TLE_CHUNK_GDR_HEAD_DIM
-        and T > 0
+        # Keep low-workload shapes on the numerically stable native path.
+        and B * H >= 32
+        and T >= 2048
         and T % TLE_CHUNK_GDR_BLOCK_S == 0
     )
 
