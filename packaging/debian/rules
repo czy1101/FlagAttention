@@ -52,8 +52,13 @@ override_dh_auto_test:
 	for d in .pybuild/cpython3_*/build; do \
 	    if [ -d "$$d/flag_attn" ]; then found_dir="$$d"; break; fi; \
 	done; \
+	src_inits="$$(cd src && find flag_attn -name __init__.py)"; \
+	if [ -z "$$src_inits" ]; then \
+	    echo "ERROR: no __init__.py found under src/flag_attn; check would be vacuous"; \
+	    exit 1; \
+	fi; \
 	missing=""; \
-	for f in $$(cd src && find flag_attn -name __init__.py); do \
+	for f in $$src_inits; do \
 	    if [ ! -f "$$found_dir/$$f" ]; then missing="$$missing $$f"; fi; \
 	done; \
 	if [ -n "$$missing" ]; then \
