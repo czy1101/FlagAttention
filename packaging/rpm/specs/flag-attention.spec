@@ -64,7 +64,7 @@ export SETUPTOOLS_SCM_PRETEND_VERSION=%{version}
 %pyproject_save_files flag_attn
 %else
 %{__python3} -m pip install --no-deps --no-index --no-warn-script-location \
-    --root %{buildroot} dist/*.whl
+    --root %{buildroot} --prefix /usr dist/*.whl
 %endif
 
 %check
