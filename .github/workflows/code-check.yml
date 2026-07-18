@@ -52,7 +52,7 @@ jobs:
   build:
     needs: detect-changes
     if: needs.detect-changes.outputs.run_tests == 'true'
-    runs-on: self-hosted
+    runs-on: h20
     steps:
     - uses: actions/checkout@v4
       with:
