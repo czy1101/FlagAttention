@@ -11,6 +11,7 @@ from flag_attn.gated_delta_rule.compat import has_triton_tle
 ASSERT_RATIO = 0.01
 RECOMPUTE_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_RECOMPUTE_TLE"
 FULL_TLE_ENV = "FLAG_ATTN_CHUNK_GATED_DELTA_RULE_TLE"
+TWO_KERNEL_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_TWO_KERNEL_TLE"
 
 GDN_RECOMPUTE_TEST_SHAPES = [
     (2, 16384, 16, 128, 128),
@@ -26,17 +27,27 @@ GDN_FUSED_FWD_TEST_SHAPES = [
     (4, 4096, 64, 128, 128),
 ]
 
+GDN_TWO_KERNEL_TEST_SHAPES = [
+    (4, 2048, 16, 128, 128),
+    (4, 4096, 64, 128, 128),
+    (8, 2048, 32, 256, 256),
+]
+
 
 def _cuda_tle_available() -> bool:
     return torch.cuda.is_available() and has_triton_tle(3, 6, 0)
 
 
 @contextmanager
-def _set_gdn_tle(*, full_tle: bool, recompute_tle: bool):
+def _set_gdn_tle(
+    *, full_tle: bool, recompute_tle: bool, two_kernel_tle: bool
+):
     old_full = os.environ.get(FULL_TLE_ENV)
     old_recompute = os.environ.get(RECOMPUTE_TLE_ENV)
+    old_two_kernel = os.environ.get(TWO_KERNEL_TLE_ENV)
     os.environ[FULL_TLE_ENV] = "1" if full_tle else "0"
     os.environ[RECOMPUTE_TLE_ENV] = "1" if recompute_tle else "0"
+    os.environ[TWO_KERNEL_TLE_ENV] = "1" if two_kernel_tle else "0"
     try:
         yield
     finally:
@@ -48,6 +59,10 @@ def _set_gdn_tle(*, full_tle: bool, recompute_tle: bool):
             os.environ.pop(RECOMPUTE_TLE_ENV, None)
         else:
             os.environ[RECOMPUTE_TLE_ENV] = old_recompute
+        if old_two_kernel is None:
+            os.environ.pop(TWO_KERNEL_TLE_ENV, None)
+        else:
+            os.environ[TWO_KERNEL_TLE_ENV] = old_two_kernel
 
 
 def _make_inputs(
@@ -74,8 +89,18 @@ def _make_inputs(
     return q, k, v, g, beta, K**-0.5, initial_state, True, None
 
 
-def _call_fwd(args, *, full_tle: bool, recompute_tle: bool):
-    with _set_gdn_tle(full_tle=full_tle, recompute_tle=recompute_tle):
+def _call_fwd(
+    args,
+    *,
+    full_tle: bool,
+    recompute_tle: bool,
+    two_kernel_tle: bool = False,
+):
+    with _set_gdn_tle(
+        full_tle=full_tle,
+        recompute_tle=recompute_tle,
+        two_kernel_tle=two_kernel_tle,
+    ):
         return chunk_gated_delta_rule_fwd(*args)
 
 
@@ -146,7 +171,11 @@ def test_chunk_gated_delta_rule_public_api_matches_native(dtype):
     baseline = _call_fwd(args, full_tle=False, recompute_tle=False)
     q, k, v, g, beta, scale, _, _, _ = args
 
-    with _set_gdn_tle(full_tle=True, recompute_tle=True):
+    with _set_gdn_tle(
+        full_tle=True,
+        recompute_tle=True,
+        two_kernel_tle=False,
+    ):
         o, final_state = chunk_gated_delta_rule(
             q,
             k,
@@ -160,3 +189,27 @@ def test_chunk_gated_delta_rule_public_api_matches_native(dtype):
 
     _assert_close("o", o, baseline[1])
     _assert_close("final_state", final_state, baseline[3])
+
+
+@pytest.mark.skipif(
+    not _cuda_tle_available(), reason="GDN two-kernel tests require CUDA/TLE"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", GDN_TWO_KERNEL_TEST_SHAPES)
+@torch.inference_mode()
+def test_chunk_gated_delta_rule_fwd_two_kernel_matches_native(dtype, shape):
+    torch.manual_seed(42)
+    args = _make_inputs(*shape, dtype=dtype, use_initial_state=False)
+
+    baseline = _call_fwd(args, full_tle=False, recompute_tle=False)
+    actual = _call_fwd(
+        args,
+        full_tle=False,
+        recompute_tle=False,
+        two_kernel_tle=True,
+    )
+
+    _assert_close("g", actual[0], baseline[0])
+    _assert_close("o", actual[1], baseline[1])
+    _assert_close("A", actual[2], baseline[2])
+    _assert_close("final_state", actual[3], baseline[3])
