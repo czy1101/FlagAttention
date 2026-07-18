@@ -5,6 +5,7 @@
 # ruff: noqa: E501
 
 import logging
+import os
 
 import torch
 
@@ -28,6 +29,7 @@ from .wy_fast import (
 )
 
 logger = logging.getLogger(__name__)
+HYBRID_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_HYBRID_TLE"
 
 
 def _chunk_size_for_sequence(T: int, is_varlen: bool) -> int:
@@ -82,6 +84,65 @@ def chunk_gated_delta_rule_fwd(
     chunk_size = _chunk_size_for_sequence(q.shape[1], cu_seqlens is not None)
     maybe_set_tle_recompute_allocator(q.device, cu_seqlens)
 
+    if initial_state is None and output_final_state:
+        try:
+            from .api import (
+                _can_use_tle_chunk_gated_delta_rule,
+                _tle_chunk_gated_delta_rule_fwd,
+            )
+
+            if _can_use_tle_chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                beta=beta,
+                g=g,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+            ):
+                hybrid_enabled = os.environ.get(HYBRID_TLE_ENV, "1").lower() not in {
+                    "0",
+                    "false",
+                    "off",
+                    "no",
+                }
+                preprocessed = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
+                    g=g,
+                    k=k,
+                    beta=beta,
+                    cu_seqlens=cu_seqlens,
+                    chunk_size=chunk_size,
+                    output_dtype=k.dtype,
+                    use_g_in_kkt=False,
+                    output_gated_from_ungated=hybrid_enabled,
+                )
+                if hybrid_enabled:
+                    g_tle, A_0, A_g = preprocessed
+                else:
+                    g_tle, A_0 = preprocessed
+                o, final_state = _tle_chunk_gated_delta_rule_fwd(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g_cumsum=g_tle,
+                    beta=beta,
+                    a=A_0,
+                    scale=float(scale),
+                )
+                if not hybrid_enabled:
+                    _, A_g = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
+                        g=g,
+                        k=k,
+                        beta=beta,
+                        cu_seqlens=cu_seqlens,
+                        chunk_size=chunk_size,
+                        output_dtype=k.dtype,
+                    )
+                return g_tle, o, A_g, final_state, None, None, None
+        except ImportError:
+            pass
+
     if can_use_two_kernel_fused_forward(
         q=q,
         k=k,
@@ -110,53 +171,6 @@ def chunk_gated_delta_rule_fwd(
             scale=float(scale),
         )
         return g, o, A, final_state, None, None, None
-
-    if initial_state is None and output_final_state:
-        try:
-            from .api import (
-                _can_use_tle_chunk_gated_delta_rule,
-                _tle_chunk_gated_delta_rule_fwd,
-            )
-
-            if _can_use_tle_chunk_gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                beta=beta,
-                g=g,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                cu_seqlens=cu_seqlens,
-            ):
-                g_tle, A_tle = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
-                    g=g,
-                    k=k,
-                    beta=beta,
-                    cu_seqlens=cu_seqlens,
-                    chunk_size=chunk_size,
-                    output_dtype=k.dtype,
-                    use_g_in_kkt=False,
-                )
-                o, final_state = _tle_chunk_gated_delta_rule_fwd(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g_cumsum=g_tle,
-                    beta=beta,
-                    a=A_tle,
-                    scale=float(scale),
-                )
-                g, A = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
-                    g=g,
-                    k=k,
-                    beta=beta,
-                    cu_seqlens=cu_seqlens,
-                    chunk_size=chunk_size,
-                    output_dtype=k.dtype,
-                )
-                return g, o, A, final_state, None, None, None
-        except ImportError:
-            pass
 
     g, A = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         g=g,

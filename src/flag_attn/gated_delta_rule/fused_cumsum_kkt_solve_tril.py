@@ -25,6 +25,43 @@ if FLA_TRIL_PRECISION not in ALLOWED_TRIL_PRECISIONS:
     )
 
 
+@triton.jit
+def _store_gated_inverse_block(
+    A_g_inv_base,
+    g_base,
+    block,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    ROW: tl.constexpr,
+    COL: tl.constexpr,
+):
+    offsets = tl.arange(0, 16)
+    remaining = T - tl.program_id(0) * BT
+    rows = ROW + offsets
+    cols = COL + offsets
+    g_rows = tl.load(g_base + rows * H, mask=rows < remaining, other=0.0).to(
+        tl.float32
+    )
+    g_cols = tl.load(g_base + cols * H, mask=cols < remaining, other=0.0).to(
+        tl.float32
+    )
+    gated = block * exp(g_rows[:, None] - g_cols[None, :])
+    output = tl.make_block_ptr(
+        A_g_inv_base,
+        (T, BT),
+        (H * BT, 1),
+        (tl.program_id(0) * BT + ROW, COL),
+        (16, 16),
+        (1, 0),
+    )
+    tl.store(
+        output,
+        gated.to(output.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+
+
 @libentry()
 @triton.heuristics(
     {
@@ -49,6 +86,7 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
     beta,
     A,
     A_inv,
+    A_g_inv,
     cu_seqlens,
     chunk_indices,
     T,
@@ -59,6 +97,7 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_G: tl.constexpr,
+    OUTPUT_GATED: tl.constexpr,
     USE_TMA: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
@@ -129,6 +168,7 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
     m_I = o_i[:, None] == o_i[None, :]
     A_base = A + (bos * H + i_h) * BT
     A_inv_base = A_inv + (bos * H + i_h) * BT
+    A_g_inv_base = A_g_inv + (bos * H + i_h) * BT
 
     if not USE_TMA:
         p_A_11 = tl.make_block_ptr(
@@ -417,6 +457,19 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril_kernel(
             b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne"),
         )
 
+    if OUTPUT_GATED:
+        g_base = g_out + (bos + i_t * BT) * H + i_h
+        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_11, T, H, BT, 0, 0)
+        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_22, T, H, BT, 16, 16)
+        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_33, T, H, BT, 32, 32)
+        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_44, T, H, BT, 48, 48)
+        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_21, T, H, BT, 16, 0)
+        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_31, T, H, BT, 32, 0)
+        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_32, T, H, BT, 32, 16)
+        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_41, T, H, BT, 48, 0)
+        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_42, T, H, BT, 48, 16)
+        _store_gated_inverse_block(A_g_inv_base, g_base, b_Ai_43, T, H, BT, 48, 32)
+
 
 def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
     g: torch.Tensor,
@@ -427,13 +480,18 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
     output_dtype: torch.dtype | None = None,
     *,
     use_g_in_kkt: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    output_gated_from_ungated: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor
+]:
     """Fused kernel: cumsum(g) + KKT(L) + solve_tril(L -> inv). Returns (g_out, A_inv).
     w_u stays a separate kernel (e.g. recompute_w_u_fwd) for HGMMA."""
     B, T, Hg, K = k.shape
     H = beta.shape[-1]
     BT = chunk_size
     output_dtype = output_dtype or k.dtype
+    if use_g_in_kkt and output_gated_from_ungated:
+        raise ValueError("dual A output requires use_g_in_kkt=False")
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
@@ -442,6 +500,7 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
     g_out = torch.empty_like(g)
     A = torch.empty(B, T, H, BT, device=g.device, dtype=torch.float32)
     A_inv = torch.zeros(B, T, H, BT, device=g.device, dtype=output_dtype)
+    A_g_inv = torch.zeros_like(A_inv) if output_gated_from_ungated else A_inv
 
     def grid(meta):
         # Varlen kernels derive the sequence from chunk_indices. The batch id
@@ -455,6 +514,7 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         beta=beta,
         A=A,
         A_inv=A_inv,
+        A_g_inv=A_g_inv,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=T,
@@ -464,7 +524,10 @@ def chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
         BT=BT,
         IS_VARLEN=cu_seqlens is not None,
         USE_G=use_g_in_kkt,
+        OUTPUT_GATED=output_gated_from_ungated,
         USE_TMA=is_tma_supported and BT == 64,
         DOT_PRECISION=FLA_TRIL_PRECISION,
     )
+    if output_gated_from_ungated:
+        return g_out, A_inv, A_g_inv
     return g_out, A_inv

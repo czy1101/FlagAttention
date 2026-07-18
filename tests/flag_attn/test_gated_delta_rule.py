@@ -12,6 +12,7 @@ ASSERT_RATIO = 0.01
 RECOMPUTE_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_RECOMPUTE_TLE"
 FULL_TLE_ENV = "FLAG_ATTN_CHUNK_GATED_DELTA_RULE_TLE"
 TWO_KERNEL_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_TWO_KERNEL_TLE"
+HYBRID_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_HYBRID_TLE"
 
 GDN_RECOMPUTE_TEST_SHAPES = [
     (2, 16384, 16, 128, 128),
@@ -40,14 +41,20 @@ def _cuda_tle_available() -> bool:
 
 @contextmanager
 def _set_gdn_tle(
-    *, full_tle: bool, recompute_tle: bool, two_kernel_tle: bool
+    *,
+    full_tle: bool,
+    recompute_tle: bool,
+    two_kernel_tle: bool,
+    hybrid_tle: bool = False,
 ):
     old_full = os.environ.get(FULL_TLE_ENV)
     old_recompute = os.environ.get(RECOMPUTE_TLE_ENV)
     old_two_kernel = os.environ.get(TWO_KERNEL_TLE_ENV)
+    old_hybrid = os.environ.get(HYBRID_TLE_ENV)
     os.environ[FULL_TLE_ENV] = "1" if full_tle else "0"
     os.environ[RECOMPUTE_TLE_ENV] = "1" if recompute_tle else "0"
     os.environ[TWO_KERNEL_TLE_ENV] = "1" if two_kernel_tle else "0"
+    os.environ[HYBRID_TLE_ENV] = "1" if hybrid_tle else "0"
     try:
         yield
     finally:
@@ -63,6 +70,10 @@ def _set_gdn_tle(
             os.environ.pop(TWO_KERNEL_TLE_ENV, None)
         else:
             os.environ[TWO_KERNEL_TLE_ENV] = old_two_kernel
+        if old_hybrid is None:
+            os.environ.pop(HYBRID_TLE_ENV, None)
+        else:
+            os.environ[HYBRID_TLE_ENV] = old_hybrid
 
 
 def _make_inputs(
@@ -95,11 +106,13 @@ def _call_fwd(
     full_tle: bool,
     recompute_tle: bool,
     two_kernel_tle: bool = False,
+    hybrid_tle: bool = False,
 ):
     with _set_gdn_tle(
         full_tle=full_tle,
         recompute_tle=recompute_tle,
         two_kernel_tle=two_kernel_tle,
+        hybrid_tle=hybrid_tle,
     ):
         return chunk_gated_delta_rule_fwd(*args)
 
@@ -213,6 +226,35 @@ def test_chunk_gated_delta_rule_fwd_two_kernel_matches_native(dtype, shape):
     _assert_close("o", actual[1], baseline[1])
     _assert_close("A", actual[2], baseline[2])
     _assert_close("final_state", actual[3], baseline[3])
+
+
+@pytest.mark.skipif(
+    not _cuda_tle_available(), reason="GDN hybrid tests require CUDA/TLE"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_chunk_gated_delta_rule_fwd_hybrid_matches_two_kernel(dtype):
+    torch.manual_seed(42)
+    args = _make_inputs(4, 2048, 16, 128, 128, dtype, use_initial_state=False)
+
+    expected = _call_fwd(
+        args,
+        full_tle=False,
+        recompute_tle=False,
+        two_kernel_tle=True,
+    )
+    actual = _call_fwd(
+        args,
+        full_tle=True,
+        recompute_tle=False,
+        two_kernel_tle=True,
+        hybrid_tle=True,
+    )
+
+    _assert_close("g", actual[0], expected[0])
+    _assert_close("o", actual[1], expected[1])
+    _assert_close("A", actual[2], expected[2])
+    _assert_close("final_state", actual[3], expected[3])
 
 
 @pytest.mark.skipif(
