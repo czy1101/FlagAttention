@@ -70,35 +70,54 @@ jobs:
     #     if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
     #     pip install .
 
-    - name: Activate Python environment
+    - name: Select Python environment
       shell: bash
       run: |
         set -euo pipefail
 
-        venv=""
         shopt -s nullglob
-        for candidate in \
-          /home/flagattn_ci/.virtualenvs/release \
-          "$HOME/.virtualenvs/release" \
-          /home/*/.virtualenvs/release; do
-          if [ -x "$candidate/bin/python" ]; then
-            venv="$candidate"
+        candidates=(
+          /home/flagattn_ci/.virtualenvs/release/bin/python
+          "$HOME"/.virtualenvs/*/bin/python
+          /home/*/.virtualenvs/*/bin/python
+          /home/*/.venvs/*/bin/python
+          /home/*/miniconda*/bin/python
+          /home/*/miniconda*/envs/*/bin/python
+          /home/*/anaconda*/bin/python
+          /home/*/anaconda*/envs/*/bin/python
+          /opt/conda/bin/python
+          /opt/conda/envs/*/bin/python
+        )
+        candidates+=("$(command -v python3 || true)" "$(command -v python || true)")
+
+        python_bin=""
+        for candidate in "${candidates[@]}"; do
+          if [ -x "$candidate" ] && "$candidate" -c "import torch, triton" >/dev/null 2>&1; then
+            python_bin="$candidate"
             break
           fi
         done
 
-        if [ -z "$venv" ]; then
-          venv="$RUNNER_TEMP/flagattention-venv"
-          python3 -m venv --system-site-packages "$venv"
+        if [ -z "$python_bin" ]; then
+          echo "No Python environment with torch and triton was found." >&2
+          printf 'Checked: %s\n' "${candidates[@]}" >&2
+          exit 1
         fi
 
-        echo "$venv/bin" >> "$GITHUB_PATH"
-        "$venv/bin/python" -c "import torch, triton"
-        "$venv/bin/python" -c "import pytest" || "$venv/bin/python" -m pip install "pytest>=7.1.0"
+        if ! "$python_bin" -c "import pytest" >/dev/null 2>&1; then
+          venv="$RUNNER_TEMP/flagattention-venv"
+          "$python_bin" -m venv --system-site-packages "$venv"
+          "$venv/bin/python" -m pip install "pytest>=7.1.0"
+          python_bin="$venv/bin/python"
+        fi
 
-    - name: Editable Install
-      run: |
-        python -m pip install --no-dependencies -e .
+        echo "$(dirname "$python_bin")" >> "$GITHUB_PATH"
+        "$python_bin" -c "import torch, triton, pytest; print(torch.__version__, triton.__version__)"
+
+    - name: Verify source import
+      env:
+        PYTHONPATH: src
+      run: python -c "import flag_attn"
 
     # - name: Lint with flake8
     #   run: |
