@@ -99,9 +99,11 @@ jobs:
         done
 
         if [ -z "$python_bin" ]; then
-          echo "No Python environment with torch and triton was found." >&2
-          printf 'Checked: %s\n' "${candidates[@]}" >&2
-          exit 1
+          venv="$RUNNER_TEMP/flagattention-venv"
+          python3 -m venv "$venv"
+          python_bin="$venv/bin/python"
+          "$python_bin" -m pip install --upgrade pip
+          "$python_bin" -m pip install "torch" "triton>=2.2.0" "pytest>=7.1.0"
         fi
 
         if ! "$python_bin" -c "import pytest" >/dev/null 2>&1; then
