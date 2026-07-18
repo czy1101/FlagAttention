@@ -9,6 +9,7 @@ from .chunk_gated_delta_direct import (
     can_use_chunk_gated_delta_rule_direct,
     chunk_gated_delta_rule_direct_fwd,
 )
+from .chunk_fused_forward import can_use_two_kernel_fused_forward
 from .compat import has_triton_tle, libentry
 from .fused_cumsum_kkt_solve_tril import (
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril,
@@ -1043,7 +1044,17 @@ def chunk_gated_delta_rule(
         q_seq = _l2_normalize_last_dim(q_seq)
         k_seq = _l2_normalize_last_dim(k_seq)
 
-    if _can_use_tle_chunk_gated_delta_rule(
+    use_two_kernel_fused_forward = can_use_two_kernel_fused_forward(
+        q=q_seq,
+        k=k_seq,
+        v=v_seq,
+        beta=beta_seq,
+        g=g_seq,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+    )
+    if not use_two_kernel_fused_forward and _can_use_tle_chunk_gated_delta_rule(
         q_seq,
         k_seq,
         v_seq,

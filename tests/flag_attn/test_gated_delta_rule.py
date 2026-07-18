@@ -213,3 +213,34 @@ def test_chunk_gated_delta_rule_fwd_two_kernel_matches_native(dtype, shape):
     _assert_close("o", actual[1], baseline[1])
     _assert_close("A", actual[2], baseline[2])
     _assert_close("final_state", actual[3], baseline[3])
+
+
+@pytest.mark.skipif(
+    not _cuda_tle_available(), reason="GDN public two-kernel test requires CUDA/TLE"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_chunk_gated_delta_rule_public_api_uses_two_kernel(dtype):
+    torch.manual_seed(42)
+    args = _make_inputs(4, 2048, 16, 128, 128, dtype, use_initial_state=False)
+    baseline = _call_fwd(args, full_tle=False, recompute_tle=False)
+    q, k, v, g, beta, scale, _, _, _ = args
+
+    with _set_gdn_tle(
+        full_tle=False,
+        recompute_tle=False,
+        two_kernel_tle=True,
+    ):
+        o, final_state = chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            beta,
+            g,
+            head_first=False,
+            scale=scale,
+            output_final_state=True,
+        )
+
+    _assert_close("o", o, baseline[1])
+    _assert_close("final_state", final_state, baseline[3])
