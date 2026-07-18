@@ -70,14 +70,35 @@ jobs:
     #     if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
     #     pip install .
 
-    - name: Activate Virtualenv
+    - name: Activate Python environment
+      shell: bash
       run: |
-        source /home/flagattn_ci/.virtualenvs/release/bin/activate
-        echo PATH=$PATH >> $GITHUB_ENV
+        set -euo pipefail
+
+        venv=""
+        shopt -s nullglob
+        for candidate in \
+          /home/flagattn_ci/.virtualenvs/release \
+          "$HOME/.virtualenvs/release" \
+          /home/*/.virtualenvs/release; do
+          if [ -x "$candidate/bin/python" ]; then
+            venv="$candidate"
+            break
+          fi
+        done
+
+        if [ -z "$venv" ]; then
+          venv="$RUNNER_TEMP/flagattention-venv"
+          python3 -m venv --system-site-packages "$venv"
+        fi
+
+        echo "$venv/bin" >> "$GITHUB_PATH"
+        "$venv/bin/python" -c "import torch, triton"
+        "$venv/bin/python" -c "import pytest" || "$venv/bin/python" -m pip install "pytest>=7.1.0"
 
     - name: Editable Install
       run: |
-        pip install --no-dependencies -e .
+        python -m pip install --no-dependencies -e .
 
     # - name: Lint with flake8
     #   run: |
@@ -87,4 +108,4 @@ jobs:
     #     flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Test with pytest
       run: |
-        pytest tests
+        python -m pytest tests
