@@ -51,7 +51,7 @@ version_file = "src/flag_attn/_version.py"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["flag_attn"]
+include = ["flag_attn", "flag_attn.*"]
 namespaces = false
 
 # helps for setting up pytest in pyprojects
