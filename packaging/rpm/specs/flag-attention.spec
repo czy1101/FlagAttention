@@ -75,6 +75,26 @@ export SETUPTOOLS_SCM_PRETEND_VERSION=%{version}
 PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=%{buildroot}%{python3_sitelib} \
     python3 -c "import importlib.util; s = importlib.util.find_spec('flag_attn'); assert s and s.origin, 'flag_attn not findable'; print('OK: flag_attn at', s.origin)"
+# Subpackage completeness: compare the __init__.py sets between src/ and
+# the installed buildroot. Catches packages.find configs that silently
+# drop subpackages (same check as in packaging/debian/rules). Filesystem
+# check on purpose: find_spec on a subpackage would import
+# flag_attn/__init__.py, which needs torch/triton — not available (and
+# not wanted) in the build environment.
+src_inits="$(cd src && find flag_attn -name __init__.py)"
+if [ -z "$src_inits" ]; then
+    echo "ERROR: no __init__.py found under src/flag_attn; check would be vacuous"
+    exit 1
+fi
+missing=""
+for f in $src_inits; do
+    if [ ! -f "%{buildroot}%{python3_sitelib}/$f" ]; then missing="$missing $f"; fi
+done
+if [ -n "$missing" ]; then
+    echo "ERROR: subpackages missing from buildroot:$missing"
+    exit 1
+fi
+echo "OK: all package __init__.py files from src/ present in buildroot"
 
 %if %{has_pyproject_macros}
 %files -f %{pyproject_files}
