@@ -1069,6 +1069,7 @@ def chunk_gated_delta_rule(
         v_tle = _direct_contiguous(v_seq)
         beta_tle = _direct_contiguous(beta_seq)
         g_tle = _direct_contiguous(g_seq)
+        _set_tle_descriptor_allocator(q_tle.device)
         g_cumsum, a = chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril(
             g=g_tle,
             k=k_tle,

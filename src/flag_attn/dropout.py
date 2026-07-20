@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import torch
+import triton
+import triton.language as tl
 
 def philox_cuda_seed_offset(increment, device=None):
     device = device or torch.cuda.current_device()
