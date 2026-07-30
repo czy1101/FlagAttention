@@ -25,6 +25,7 @@ from flag_attn.flash import attention as flash_attention # noqa: F401
 from flag_attn.split_kv import attention as flash_attention_split_kv # noqa: F401
 from flag_attn.paged import attention as paged_attention # noqa: F401
 from flag_attn.gated_delta_rule import chunk_gated_delta_rule # noqa: F401
+from flag_attn.gated_linear_attention import chunk_gla as chunk_gla
 from flag_attn.minimax_sparse_attention import (
     minimax_m3_index_decode as minimax_m3_index_decode,
     minimax_m3_index_decode_score as minimax_m3_index_decode_score,
