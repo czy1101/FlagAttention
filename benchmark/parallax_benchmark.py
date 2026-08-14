@@ -146,7 +146,7 @@ DEFAULT_CASES = (
     ParallaxCase(B=2, T=4096, H=2, HQ=2, D=64),
     ParallaxCase(B=2, T=8192, H=2, HQ=8, D=64),
     ParallaxCase(B=3, T=111, H=2, HQ=2, D=100),
-    ParallaxCase(B=4, T=16384, H=16, HQ=32, D=128),
+    ParallaxCase(B=3, T=1024, H=2, HQ=8, D=128),
     ParallaxCase(B=2, T=2048, H=2, HQ=8, D=128),
     ParallaxCase(B=2, T=8192, H=8, HQ=16, D=128),
 )

@@ -13,8 +13,8 @@ import torch
 import triton
 import triton.language as tl
 
-from .index import prepare_chunk_indices
-from .utils import input_guard
+from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
+from flaggems_vllm.ops.FLA.utils import input_guard
 
 try:
     import triton.experimental.tle.language as tle
@@ -269,16 +269,14 @@ def parallax_prune_configs(configs, named_args, **kwargs):
 
     mesh = _autotune_arg(named_args, kwargs, "mesh")
     if mesh is not None:
-        # The production TLE cluster path is restricted to D=128.  Its stable
-        # H100 winner is BS128/W8/S3; construct it directly because S3/BS128 is
-        # intentionally absent from the broader non-cluster autotune space.
-        return [
-            triton.Config(
-                {"BK": expected_bk, "BS": 128},
-                num_warps=8,
-                num_stages=3,
-            )
+        cluster_configs = [
+            cfg
+            for cfg in valid
+            if cfg.kwargs["BS"] == 128
+            and cfg.num_warps == 8
+            and cfg.num_stages == 2
         ]
+        return _copy_autotune_configs(cluster_configs)
 
     cu_seqlens = _autotune_arg(named_args, kwargs, "cu_seqlens")
     if cu_seqlens is None:
