@@ -1,22 +1,8 @@
-#!/usr/bin/env python3
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """CUDA correctness tests for the MiniMax M3 paged MSA kernels."""
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -32,6 +18,8 @@ from flag_attn.minimax_sparse_attention import (
     minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode,
 )
+
+index_topk_module = importlib.import_module("flag_attn.minimax_sparse_attention.index_topk")
 
 triton.knobs.autotuning.adjust_block_size = False
 BLOCK = SPARSE_BLOCK_SIZE
@@ -359,19 +347,20 @@ def _ref_decode_index(
         for query_index in range(decode_qlen):
             query_id = request * decode_qlen + query_index
             query_pos = seq_len - decode_qlen + query_index
-            valid_blocks = (query_pos + BLOCK) // BLOCK
+            kv_len = query_pos + 1
+            valid_blocks = (kv_len + BLOCK - 1) // BLOCK
             query = data.idx_q[query_id].float()
             for block in range(valid_blocks):
                 page = int(data.block_table[request, block].item())
-                valid_tokens = min(BLOCK, seq_len - block * BLOCK)
+                valid_tokens = min(BLOCK, kv_len - block * BLOCK)
                 keys = data.index_kv_cache[page, :valid_tokens].float()
                 scores[:, query_id, block] = torch.einsum(
                     "hd,kd->hk", query, keys
                 ).amax(dim=-1)
-            local_start = max(0, valid_blocks - local_blocks)
-            scores[:, query_id, local_start:valid_blocks] = 1e29
             init_end = min(init_blocks, valid_blocks)
             scores[:, query_id, :init_end] = 1e30
+            local_start = max(0, valid_blocks - local_blocks)
+            scores[:, query_id, local_start:valid_blocks] = 1e29
 
     result = torch.full(
         (num_idx_heads, data.q.shape[0], topk),
@@ -611,31 +600,195 @@ def _run_decode(case: tuple, mode: str) -> None:
     _assert_attention_match(output, ref_output, data)
 
 
+def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
+    """Invalid lanes must lose even when every valid score is negative infinity."""
+    num_score_blocks = 96
+    valid_blocks = 70
+    topk = 16
+    score = torch.full(
+        (1, 1, num_score_blocks),
+        -float("inf"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    cu_seqlens_q = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    prefix_lens = torch.tensor(
+        [(valid_blocks - 1) * BLOCK], device="cuda", dtype=torch.int32
+    )
+
+    assert index_topk_module._select_prefill_topk_path(score, topk, 1) == "streaming"
+    actual = minimax_m3_index_topk(
+        score,
+        cu_seqlens_q,
+        prefix_lens,
+        1,
+        topk,
+        0,
+        0,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.arange(topk, device="cuda", dtype=torch.int32).view(1, 1, topk)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not index_topk_module._HAS_TLE,
+    reason="requires FlagTree 3.6+ with TLE",
+)
+def test_prefill_topk_radix_path() -> None:
+    """Exercise the actual wide-row TLE path instead of accepting fallback."""
+    num_score_blocks = 1024
+    topk = 16
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(123)
+    score = torch.randn(
+        (1, 1, num_score_blocks),
+        generator=generator,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    cu_seqlens_q = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    prefix_lens = torch.tensor(
+        [(num_score_blocks - 1) * BLOCK], device="cuda", dtype=torch.int32
+    )
+    block_size_k, _ = index_topk_module._radix_prefill_launch_config(num_score_blocks)
+    config_key = (block_size_k, topk)
+    index_topk_module._FAILED_RADIX_CONFIGS.discard(config_key)
+
+    assert index_topk_module._select_prefill_topk_path(score, topk, 1) == "radix"
+    actual = minimax_m3_index_topk(
+        score,
+        cu_seqlens_q,
+        prefix_lens,
+        1,
+        topk,
+        0,
+        0,
+    )
+    torch.cuda.synchronize()
+
+    assert config_key not in index_topk_module._FAILED_RADIX_CONFIGS
+    expected = torch.topk(score, topk, dim=-1).indices.to(torch.int32)
+    expected = expected.sort(dim=-1).values
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 PREFILL_CASES = [
+    # Boundary and padding: valid_blocks=2, topk=4.
     ((129,), (0,), 1, 16, 4, 1, 2),
-    ((257, 513, 129), (0, 64, 128), 2, 8, 8, 1, 2),
-    ((1025, 257, 513, 65), (256, 64, 128, 0), 4, 4, 16, 2, 3),
+    # Selection: 1024 tokens -> 8 blocks, topk=4.
+    ((1024,), (0,), 2, 8, 4, 1, 2),
+    # Ragged/prefix selection: late queries see 32/16/9 blocks, topk=8.
+    ((4096, 2048, 1025), (0, 256, 128), 4, 4, 8, 1, 2),
 ]
 
 DECODE_CASES = [
-    ((129,), 1, 16, 4, 1, 2, 1),
-    ((257, 513, 129), 2, 8, 8, 1, 2, 4),
-    ((1025, 257, 513, 65, 129), 4, 4, 16, 2, 3, 8),
+    # Boundary and selection: 512 tokens -> 4 blocks, topk=3.
+    ((512,), 1, 16, 3, 1, 2, 1),
+    # Ragged selection: late queries see 16/8/5 blocks, topk=4.
+    ((2048, 1024, 513), 2, 8, 4, 1, 2, 4),
+    # Long GQA case with both selection and a short padding request.
+    ((8192, 2048, 1025, 129), 4, 4, 8, 2, 3, 8),
+]
+
+DECODE_SELECTION_CASES = [
+    ((4097,), 1, 1, 8, 1, 2, 1),
+    ((1025,) * 16, 4, 1, 4, 1, 2, 1),
+]
+
+DECODE_K16_CASES = [
+    ((2048, 1025), 2, 8, 16, 1, 2, 4),
+    ((4100,), 1, 1, 16, 0, 0, 4),
 ]
 
 
 @pytest.mark.parametrize(
-    "case", PREFILL_CASES, ids=("short", "ragged_prefix", "padded_batch")
+    "case", PREFILL_CASES, ids=("boundary", "selection", "long_ragged")
 )
 def test_prefill_bf16(case: tuple) -> None:
     _run_prefill(case, "bf16")
 
 
 @pytest.mark.parametrize(
-    "case", DECODE_CASES, ids=("short", "spec_decode", "padded_batch")
+    "case", DECODE_CASES, ids=("boundary", "selection", "long_gqa")
 )
 def test_decode_bf16(case: tuple) -> None:
     _run_decode(case, "bf16")
+
+
+@pytest.mark.parametrize(
+    "case", DECODE_SELECTION_CASES, ids=("split_k", "single_chunk")
+)
+def test_decode_topk_selection_bf16(case: tuple) -> None:
+    """Cover N > K for both multi-chunk and single-chunk selection."""
+    _run_decode(case, "bf16")
+
+
+@pytest.mark.parametrize(
+    "case", DECODE_K16_CASES, ids=("identity_ragged", "spec_causal")
+)
+def test_decode_topk_k16_bf16(case: tuple) -> None:
+    """Cover the configured K=16 Identity and causal selection paths."""
+    _run_decode(case, "bf16")
+
+
+def test_decode_topk_identity_out_and_score_out_bf16() -> None:
+    """Identity must preserve out aliasing and populate an explicit score buffer."""
+    seq_lens = (2048, 1025)
+    num_kv_heads = 2
+    topk = 16
+    decode_qlen = 4
+    data = make_data(
+        seq_lens,
+        num_kv_heads,
+        8,
+        decode=True,
+        decode_qlen=decode_qlen,
+        mode="bf16",
+    )
+    total_q = data.q.shape[0]
+    max_blocks = (data.max_seq_len + BLOCK - 1) // BLOCK
+    out = torch.full(
+        (num_kv_heads, total_q + 1, topk),
+        -2,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    score_out = torch.full(
+        (num_kv_heads, total_q, max_blocks),
+        float("nan"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    actual = minimax_m3_index_decode(
+        data.idx_q,
+        data.index_kv_cache,
+        data.block_table,
+        data.seq_lens,
+        data.max_seq_len,
+        topk,
+        1,
+        2,
+        num_kv_heads,
+        decode_qlen,
+        decode_qlen,
+        out=out,
+        score_out=score_out,
+    )
+    torch.cuda.synchronize()
+
+    expected = _ref_decode_index(data, topk, 1, 2, decode_qlen)
+    _assert_topk_match(actual, expected, data, topk, decode=True)
+    assert actual.data_ptr() == out.data_ptr()
+    assert torch.all(out[:, total_q] == -2)
+    for request, seq_len in enumerate(seq_lens):
+        for query_index in range(decode_qlen):
+            query_id = request * decode_qlen + query_index
+            kv_len = seq_len - decode_qlen + query_index + 1
+            valid_blocks = (kv_len + BLOCK - 1) // BLOCK
+            assert torch.all(torch.isfinite(score_out[:, query_id, :valid_blocks]))
 
 
 @pytest.mark.skipif(
@@ -643,7 +796,7 @@ def test_decode_bf16(case: tuple) -> None:
     reason="FP8 tests require an NVIDIA GPU with FP8 support",
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
-@pytest.mark.parametrize("case", PREFILL_CASES[:2], ids=("short", "ragged_prefix"))
+@pytest.mark.parametrize("case", PREFILL_CASES[:2], ids=("boundary", "selection"))
 def test_prefill_fp8(mode: str, case: tuple) -> None:
     _run_prefill(case, mode)
 
@@ -653,6 +806,6 @@ def test_prefill_fp8(mode: str, case: tuple) -> None:
     reason="FP8 tests require an NVIDIA GPU with FP8 support",
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
-@pytest.mark.parametrize("case", DECODE_CASES[:2], ids=("short", "spec_decode"))
+@pytest.mark.parametrize("case", DECODE_CASES[:2], ids=("boundary", "selection"))
 def test_decode_fp8(mode: str, case: tuple) -> None:
     _run_decode(case, mode)

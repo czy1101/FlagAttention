@@ -1,18 +1,5 @@
-# Copyright 2026 FlagOS Contributors
-# Copyright contributors to the vLLM project
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton kernels for MiniMax M3 lightning-indexer block scoring + top-k.
 
 Index queries score each 128-token block of index keys (max over the block),
@@ -30,8 +17,22 @@ feed the block-sparse attention kernels in ``sparse_attn``.
 import torch
 import triton
 import triton.language as tl
+from triton.errors import TritonError
 
-from .utils import current_platform, round_up
+from .utils import current_platform, has_triton_tle, round_up
+
+if has_triton_tle(3, 6, 0):
+    try:
+        import triton.experimental.tle.language as tle
+
+        _HAS_TLE = True
+    except ImportError:
+        tle = None
+        _HAS_TLE = False
+else:
+    tle = None
+    _HAS_TLE = False
+
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -196,7 +197,7 @@ def _index_block_score_kernel(
     key=["BLOCK_SIZE_T"],
 )
 @triton.jit(do_not_specialize_on_alignment=["prefix_lens"])
-def _topk_index_kernel(
+def _topk_index_kernel_fallback(
     s_ptr,  # [num_heads, total_q, max_block]
     ti_ptr,  # [num_heads, total_q, topk]
     sample_interval: tl.constexpr,  # block_size_q (1 for M3)
@@ -295,6 +296,380 @@ def _topk_index_kernel(
     valid_mask = off_t < valid_blocks
     topk_idx = tl.where(store_mask & valid_mask, topk_idx, -1)
     tl.store(ti_ptrs, topk_idx.to(ti_ptrs.dtype.element_ty), mask=store_mask)
+
+
+# ---------------------------------------------------------------------------
+# Streaming Top-K adapted to MSA prefill semantics.
+#
+# The reference implementation is ``FlagTree/python/tutorials/tle/03-topk.py``
+# and operates on a uniform 2-D [M, N] tensor.  This adapted kernel keeps the
+# MSA row mapping, per-query causal length, forced init/local blocks, NaN
+# handling, output layout, and -1 padding.  Only the row-local selection engine
+# is replaced by the packed-key ``tl.topk`` + ``tl.bitonic_merge`` algorithm.
+#
+# This path intentionally remains separate from ``_topk_index_kernel_fallback``
+# so unsupported shapes preserve the previous behavior.  The streaming
+# implementation uses only standard Triton APIs; it does not depend on TLE.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _streaming_topk_fpval_to_key(x_bits):
+    sign_bit = tl.full(x_bits.shape, 0x80000000, dtype=tl.uint32)
+    full_mask = tl.full(x_bits.shape, 0xFFFFFFFF, dtype=tl.uint32)
+    mask = tl.where((x_bits & sign_bit) != 0, full_mask, sign_bit)
+    return x_bits ^ mask
+
+
+@triton.jit
+def _streaming_topk_index_to_key(index):
+    max_u16 = tl.full(index.shape, 0xFFFF, dtype=tl.uint32)
+    return max_u16 - index.to(tl.uint32)
+
+
+@triton.jit
+def _streaming_topk_key_to_index(index_key):
+    max_u16 = tl.full(index_key.shape, 0xFFFF, dtype=tl.uint32)
+    return (max_u16 - index_key.to(tl.uint32)).to(tl.int32)
+
+
+_MAX_STREAMING_TILE_SIZE = 2048
+_RADIX_BITS = 4
+_RADIX_MIN_PADDED_BLOCKS = 1024
+_RADIX_MAX_TOPK = 64
+_RADIX_MIN_BLOCKS_PER_TOPK = 16
+_FAILED_RADIX_CONFIGS: set[tuple[int, int]] = set()
+
+
+@triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
+@triton.jit(do_not_specialize_on_alignment=["prefix_lens"])
+def _topk_index_kernel_streaming(
+    s_ptr,  # [num_heads, total_q, max_block]
+    ti_ptr,  # [num_heads, total_q, topk]
+    sample_interval: tl.constexpr,  # block_size_q (1 for M3)
+    block_size: tl.constexpr,  # sparse block size (128)
+    cu_seqlens,
+    cu_seqblocks_q,
+    prefix_lens,
+    topk: tl.constexpr,
+    init_blocks: tl.constexpr,
+    local_blocks: tl.constexpr,
+    stride_s_h,
+    stride_s_n,
+    stride_s_k,
+    stride_ti_h,
+    stride_ti_n,
+    stride_ti_t,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    MASK_INIT: tl.constexpr,
+    MASK_LOCAL: tl.constexpr,
+):
+    tl.static_assert(BLOCK_SIZE_T == topk)
+    tl.static_assert(BLOCK_SIZE_K >= BLOCK_SIZE_T)
+
+    pid_q = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    seq_start = tl.load(cu_seqlens + pid_b)
+    block_start = tl.load(cu_seqblocks_q + pid_b)
+    block_num = tl.load(cu_seqblocks_q + pid_b + 1) - block_start
+    prefix_len = tl.load(prefix_lens + pid_b)
+    if pid_q >= block_num:
+        return
+
+    valid_blocks = (prefix_len + pid_q * sample_interval + block_size) // block_size
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    ti_ptrs = (
+        ti_ptr
+        + (block_start + pid_q) * stride_ti_n
+        + pid_h * stride_ti_h
+        + off_t * stride_ti_t
+    )
+
+    # When N <= K every visible block must be selected.  The normal streaming
+    # path also returns these ids in ascending order, so this is exactly the
+    # same output without loading or sorting scores.
+    if valid_blocks <= topk:
+        topk_idx = tl.where(off_t < valid_blocks, off_t, -1)
+        tl.store(ti_ptrs, topk_idx.to(ti_ptrs.dtype.element_ty))
+        return
+
+    off_k = tl.arange(0, BLOCK_SIZE_K)
+
+    # Start from the last (possibly partial) tile.  All preceding tiles are
+    # full, matching the order used by the source streaming kernel.
+    num_tiles = tl.cdiv(valid_blocks, BLOCK_SIZE_K)
+    tile_start = (num_tiles - 1) * BLOCK_SIZE_K
+    block_idx = tile_start + off_k
+    causal_mask = block_idx < valid_blocks
+    local_mask = block_idx >= max(0, valid_blocks - local_blocks)
+    init_mask = block_idx < init_blocks
+
+    score_row = (
+        s_ptr + (seq_start + pid_q * sample_interval) * stride_s_n + pid_h * stride_s_h
+    )
+    score = tl.load(
+        score_row + block_idx * stride_s_k,
+        mask=causal_mask,
+        other=-1e30,
+    ).to(tl.float32)
+    score = tl.where(score != score, -1e30, score)
+    if MASK_INIT:
+        score = tl.where(causal_mask & init_mask, score - 1e29, score)
+    else:
+        score = tl.where(causal_mask & init_mask, 1e30, score)
+    if MASK_LOCAL:
+        score = tl.where(causal_mask & local_mask, score - 1e28, score)
+    else:
+        score = tl.where(causal_mask & local_mask, 1e29, score)
+
+    score_key = _streaming_topk_fpval_to_key(score.to(tl.uint32, bitcast=True))
+    index_key = _streaming_topk_index_to_key(block_idx)
+    packed = (score_key.to(tl.uint64) << 16) | index_key.to(tl.uint64)
+    # A finite sentinel such as -1e30 is not below every valid FP32 value.
+    # Force lanes outside this row's causal range below the key for -inf so a
+    # partial tile can never return an out-of-range logical block id.
+    packed = tl.where(causal_mask, packed, tl.zeros_like(packed))
+    acc = tl.topk(packed, BLOCK_SIZE_T)
+
+    for _ in tl.range(0, num_tiles - 1):
+        acc = tl.bitonic_merge(acc)
+        tile_start -= BLOCK_SIZE_K
+        block_idx = tile_start + off_k
+        local_mask = block_idx >= max(0, valid_blocks - local_blocks)
+        init_mask = block_idx < init_blocks
+
+        score = tl.load(score_row + block_idx * stride_s_k).to(tl.float32)
+        score = tl.where(score != score, -1e30, score)
+        if MASK_INIT:
+            score = tl.where(init_mask, score - 1e29, score)
+        else:
+            score = tl.where(init_mask, 1e30, score)
+        if MASK_LOCAL:
+            score = tl.where(local_mask, score - 1e28, score)
+        else:
+            score = tl.where(local_mask, 1e29, score)
+
+        score_key = _streaming_topk_fpval_to_key(score.to(tl.uint32, bitcast=True))
+        index_key = _streaming_topk_index_to_key(block_idx)
+        packed = (score_key.to(tl.uint64) << 16) | index_key.to(tl.uint64)
+        acc = tl.maximum(acc, tl.topk(packed, BLOCK_SIZE_T))
+
+    # Match the source streaming implementation's output convention: rotate
+    # the index key into the high bits, then sort selected blocks by ascending
+    # logical block id.
+    acc = (acc << 48) | (acc >> 16)
+    acc = tl.sort(acc, descending=True)
+    selected_index_key = (acc >> 48).to(tl.uint32)
+    topk_idx = _streaming_topk_key_to_index(selected_index_key)
+
+    valid_result = (off_t < valid_blocks) & (topk_idx < valid_blocks)
+    topk_idx = tl.where(valid_result, topk_idx, -1)
+    tl.store(ti_ptrs, topk_idx.to(ti_ptrs.dtype.element_ty))
+
+
+# ---------------------------------------------------------------------------
+# TLE shared-memory Radix Select for wide Prefill rows.
+#
+# This adapts ``FlagTree/python/tutorials/tle/03-topk.py`` to MSA metadata.
+# Unlike the tutorial's atomic output compaction, the final pass scans block ids
+# in ascending order and uses prefix sums.  Equal scores therefore use the same
+# smaller-block-id tie-break as the packed-key streaming path.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _load_prefill_topk_score(
+    score_row,
+    block_idx,
+    valid_blocks,
+    init_blocks: tl.constexpr,
+    local_blocks: tl.constexpr,
+    stride_s_k,
+    MASK_INIT: tl.constexpr,
+    MASK_LOCAL: tl.constexpr,
+):
+    valid = block_idx < valid_blocks
+    score = tl.load(
+        score_row + block_idx * stride_s_k,
+        mask=valid,
+        other=-1e30,
+    ).to(tl.float32)
+    score = tl.where(score != score, -1e30, score)
+    init_mask = block_idx < init_blocks
+    local_mask = block_idx >= max(0, valid_blocks - local_blocks)
+    if MASK_INIT:
+        score = tl.where(valid & init_mask, score - 1e29, score)
+    else:
+        score = tl.where(valid & init_mask, 1e30, score)
+    if MASK_LOCAL:
+        score = tl.where(valid & local_mask, score - 1e28, score)
+    else:
+        score = tl.where(valid & local_mask, 1e29, score)
+    return score, valid
+
+
+if _HAS_TLE:
+
+    @triton.jit(do_not_specialize_on_alignment=["prefix_lens"])
+    def _topk_index_kernel_radix_tle(
+        s_ptr,  # [num_heads, total_q, max_block]
+        ti_ptr,  # [num_heads, total_q, topk]
+        sample_interval: tl.constexpr,
+        block_size: tl.constexpr,
+        cu_seqlens,
+        cu_seqblocks_q,
+        prefix_lens,
+        topk: tl.constexpr,
+        init_blocks: tl.constexpr,
+        local_blocks: tl.constexpr,
+        stride_s_h,
+        stride_s_n,
+        stride_s_k,
+        stride_ti_h,
+        stride_ti_n,
+        stride_ti_t,
+        BLOCK_SIZE_K: tl.constexpr,
+        BLOCK_SIZE_T: tl.constexpr,
+        RADIX_BITS: tl.constexpr,
+        MASK_INIT: tl.constexpr,
+        MASK_LOCAL: tl.constexpr,
+    ):
+        tl.static_assert(RADIX_BITS == 4)
+        tl.static_assert(BLOCK_SIZE_T >= topk)
+        RADIX_SIZE: tl.constexpr = 1 << RADIX_BITS
+        RADIX_MASK: tl.constexpr = RADIX_SIZE - 1
+
+        pid_q = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        pid_h = tl.program_id(2)
+        seq_start = tl.load(cu_seqlens + pid_b)
+        block_start = tl.load(cu_seqblocks_q + pid_b)
+        block_num = tl.load(cu_seqblocks_q + pid_b + 1) - block_start
+        prefix_len = tl.load(prefix_lens + pid_b)
+        if pid_q >= block_num:
+            return
+
+        valid_blocks = (prefix_len + pid_q * sample_interval + block_size) // block_size
+        off_t = tl.arange(0, BLOCK_SIZE_T)
+        output_row = ti_ptr + (block_start + pid_q) * stride_ti_n + pid_h * stride_ti_h
+
+        # Per-row Identity path.  It is particularly important for early
+        # Prefill queries, whose causal range has not yet grown beyond K.
+        if valid_blocks <= topk:
+            topk_idx = tl.where(off_t < valid_blocks, off_t, -1)
+            tl.store(
+                output_row + off_t * stride_ti_t,
+                topk_idx.to(ti_ptr.dtype.element_ty),
+                mask=off_t < topk,
+            )
+            return
+
+        score_row = (
+            s_ptr
+            + (seq_start + pid_q * sample_interval) * stride_s_n
+            + pid_h * stride_s_h
+        )
+        lane = tl.arange(0, BLOCK_SIZE_K)
+        bins = tl.arange(0, RADIX_SIZE)
+        one = tl.full([BLOCK_SIZE_K], 1, tl.int32)
+        n_tiles = tl.cdiv(valid_blocks, BLOCK_SIZE_K)
+
+        # The histogram is CTA-local, exactly as in the TLE tutorial.
+        smem_counts = tle.gpu.alloc(
+            [RADIX_SIZE],
+            dtype=tl.int32,
+            layout=None,
+            scope=tle.gpu.smem,
+            nv_mma_shared_layout=False,
+        )
+        smem_count_ptrs = tle.gpu.local_ptr(smem_counts, (bins,))
+
+        desired = tl.full((), 0, dtype=tl.uint32)
+        desired_mask = tl.full((), 0, dtype=tl.uint32)
+        k_to_find = tl.full((), topk, dtype=tl.int32)
+        radix_mask_u32 = tl.full((), RADIX_MASK, dtype=tl.uint32)
+
+        # Eight 4-bit MSD passes locate the exact FP32 key at the K boundary.
+        for digit_pos in tl.static_range(32 - RADIX_BITS, -1, -RADIX_BITS):
+            tl.store(
+                smem_count_ptrs,
+                tl.zeros([RADIX_SIZE], dtype=tl.int32),
+            )
+            tl.debug_barrier()
+            for tile in tl.range(0, n_tiles):
+                block_idx = tile * BLOCK_SIZE_K + lane
+                score, valid = _load_prefill_topk_score(
+                    score_row,
+                    block_idx,
+                    valid_blocks,
+                    init_blocks,
+                    local_blocks,
+                    stride_s_k,
+                    MASK_INIT,
+                    MASK_LOCAL,
+                )
+                score_key = _streaming_topk_fpval_to_key(
+                    score.to(tl.uint32, bitcast=True)
+                )
+                matches = (score_key & desired_mask) == desired
+                digit = ((score_key >> digit_pos) & RADIX_MASK).to(tl.int32)
+                count_ptrs = tle.gpu.local_ptr(smem_counts, (digit,))
+                tl.atomic_add(
+                    count_ptrs,
+                    one,
+                    mask=valid & matches,
+                    sem="relaxed",
+                    scope="cta",
+                )
+            tl.debug_barrier()
+
+            counts = tl.load(smem_count_ptrs)
+            cumsum_desc = tl.cumsum(counts, axis=0, reverse=True)
+            selected_mask = cumsum_desc >= k_to_find
+            selected = tl.max(tl.where(selected_mask, bins, 0), axis=0).to(tl.int32)
+            counts_gt = tl.max(tl.where(bins == selected + 1, cumsum_desc, 0), axis=0)
+            selected_u32 = selected.to(tl.uint32)
+            desired = desired | (selected_u32 << digit_pos)
+            desired_mask = desired_mask | (radix_mask_u32 << digit_pos)
+            k_to_find = k_to_find - counts_gt
+
+        # At this point ``desired`` is the exact threshold key and
+        # ``k_to_find`` is how many threshold-equal elements are still needed.
+        # Scan once in ascending block-id order, emitting all greater keys and
+        # the first equal keys.  This combines the tutorial's two collection
+        # passes and makes ties deterministic.
+        written = tl.full((), 0, dtype=tl.int32)
+        equal_seen = tl.full((), 0, dtype=tl.int32)
+        for tile in tl.range(0, n_tiles):
+            block_idx = tile * BLOCK_SIZE_K + lane
+            score, valid = _load_prefill_topk_score(
+                score_row,
+                block_idx,
+                valid_blocks,
+                init_blocks,
+                local_blocks,
+                stride_s_k,
+                MASK_INIT,
+                MASK_LOCAL,
+            )
+            score_key = _streaming_topk_fpval_to_key(score.to(tl.uint32, bitcast=True))
+            take_gt = valid & (score_key > desired)
+            take_equal = valid & (score_key == desired)
+            equal_rank = tl.cumsum(take_equal.to(tl.int32), axis=0)
+            take_equal = take_equal & (equal_seen + equal_rank <= k_to_find)
+            take = take_gt | take_equal
+            take_rank = tl.cumsum(take.to(tl.int32), axis=0)
+            out_pos = written + take_rank - 1
+            tl.store(
+                output_row + out_pos * stride_ti_t,
+                block_idx.to(ti_ptr.dtype.element_ty),
+                mask=take,
+            )
+            written = written + tl.sum(take.to(tl.int32), axis=0)
+            equal_seen = equal_seen + tl.sum(
+                (valid & (score_key == desired)).to(tl.int32), axis=0
+            )
+
+else:
+    _topk_index_kernel_radix_tle = None
 
 
 # ---------------------------------------------------------------------------
@@ -404,9 +779,49 @@ def _decode_index_score_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Decode top-k (split-K): per-chunk partial top-k + merge. Forced init/local
-# blocks are already encoded in the scores.
+# Decode top-k: identity for N <= K, otherwise per-chunk partial top-k plus a
+# merge. Forced init/local blocks are already encoded in the scores.
 # ---------------------------------------------------------------------------
+@triton.jit(do_not_specialize=["decode_query_len"])
+def _decode_topk_identity_kernel(
+    ti_final_ptr,  # [num_idx_heads, total_q, topk]
+    seq_lens,  # [num_reqs]
+    block_size: tl.constexpr,
+    topk: tl.constexpr,
+    decode_query_len,
+    stride_tif_h,
+    stride_tif_b,
+    stride_tif_t,
+    BLOCK_SIZE_T: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    """Emit every visible block when the padded maximum cannot exceed K."""
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    req_id = pid_b // decode_query_len
+    q_offset = pid_b - req_id * decode_query_len
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    seq_len = tl.load(seq_lens + req_id)
+    query_pos = seq_len - decode_query_len + q_offset
+    kv_len = tl.maximum(query_pos + 1, 0)
+    num_blocks = (kv_len + block_size - 1) // block_size
+
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    topk_idx = tl.where(off_t < num_blocks, off_t, -1)
+    tl.store(
+        ti_final_ptr
+        + pid_h * stride_tif_h
+        + pid_b * stride_tif_b
+        + off_t * stride_tif_t,
+        topk_idx.to(ti_final_ptr.dtype.element_ty),
+        mask=off_t < topk,
+    )
+
+
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
 @triton.autotune(
     configs=[
@@ -716,6 +1131,102 @@ def minimax_m3_index_score(
     return score
 
 
+def _supports_prefill_selector_input(score: torch.Tensor, topk: int) -> bool:
+    """Common correctness boundary for the optimized Prefill selectors."""
+    if score.device.type != "cuda":
+        return False
+    if score.dtype != torch.float32 or score.ndim != 3:
+        return False
+    if topk <= 0 or score.shape[2] <= 0:
+        return False
+    return True
+
+
+def _can_use_radix_prefill_topk(
+    score: torch.Tensor,
+    topk: int,
+    max_query_len: int,
+) -> bool:
+    """Use Radix for a short Prefill chunk over a wide existing context."""
+    if not _HAS_TLE or _topk_index_kernel_radix_tle is None:
+        return False
+    if not _supports_prefill_selector_input(score, topk):
+        return False
+    max_score_blocks = score.shape[2]
+    block_size_k, _ = _radix_prefill_launch_config(max_score_blocks)
+    return (
+        # A chunk no longer than one sparse page keeps per-row valid_blocks
+        # nearly constant.  Full Prefill has N growing from 1 to max_block and
+        # is better served by the single-pass Streaming selector.
+        0 < max_query_len <= SPARSE_BLOCK_SIZE
+        and max_score_blocks >= _RADIX_MIN_PADDED_BLOCKS
+        and topk <= _RADIX_MAX_TOPK
+        and max_score_blocks >= _RADIX_MIN_BLOCKS_PER_TOPK * topk
+        and (block_size_k, topk) not in _FAILED_RADIX_CONFIGS
+    )
+
+
+def _can_use_streaming_prefill_topk(score: torch.Tensor, topk: int) -> bool:
+    """Return whether packed-key Streaming supports this call exactly."""
+    if not _supports_prefill_selector_input(score, topk):
+        return False
+    if topk > _MAX_STREAMING_TILE_SIZE:
+        return False
+    # The streaming selector packs the logical block id into 16 bits and uses
+    # an exact (not padded) compile-time K in ``tl.topk``.
+    if score.shape[2] > 0xFFFF:
+        return False
+    if (topk & (topk - 1)) != 0:
+        return False
+    return True
+
+
+def _select_prefill_topk_path(
+    score: torch.Tensor,
+    topk: int,
+    max_query_len: int,
+) -> str:
+    """Choose an algorithm; correctness support and performance policy differ."""
+    if _can_use_radix_prefill_topk(score, topk, max_query_len):
+        return "radix"
+    if _can_use_streaming_prefill_topk(score, topk):
+        return "streaming"
+    return "fallback"
+
+
+def _topk_tile_num_warps(block_size: int) -> int:
+    if block_size <= 64:
+        return 2
+    if block_size <= 128:
+        return 4
+    return 8
+
+
+def _streaming_prefill_launch_config(
+    max_score_blocks: int,
+    topk: int,
+) -> tuple[int, int]:
+    """Choose Streaming resources from MSA's padded max-block dimension."""
+    # MSA rows have different valid_blocks, but they share this padded upper
+    # bound.  Cap the normal tile at 1024 as in TLE, then enlarge only when K
+    # itself needs more lanes.  No synthetic kernel argument is required.
+    block_size = max(
+        64,
+        topk,
+        triton.next_power_of_2(min(max_score_blocks, 1024)),
+    )
+    return block_size, _topk_tile_num_warps(block_size)
+
+
+def _radix_prefill_launch_config(max_score_blocks: int) -> tuple[int, int]:
+    """Choose Radix resources from MSA's padded max-block dimension."""
+    block_size = max(
+        32,
+        triton.next_power_of_2(min(max_score_blocks, 1024)),
+    )
+    return block_size, _topk_tile_num_warps(block_size)
+
+
 @torch.no_grad()
 def minimax_m3_index_topk(
     score: torch.Tensor,  # [num_idx_heads, total_q, max_block]
@@ -728,6 +1239,11 @@ def minimax_m3_index_topk(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select index top-k from a precomputed score tensor.
+
+    Dispatches short Prefill chunks over wide contexts to TLE Radix Select,
+    full/medium Prefill to packed-key Streaming Top-K, and unsupported inputs to
+    the original Bitonic fallback.  Optimized kernels contain a per-row N <= K
+    identity path.
 
     When ``out`` is provided (a ``[num_idx_heads, >=total_q, topk]`` buffer), the
     result is written into ``out[:, :total_q, :]`` instead of a fresh tensor --
@@ -746,7 +1262,7 @@ def minimax_m3_index_topk(
         )
     # block_size_q == 1 -> query blocks coincide with query tokens.
     grid_topk = (max_query_len, batch, num_idx_heads)
-    _topk_index_kernel[grid_topk](
+    kernel_args = (
         score,
         topk_idx,
         1,  # sample_interval (block_size_q)
@@ -763,9 +1279,50 @@ def minimax_m3_index_topk(
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
-        MASK_INIT=False,
-        MASK_LOCAL=False,
     )
+    path = _select_prefill_topk_path(score, topk, max_query_len)
+    if path == "radix":
+        assert _topk_index_kernel_radix_tle is not None
+        block_size_k, num_warps = _radix_prefill_launch_config(score.shape[2])
+        try:
+            _topk_index_kernel_radix_tle[grid_topk](
+                *kernel_args,
+                BLOCK_SIZE_K=block_size_k,
+                BLOCK_SIZE_T=triton.next_power_of_2(topk),
+                RADIX_BITS=_RADIX_BITS,
+                MASK_INIT=False,
+                MASK_LOCAL=False,
+                num_warps=num_warps,
+                num_stages=1,
+            )
+            return topk_idx
+        except TritonError:
+            # Some CUDA/Triton combinations expose the TLE module but cannot
+            # lower this shared-memory kernel.  Remember the failed compile
+            # configuration so later calls do not repeatedly pay that cost.
+            _FAILED_RADIX_CONFIGS.add((block_size_k, topk))
+            path = (
+                "streaming"
+                if _can_use_streaming_prefill_topk(score, topk)
+                else "fallback"
+            )
+
+    if path == "streaming":
+        block_size_k, num_warps = _streaming_prefill_launch_config(score.shape[2], topk)
+        _topk_index_kernel_streaming[grid_topk](
+            *kernel_args,
+            BLOCK_SIZE_K=block_size_k,
+            MASK_INIT=False,
+            MASK_LOCAL=False,
+            num_warps=num_warps,
+            num_stages=2,
+        )
+    else:
+        _topk_index_kernel_fallback[grid_topk](
+            *kernel_args,
+            MASK_INIT=False,
+            MASK_LOCAL=False,
+        )
     return topk_idx
 
 
@@ -883,7 +1440,7 @@ def minimax_m3_index_decode(
     out: torch.Tensor | None = None,
     score_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Decode index block-score + top-k, both split-K (cudagraph-safe).
+    """Decode index block-score + dispatched top-k (cudagraph-safe).
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     When ``out`` ([num_kv_heads, >=total_q, topk]) is given, writes into
@@ -894,12 +1451,62 @@ def minimax_m3_index_decode(
     via strides, so a transposed view of a block-major buffer is accepted.
     """
     total_q, num_idx_heads, _ = idx_q.shape
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
+    assert decode_query_len <= max_decode_query_len
+    assert total_q == seq_lens.shape[0] * decode_query_len
     batch = total_q
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     use_pdl = current_platform.is_arch_support_pdl()
     pdl_kwargs: dict[str, bool | int] = {}
     if use_pdl:
         pdl_kwargs.update({"launch_pdl": True})
+
+    block_size_t = triton.next_power_of_2(topk)
+    if max_block <= topk:
+        # Every visible block is selected, so scores cannot affect the result.
+        # Preserve the documented score_out mutation when the caller supplies
+        # that buffer; otherwise skip both score generation and Top-K sorting.
+        if out is not None:
+            topk_idx = out[:, :total_q, :]
+        else:
+            topk_idx = torch.empty(
+                (num_idx_heads, total_q, topk),
+                dtype=torch.int32,
+                device=idx_q.device,
+            )
+        if score_out is not None:
+            minimax_m3_index_decode_score(
+                idx_q,
+                index_kv_cache,
+                block_table,
+                seq_lens,
+                max_seq_len,
+                init_blocks,
+                local_blocks,
+                num_kv_heads,
+                decode_query_len,
+                max_decode_query_len,
+                score_out=score_out,
+            )
+        identity_use_pdl = use_pdl and score_out is not None
+        identity_pdl_kwargs = pdl_kwargs if identity_use_pdl else {}
+        _decode_topk_identity_kernel[(batch, num_idx_heads)](
+            topk_idx,
+            seq_lens,
+            SPARSE_BLOCK_SIZE,
+            topk,
+            decode_query_len,
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            BLOCK_SIZE_T=block_size_t,
+            USE_PDL=identity_use_pdl,
+            **identity_pdl_kwargs,
+        )
+        return topk_idx
+
     score = minimax_m3_index_decode_score(
         idx_q,
         index_kv_cache,
@@ -922,6 +1529,7 @@ def minimax_m3_index_decode(
             dtype=torch.int32,
             device=idx_q.device,
         )
+
     # Chunk count is shape-constant (cudagraph-safe), capped so the merge sorts
     # pow2(num_topk_chunks * pow2(topk)) candidates.
     TOPK_TARGET_GRID = 64
@@ -930,7 +1538,6 @@ def minimax_m3_index_decode(
         1, min(MAX_NUM_TOPK_CHUNKS, TOPK_TARGET_GRID // max(1, batch * num_idx_heads))
     )
     num_topk_chunks = 1 << (topk_target.bit_length() - 1)
-    block_size_t = triton.next_power_of_2(topk)
     chunk_blocks = (max_block + num_topk_chunks - 1) // num_topk_chunks
     topk_score_partial = torch.empty(
         num_topk_chunks,
