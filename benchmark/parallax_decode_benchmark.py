@@ -14,21 +14,16 @@
 
 """Benchmark the FlagAttention Parallax TLE decode kernel.
 
-When the external ``parallax-kernel`` package with the ``[cutedsl]`` extra
-(https://github.com/Yifei-Zuo/Parallax) is importable, its CuTe SM90 decode
-baseline is benchmarked alongside FlagAttention for comparison; otherwise only
-the FlagAttention kernel is timed.
-
 Examples::
 
     CUDA_VISIBLE_DEVICES=0 python benchmark/parallax_decode_benchmark.py
     CUDA_VISIBLE_DEVICES=0 python benchmark/parallax_decode_benchmark.py \
         --shape 1,2048,8,8,128 --shape 2,8192,8,2,128 --dtype float16
 
-Each shape is checked against the fp32 reference before it is timed. Providers
-are captured into separate CUDA graphs with multiple calls per graph, then
-timed by graph replay in mirrored provider order. The reported speedup is
-``CuTe_ms / TLE_ms``; values above 1 mean TLE is faster.
+Each shape is checked against the fp32 reference before it is timed. The local
+FlagAttention TLE operator is captured into a CUDA graph with multiple calls
+per graph, then timed by graph replay. No external operator package is
+imported.
 """
 
 from __future__ import annotations
@@ -40,22 +35,10 @@ import statistics
 
 import torch
 
-from flag_attn.parallax import HAS_TLE, parallax_decode as parallax_decode_tle
-
-try:
-    import parallax as parallax_kernel
-
-    if not parallax_kernel.cute_decode_available:
-        raise ImportError(
-            "parallax-kernel is installed without the [cutedsl] extra; "
-            "install it with: pip install 'parallax-kernel[cutedsl]'"
-        )
-    from parallax import parallax_decode as parallax_decode_cute
-except Exception as exc:  # parallax-kernel is an optional benchmark baseline.
-    parallax_decode_cute = None
-    CUTE_IMPORT_ERROR = exc
-else:
-    CUTE_IMPORT_ERROR = None
+from flag_attn.parallax.decode import (
+    HAS_TLE,
+    parallax_decode as parallax_decode_tle,
+)
 
 
 DEFAULT_SHAPES = [
@@ -109,34 +92,16 @@ def _median_and_mad_percent(samples: list[float]) -> tuple[float, float]:
 
 
 def _sample_median_and_mad(
-    graphs: dict[str, torch.cuda.CUDAGraph],
+    graph: torch.cuda.CUDAGraph,
     calls_per_graph: int,
     samples: int,
-) -> dict[str, tuple[float, float]]:
-    """Replay captured graphs in mirrored order and report median and MAD%."""
-    names = list(graphs)
-    runs: dict[str, list[float]] = {name: [] for name in names}
-    if len(names) == 1:
-        # A single provider has no ordering bias to cancel out.
-        name = names[0]
-        runs[name] = [
-            _graph_sample_ms(graphs[name], calls_per_graph) for _ in range(samples)
-        ]
-    else:
-        first, second = names
-        orders = (
-            (first, second, second, first),
-            (second, first, first, second),
-        )
-        round_id = 0
-        while any(len(runs[name]) < samples for name in names):
-            for provider in orders[round_id % 2]:
-                if len(runs[provider]) < samples:
-                    runs[provider].append(
-                        _graph_sample_ms(graphs[provider], calls_per_graph)
-                    )
-            round_id += 1
-    return {name: _median_and_mad_percent(values) for name, values in runs.items()}
+) -> tuple[float, float]:
+    """Replay the local TLE graph and report median latency and MAD%."""
+    values = [
+        _graph_sample_ms(graph, calls_per_graph)
+        for _ in range(samples)
+    ]
+    return _median_and_mad_percent(values)
 
 
 def _rel_err(actual, expected):
@@ -197,7 +162,7 @@ def main():
     )
     parser.add_argument(
         "--samples", type=int, default=12,
-        help="timed graph replays per provider",
+        help="timed graph replays for the local TLE operator",
     )
     args = parser.parse_args()
     if args.warmup < 1 or args.iterations < 1 or args.samples < 1:
@@ -209,29 +174,14 @@ def main():
         raise SystemExit(
             "FlagTree TLE is unavailable: expected triton.experimental.tle.language"
         )
-    run_cute = parallax_decode_cute is not None
-    if run_cute and torch.cuda.get_device_capability()[0] != 9:
-        raise SystemExit("the CuTe baseline requires an SM90 GPU")
-
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     shapes = args.shape or DEFAULT_SHAPES
     print(f"GPU: {torch.cuda.get_device_name()} | dtype={dtype} | window={args.window}")
     print(
         f"mode=CUDA-graph, eager-warmup={args.warmup}, "
-        f"calls/graph={args.iterations}, replays/provider={args.samples}"
+        f"calls/graph={args.iterations}, replays={args.samples}"
     )
-    if run_cute:
-        print(
-            "speedup = CuTe/TLE (>1 means TLE is faster); "
-            "measurement_order = mirrored ABBA/BAAB"
-        )
-    else:
-        print(
-            "CuTe baseline unavailable; timing FlagAttention TLE only. Install "
-            "'parallax-kernel[cutedsl]' from "
-            "https://github.com/Yifei-Zuo/Parallax to enable the comparison. "
-            f"Underlying import error: {CUTE_IMPORT_ERROR!r}"
-        )
+    print("provider=FlagAttention TLE; reference=local fp32 PyTorch oracle")
     print(
         "TLE config: "
         f"BN={os.environ.get('PARALLAX_TLE_BLOCK_N', 'auto')} "
@@ -242,18 +192,10 @@ def main():
     )
     if "PARALLAX_TLE_BLOCK_N" not in os.environ:
         print("TLE BN auto policy: BN=64 for D=128,L<=512; BN=128 otherwise")
-    header = (
+    print(
         f"{'B':>3} {'L':>7} {'HQ':>4} {'HKV':>4} {'D':>4} "
         f"{'TLE(ms)':>11} {'TLEMAD%':>9} {'TLE-ref':>10}"
     )
-    if run_cute:
-        header = (
-            f"{'B':>3} {'L':>7} {'HQ':>4} {'HKV':>4} {'D':>4} "
-            f"{'CuTe(ms)':>11} {'TLE(ms)':>11} {'speedup':>9} "
-            f"{'CuTeMAD%':>9} {'TLEMAD%':>9} "
-            f"{'CuTe-ref':>10} {'TLE-ref':>10} {'TLE-CuTe':>10}"
-        )
-    print(header)
 
     for case_id, (B, L, HQ, H, D) in enumerate(shapes):
         q, r, k, v = _make_inputs(B, L, HQ, H, D, dtype, seed=2026 + case_id)
@@ -262,60 +204,32 @@ def main():
         tle_fn = lambda: parallax_decode_tle(
             q, r, k, v, scale, window_size_left=args.window, out=out_tle
         )
-        out_cute = torch.empty_like(q) if run_cute else None
-        cute_fn = (
-            lambda: parallax_decode_cute(
-                q, r, k, v, scale, window_size_left=args.window, out=out_cute
-            )
-            if run_cute
-            else None
-        )
 
         # Compile outside the timed region and reject numerically invalid rows.
         tle_fn()
-        if run_cute:
-            cute_fn()
         torch.cuda.synchronize()
         reference = _decode_reference(q, r, k, v, scale, args.window)
         tle_ref_error = _rel_err(out_tle, reference)
-        errors = [tle_ref_error]
-        if run_cute:
-            cute_ref_error = _rel_err(out_cute, reference)
-            cross_error = _rel_err(out_tle, out_cute)
-            errors += [cute_ref_error, cross_error]
-        if max(errors) >= 1e-2:
+        if tle_ref_error >= 1e-2:
             raise RuntimeError(f"correctness check failed for {(B, L, HQ, H, D)}")
 
         # Warm every lazy path before capture. Stable out/workspace tensors are
         # supplied by the closures, so replay performs no allocator work.
         for _ in range(args.warmup):
             tle_fn()
-            if run_cute:
-                cute_fn()
         torch.cuda.synchronize()
-        graphs = {"tle": _capture_graph(tle_fn, args.iterations)}
-        if run_cute:
-            graphs["cute"] = _capture_graph(cute_fn, args.iterations)
+        graph = _capture_graph(tle_fn, args.iterations)
         for _ in range(3):
-            for graph in graphs.values():
-                graph.replay()
+            graph.replay()
         torch.cuda.synchronize()
 
-        timings = _sample_median_and_mad(graphs, args.iterations, args.samples)
-        tle_ms, tle_mad = timings["tle"]
-        row = (
+        tle_ms, tle_mad = _sample_median_and_mad(
+            graph, args.iterations, args.samples
+        )
+        print(
             f"{B:3d} {L:7d} {HQ:4d} {H:4d} {D:4d} "
             f"{tle_ms:11.6f} {tle_mad:9.3f} {tle_ref_error:10.3e}"
         )
-        if run_cute:
-            cute_ms, cute_mad = timings["cute"]
-            row = (
-                f"{B:3d} {L:7d} {HQ:4d} {H:4d} {D:4d} "
-                f"{cute_ms:11.6f} {tle_ms:11.6f} {cute_ms / tle_ms:8.3f}x "
-                f"{cute_mad:9.3f} {tle_mad:9.3f} "
-                f"{cute_ref_error:10.3e} {tle_ref_error:10.3e} {cross_error:10.3e}"
-            )
-        print(row)
 
 
 if __name__ == "__main__":
