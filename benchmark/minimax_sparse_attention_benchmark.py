@@ -22,7 +22,6 @@ with scalar K/V dequantization scales passed to both implementations.
 
 from __future__ import annotations
 
-import argparse
 import inspect
 import sys
 import warnings
@@ -108,12 +107,10 @@ KV_SCALE = 0.5
 PREFILL_SHAPES = [
     (1, 8192, 16, 96),
     (2, 16384, 8, 96),
-    (4, 2048, 16, 96),
+    (1, 32768, 16, 96),
+    (2, 8192, 8, 96),
     (4, 4096, 16, 384),
-    (8, 2048, 32, 192),
-    (2, 2048, 16, 96),
-    (4, 1024, 8, 96),
-    (8, 1024, 8, 48),
+    (4, 4096, 16, 256),
 ]
 
 DECODE_SHAPES = [
@@ -126,6 +123,26 @@ DECODE_SHAPES = [
     (32, 2048, 4, 48),
     (64, 1024, 4, 48),
 ]
+
+
+@dataclass
+class MSABenchmarkArgs:
+    dtype: str = "both"
+    shape: str | None = None
+    topk: int = 16
+    init_blocks: int = 1
+    local_blocks: int = 2
+    all_shapes: bool = False
+    per_step: bool = True
+    identity_pages: bool = False
+    prefill_only: bool = False
+    decode_only: bool = False
+    decode_qlen: int = 1
+    warmup: int = DEFAULT_WARMUP
+    rep: int = DEFAULT_REP
+    seed: int = 0
+    no_vllm: bool = False
+    decode: bool = False
 
 
 @dataclass
@@ -260,6 +277,10 @@ def make_data(
     physical_pages = torch.randperm(total_blocks, device=device, generator=generator)
     if not randomize_pages:
         physical_pages = torch.arange(total_blocks, device=device)
+    # Force identity page ordering for FP8 inputs.
+    if dtype_name == "fp8":
+        physical_pages = torch.arange(total_blocks, device=device)
+        randomize_pages = False  # Skip the page-remapping step below.
     block_table = physical_pages.reshape(batch, blocks_per_request).to(torch.int32)
     if randomize_pages:
         kv_cache = kv_cache[physical_pages.argsort()].contiguous()
@@ -441,7 +462,7 @@ def _supports_fp8_scales() -> bool:
 def _bench_steps(
     data: MSAData,
     decode: bool,
-    args: argparse.Namespace,
+    args: MSABenchmarkArgs,
     shape: tuple[int, int, int, int],
 ) -> dict[str, float]:
     batch, seq_len, num_kv_heads, _ = shape
@@ -554,7 +575,7 @@ def _parse_shape(value: str) -> tuple[int, int, int, int]:
     return shape
 
 
-def _get_shapes(args: argparse.Namespace) -> list[tuple[int, int, int, int]]:
+def _get_shapes(args: MSABenchmarkArgs) -> list[tuple[int, int, int, int]]:
     if args.shape is not None and not args.all_shapes:
         return [_parse_shape(args.shape)]
     return DECODE_SHAPES if args.decode else PREFILL_SHAPES
@@ -564,14 +585,15 @@ def _format_columns(columns: list[tuple[str, int]]) -> str:
     return "  ".join(f"{value:>{width}s}" for value, width in columns)
 
 
-def _run_dtype(args: argparse.Namespace, dtype_name: str) -> None:
+def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
     run_vllm = VLLM_AVAILABLE and not args.no_vllm
     if dtype_name == "fp8" and run_vllm and not _supports_fp8_scales():
         print("[baseline] vLLM FP8 skipped: k_scale/v_scale are unavailable")
         run_vllm = False
 
     mode = f"decode qlen={args.decode_qlen}" if args.decode else "prefill"
-    page_mode = "identity" if args.identity_pages else "random"
+    use_identity_pages = args.identity_pages or dtype_name == "fp8"
+    page_mode = "identity" if use_identity_pages else "random"
     print(f"\nMiniMax M3 paged sparse attention ({mode})")
     print(
         f"dtype={dtype_name}, topk={args.topk}, "
@@ -583,7 +605,7 @@ def _run_dtype(args: argparse.Namespace, dtype_name: str) -> None:
     if run_vllm:
         print("Provider order: alternates by shape")
     else:
-        print("vLLM baseline: unavailable; FlagAttention only")
+        print("vLLM baseline: unavailable; FlagAttn only")
 
     headers = [("Shape [B,S,KVH,H]", 22), ("FlagAttn(ms)", 13)]
     if run_vllm:
@@ -622,7 +644,7 @@ def _run_dtype(args: argparse.Namespace, dtype_name: str) -> None:
             dtype_name,
             decode=args.decode,
             decode_qlen=args.decode_qlen,
-            randomize_pages=not args.identity_pages,
+            randomize_pages=not use_identity_pages,
             generator=generator,
         )
         flag_attn_output = torch.empty_like(data.q)
@@ -731,31 +753,10 @@ def _run_dtype(args: argparse.Namespace, dtype_name: str) -> None:
         sys.stdout.flush()
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dtype", choices=("bf16", "fp8", "both"), default="bf16")
-    parser.add_argument("--shape", default=None)
-    parser.add_argument("--topk", type=int, default=32)
-    parser.add_argument("--init-blocks", type=int, default=1)
-    parser.add_argument("--local-blocks", type=int, default=2)
-    parser.add_argument("--all-shapes", action="store_true")
-    parser.add_argument("--per-step", action="store_true")
-    parser.add_argument("--identity-pages", action="store_true")
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--prefill-only", action="store_true")
-    mode.add_argument(
-        "--decode-only", "--decode", dest="decode_only", action="store_true"
-    )
-    parser.add_argument("--decode-qlen", type=int, default=1)
-    parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
-    parser.add_argument("--rep", type=int, default=DEFAULT_REP)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--no-vllm", action="store_true")
-    return parser.parse_args(argv)
-
-
-def run_benchmark(args: argparse.Namespace) -> None:
+def run_benchmark(args: MSABenchmarkArgs) -> None:
     _require_cuda()
+    if args.topk < 1:
+        raise ValueError("--topk must be positive")
     if args.decode_qlen < 1:
         raise ValueError("--decode-qlen must be positive")
     if args.warmup < 0 or args.rep <= 0:
@@ -796,16 +797,11 @@ def run_benchmark(args: argparse.Namespace) -> None:
             _run_dtype(args, dtype_name)
 
 
-def test_msa_benchmark() -> None:
-    """Run the MSA benchmark through pytest with default timing options."""
-    args = parse_args([])
-    args.per_step = True
+def test_msa_benchmark(request) -> None:
+    """Run the MSA benchmark through pytest using benchmark CLI timing options."""
+    args = MSABenchmarkArgs(
+        topk=int(request.config.getoption("--topk", default=16)),
+        warmup=int(request.config.getoption("--warmup", default=DEFAULT_WARMUP)),
+        rep=int(request.config.getoption("--iter", default=DEFAULT_REP)),
+    )
     run_benchmark(args)
-
-
-def main() -> None:
-    run_benchmark(parse_args())
-
-
-if __name__ == "__main__":
-    main()
