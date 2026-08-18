@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: MIT
 """Single-token Parallax decode written in Triton with TLE async loads.
 
-This is the TLE counterpart of :mod:`flag_attn.parallax.cute.parallax_decode`.  It uses
-the same ``(B, 1, H_q, D)`` query and ``(B, L, H_kv, D)`` cache layouts and
-evaluates the same composite Parallax attention formula::
+This is the Triton counterpart of the CuTeDSL SM90 decode shipped by the
+external ``parallax-kernel`` package (https://github.com/Yifei-Zuo/Parallax).
+It uses the same ``(B, 1, H_q, D)`` query and ``(B, L, H_kv, D)`` cache layouts
+and evaluates the same composite Parallax attention formula::
 
     s1_j = scale * dot(q, k_j)
     s2_j = dot(r, k_j)

@@ -1,4 +1,23 @@
-"""Correctness tests for TLE decode, using the CuTe SM90 kernel as baseline."""
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Correctness tests for TLE decode.
+
+When the external ``parallax-kernel`` package with the ``[cutedsl]`` extra
+(https://github.com/Yifei-Zuo/Parallax) is available, its CuTe SM90 kernel is
+used as an additional baseline.
+"""
 
 from __future__ import annotations
 
@@ -7,14 +26,19 @@ import math
 import pytest
 import torch
 
-from flag_attn.parallax.tle import HAS_TLE, parallax_attn_with_kvcache, parallax_decode
+from flag_attn.parallax import HAS_TLE, parallax_attn_with_kvcache, parallax_decode
 
 try:
-    from flag_attn.parallax.cute import (
-        parallax_attn_with_kvcache as cute_kvcache,
-        parallax_decode as cute_decode,
-    )
-except Exception as exc:
+    import parallax as parallax_kernel
+
+    if not parallax_kernel.cute_decode_available:
+        raise ImportError(
+            "parallax-kernel is installed without the [cutedsl] extra; "
+            "install it with: pip install 'parallax-kernel[cutedsl]'"
+        )
+    from parallax import parallax_attn_with_kvcache as cute_kvcache
+    from parallax import parallax_decode as cute_decode
+except Exception as exc:  # parallax-kernel is an optional test baseline.
     cute_kvcache = None
     cute_decode = None
     CUTE_IMPORT_ERROR = exc
