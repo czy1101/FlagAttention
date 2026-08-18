@@ -1,6 +1,6 @@
-# FP8 Decode Attention with Triton + TLE
+# Hy3 HPC-Ops FP8 Decode Attention with Triton + TLE
 
-本项目提供面向 NVIDIA Hopper GPU 的 MTP=1 FP8 decode attention 实现，
+本项目提供面向 NVIDIA Hopper GPU 的 MTP=1 Hy3 HPC-Ops FP8 decode attention 实现，
 计算内核基于 Triton Language Extensions（TLE），并提供 GPU 任务调度、测试和
 性能基准。
 
