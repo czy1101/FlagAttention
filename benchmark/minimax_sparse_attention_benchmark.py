@@ -1,6 +1,21 @@
+#!/usr/bin/env python3
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """CUDA benchmark for the MiniMax M3 paged MSA kernels.
 
-The benchmark compares the FlagGems and vLLM implementations on the same
+The benchmark compares the FlagAttention and vLLM implementations on the same
 inputs.  ``fp8`` means FP8 index queries/index keys and FP8 main KV cache,
 with scalar K/V dequantization scales passed to both implementations.
 """
@@ -64,13 +79,13 @@ class _CachedPlatform:
         return self._supports_pdl
 
 
-_flaggems_index_module = sys.modules[minimax_m3_index_decode.__module__]
-_flaggems_sparse_module = sys.modules[minimax_m3_sparse_attn_decode.__module__]
-_flaggems_platform = _CachedPlatform(
-    _flaggems_index_module.current_platform.is_arch_support_pdl()
+_flag_attn_index_module = sys.modules[minimax_m3_index_decode.__module__]
+_flag_attn_sparse_module = sys.modules[minimax_m3_sparse_attn_decode.__module__]
+_flag_attn_platform = _CachedPlatform(
+    _flag_attn_index_module.current_platform.is_arch_support_pdl()
 )
-_flaggems_index_module.current_platform = _flaggems_platform
-_flaggems_sparse_module.current_platform = _flaggems_platform
+_flag_attn_index_module.current_platform = _flag_attn_platform
+_flag_attn_sparse_module.current_platform = _flag_attn_platform
 
 if VLLM_AVAILABLE:
     _vllm_index_module = sys.modules[vllm_index_decode.__module__]
@@ -590,9 +605,9 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
     if run_vllm:
         print("Provider order: alternates by shape")
     else:
-        print("vLLM baseline: unavailable; FlagGems only")
+        print("vLLM baseline: unavailable; FlagAttn only")
 
-    headers = [("Shape [B,S,KVH,H]", 22), ("FlagGems(ms)", 13)]
+    headers = [("Shape [B,S,KVH,H]", 22), ("FlagAttn(ms)", 13)]
     if run_vllm:
         headers.extend([("vLLM(ms)", 10), ("vLLM/ours", 10)])
     if args.per_step:
@@ -632,10 +647,10 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
             randomize_pages=not use_identity_pages,
             generator=generator,
         )
-        flaggems_output = torch.empty_like(data.q)
+        flag_attn_output = torch.empty_like(data.q)
         vllm_output = torch.empty_like(data.q) if run_vllm else None
 
-        def flaggems_run() -> None:
+        def flag_attn_run() -> None:
             if args.decode:
                 run_decode(
                     minimax_m3_index_decode,
@@ -647,7 +662,7 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
                     args.init_blocks,
                     args.local_blocks,
                     args.decode_qlen,
-                    flaggems_output,
+                    flag_attn_output,
                 )
             else:
                 run_prefill(
@@ -660,7 +675,7 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
                     args.topk,
                     args.init_blocks,
                     args.local_blocks,
-                    flaggems_output,
+                    flag_attn_output,
                 )
 
         def vllm_run() -> None:
@@ -694,28 +709,28 @@ def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
 
         if run_vllm:
             providers = (
-                (("flaggems", flaggems_run), ("vllm", vllm_run))
+                (("flag_attn", flag_attn_run), ("vllm", vllm_run))
                 if shape_index % 2 == 0
-                else (("vllm", vllm_run), ("flaggems", flaggems_run))
+                else (("vllm", vllm_run), ("flag_attn", flag_attn_run))
             )
             timings = {
                 name: bench_fn(fn, args.warmup, args.rep) for name, fn in providers
             }
-            flaggems_ms = timings["flaggems"]
+            flag_attn_ms = timings["flag_attn"]
             vllm_ms = timings["vllm"]
         else:
-            flaggems_ms = bench_fn(flaggems_run, args.warmup, args.rep)
+            flag_attn_ms = bench_fn(flag_attn_run, args.warmup, args.rep)
 
         steps = _bench_steps(data, args.decode, args, shape) if args.per_step else {}
         row = [
             (f"{batch}x{seq_len}x{num_kv_heads}x{num_heads}", 22),
-            (f"{flaggems_ms:.4f}", 13),
+            (f"{flag_attn_ms:.4f}", 13),
         ]
         if run_vllm:
             row.extend(
                 [
                     (f"{vllm_ms:.4f}", 10),
-                    (f"{vllm_ms / flaggems_ms:.2f}x", 10),
+                    (f"{vllm_ms / flag_attn_ms:.2f}x", 10),
                 ]
             )
         if args.per_step:
