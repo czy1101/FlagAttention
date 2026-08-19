@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright 2026 FlagOS Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,18 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Forward and backward benchmark for chunked gated linear attention."""
-
-from __future__ import annotations
-
 import torch
 import torch.nn.functional as F
 import triton
 
 from flag_attn.gated_linear_attention import chunk_gla as flag_attn_chunk_gla
 
-DEFAULT_WARMUP = 100
-DEFAULT_REP = 200
 
 # optional FLA reference
 _HAS_FLA_CHUNK = False
@@ -39,9 +32,6 @@ except Exception:
 
 
 def _fla_chunk_wrapper(q, k, v, g, **kwargs):
-    if not _HAS_FLA_CHUNK:
-        raise RuntimeError("fla chunk_gla is unavailable")
-
     return _fla_chunk_gla(
         q=q,
         k=k,
@@ -55,26 +45,8 @@ def _fla_chunk_wrapper(q, k, v, g, **kwargs):
     )
 
 
-def _precompile():
-    """
-    Force:
-    1. Triton JIT compile
-    2. autotune cache population
-    3. CUDA context stabilization
-    """
-    print("[precompile] warming up kernels & autotune cache ...")
-
-    device = torch.device("cuda")
-    dtype = torch.float16
-
-    B, T, H, D = 1, 512, 8, 64
-
-    q = torch.randn(B, T, H, D, device=device, dtype=dtype)
-    k = torch.randn(B, T, H, D, device=device, dtype=dtype)
-    v = torch.randn(B, T, H, D, device=device, dtype=dtype)
-    g = F.logsigmoid(torch.randn(B, T, H, D, device=device, dtype=dtype))
-
-    kwargs = {
+def _make_kwargs(D: int) -> dict:
+    return {
         "scale": D**-0.5,
         "initial_state": None,
         "output_final_state": False,
@@ -82,23 +54,6 @@ def _precompile():
         "cu_seqlens": None,
         "cu_seqlens_cpu": None,
     }
-
-    # run multiple times to fully warm autotune
-    for _ in range(5):
-        if _HAS_FLA_CHUNK:
-            _fla_chunk_wrapper(q, k, v, g, **kwargs)
-        flag_attn_chunk_gla(q, k, v, g, **kwargs)
-
-    torch.cuda.synchronize()
-
-
-def _bench_ms(fn, warmup: int, rep: int) -> float:
-    return triton.testing.do_bench(
-        fn,
-        warmup=warmup,
-        rep=rep,
-        return_mode="median",
-    )
 
 
 def _build_inputs(B, T, H, D, dtype, requires_grad=False):
@@ -110,24 +65,13 @@ def _build_inputs(B, T, H, D, dtype, requires_grad=False):
         B, T, H, D, device=device, dtype=dtype, requires_grad=requires_grad
     )
 
-    kwargs = {
-        "scale": D**-0.5,
-        "initial_state": None,
-        "output_final_state": False,
-        "state_v_first": False,
-        "cu_seqlens": None,
-        "cu_seqlens_cpu": None,
-    }
     if requires_grad:
-        return q, k, v, g_logit, kwargs
+        return q, k, v, g_logit
     else:
         g = F.logsigmoid(g_logit)
-        return q, k, v, g, kwargs
+        return q, k, v, g
 
 
-# ---------------------------
-# fwd+bwd benchmark helper
-# ---------------------------
 def _bench_fwd_bwd_ms(fn, q, k, v, g_logit, kwargs, warmup: int, rep: int) -> float:
     """Measure forward + backward pass time for a chunk_gla function.
 
@@ -157,7 +101,11 @@ def _bench_fwd_bwd_ms(fn, q, k, v, g_logit, kwargs, warmup: int, rep: int) -> fl
     )
 
 
+DEFAULT_WARMUP = 100
+DEFAULT_REP = 200
+
 _SHAPES = [
+    # (B, T, H, D)
     # (1, 4096, 32, 512),
     # (2, 2048, 16, 512),
     (1, 8192, 96, 128),
@@ -170,153 +118,56 @@ _SHAPES = [
     (8, 1024, 8, 64),
 ]
 
-_DTYPES = [
+_T_DTYPES = [
     torch.bfloat16,
     # torch.float32,
     # torch.float16,
 ]
 
+configs = [
+    triton.testing.Benchmark(
+        x_names=["shape"],
+        x_vals=[(B, T, H, D) for B, T, H, D in _SHAPES],
+        line_arg="provider",
+        line_vals=["flag_attn"] + (["fla"] if _HAS_FLA_CHUNK else []),
+        line_names=["flag_attn"] + (["fla"] if _HAS_FLA_CHUNK else []),
+        styles=[("red", "-"), ("blue", "-")],
+        ylabel="ms",
+        plot_name=f"chunk_gla-mode-{mode}-dtype-{dtype}",
+        args={"mode": mode, "dtype": dtype},
+    )
+    for mode in ["fwd", "bwd"]
+    for dtype in _T_DTYPES
+]
 
-def _print_header(title: str, subtitle: str, warmup: int, rep: int) -> None:
-    print(f"\n{'=' * 70}")
-    print(f"  {title}")
-    print(f"  {subtitle}")
-    print(f"  warmup={warmup}ms  rep={rep}ms")
-    print(f"{'=' * 70}")
 
-    if _HAS_FLA_CHUNK:
-        print(
-            f"{'B':>3} {'T':>6} {'H':>4} {'D':>4} {'dtype':>8} "
-            f"{'fla(ms)':>10} {'flag_attn(ms)':>14} {'fla/flag_attn':>14}"
-        )
+@triton.testing.perf_report(configs)
+def bench_chunk_gla(shape, mode, provider, dtype=torch.bfloat16, device="cuda"):
+    assert mode in ["fwd", "bwd"]
+    B, T, H, D = shape
+
+    is_bwd = mode == "bwd"
+    kwargs = _make_kwargs(D)
+
+    if provider == "flag_attn":
+        fn = flag_attn_chunk_gla
+    elif provider == "fla":
+        fn = _fla_chunk_wrapper
     else:
-        print(
-            f"{'B':>3} {'T':>6} {'H':>4} {'D':>4} {'dtype':>8} "
-            f"{'flag_attn(ms)':>14}"
-        )
+        raise ValueError(f"unknown provider: {provider}")
 
-
-def _print_row(B, T, H, D, dtype, ms_fla, ms_flag_attn) -> None:
-    dtype_str = str(dtype).split(".")[-1]
-    if _HAS_FLA_CHUNK:
-        speedup = ms_fla / ms_flag_attn if ms_flag_attn > 0 else float("inf")
-        print(
-            f"{B:>3} {T:>6} {H:>4} {D:>4} {dtype_str:>8} "
-            f"{ms_fla:>10.3f} {ms_flag_attn:>14.3f} {speedup:>14.2f}x"
-        )
+    if is_bwd:
+        q, k, v, g_logit = _build_inputs(B, T, H, D, dtype, requires_grad=True)
+        ms = _bench_fwd_bwd_ms(fn, q, k, v, g_logit, kwargs, DEFAULT_WARMUP, DEFAULT_REP)
     else:
-        print(
-            f"{B:>3} {T:>6} {H:>4} {D:>4} {dtype_str:>8} "
-            f"{ms_flag_attn:>14.3f}"
+        q, k, v, g = _build_inputs(B, T, H, D, dtype, requires_grad=False)
+        ms = triton.testing.do_bench(
+            lambda: fn(q, k, v, g, **kwargs), warmup=DEFAULT_WARMUP, rep=DEFAULT_REP
         )
 
-
-# ---------------------------
-# unified benchmark (fwd then fwd+bwd)
-# ---------------------------
-def run_benchmark(warmup: int = DEFAULT_WARMUP, rep: int = DEFAULT_REP) -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("chunk_gla benchmark requires CUDA")
-
-    # ============================================================
-    # Part 1: forward only
-    # ============================================================
-    _print_header(
-        "chunk_gla benchmark — FWD ONLY",
-        "provider: fla_chunk vs flag_attn_chunk",
-        warmup,
-        rep,
-    )
-
-    _precompile()
-    torch.cuda.synchronize()
-
-    for dtype in _DTYPES:
-        print("\ndtype:", dtype)
-        for B, T, H, D in _SHAPES:
-            q, k, v, g, kwargs = _build_inputs(B, T, H, D, dtype)
-
-            ms_fla = None
-            if _HAS_FLA_CHUNK:
-                ms_fla = _bench_ms(
-                    lambda: _fla_chunk_wrapper(q, k, v, g, **kwargs), warmup, rep
-                )
-            ms_flag_attn = _bench_ms(
-                lambda: flag_attn_chunk_gla(q, k, v, g, **kwargs), warmup, rep
-            )
-            _print_row(B, T, H, D, dtype, ms_fla, ms_flag_attn)
-
-    # ============================================================
-    # Part 2: forward + backward
-    # ============================================================
-    _print_header(
-        "chunk_gla benchmark — FWD + BWD",
-        "provider: fla_chunk vs flag_attn_chunk  (forward + backward)",
-        warmup,
-        rep,
-    )
-
-    # warmup: run fwd+bwd on a small shape so backward kernels compile
-    print("[precompile] warming up fwd+bwd kernels ...")
-    wq, wk, wv, wg_logit, wkwargs = _build_inputs(
-        1, 256, 4, 64, torch.float16, requires_grad=True
-    )
-    for _ in range(3):
-        if _HAS_FLA_CHUNK:
-            wg = F.logsigmoid(wg_logit)
-            out = _fla_chunk_wrapper(wq, wk, wv, wg, **wkwargs)
-            if isinstance(out, tuple):
-                out = out[0]
-            out.sum().backward()
-            for p in [wq, wk, wv, wg_logit]:
-                if p.grad is not None:
-                    p.grad.zero_()
-        wg = F.logsigmoid(wg_logit)
-        out = flag_attn_chunk_gla(wq, wk, wv, wg, **wkwargs)
-        if isinstance(out, tuple):
-            out = out[0]
-        out.sum().backward()
-        for p in [wq, wk, wv, wg_logit]:
-            if p.grad is not None:
-                p.grad.zero_()
-    torch.cuda.synchronize()
-
-    for dtype in _DTYPES:
-        print("\ndtype:", dtype)
-        for B, T, H, D in _SHAPES:
-            q, k, v, g_logit, kwargs = _build_inputs(
-                B, T, H, D, dtype, requires_grad=True
-            )
-
-            ms_fla = None
-            if _HAS_FLA_CHUNK:
-                ms_fla = _bench_fwd_bwd_ms(
-                    _fla_chunk_wrapper,
-                    q,
-                    k,
-                    v,
-                    g_logit,
-                    kwargs,
-                    warmup,
-                    rep,
-                )
-            ms_flag_attn = _bench_fwd_bwd_ms(
-                flag_attn_chunk_gla,
-                q,
-                k,
-                v,
-                g_logit,
-                kwargs,
-                warmup,
-                rep,
-            )
-            _print_row(B, T, H, D, dtype, ms_fla, ms_flag_attn)
-
-    print(f"\n{'=' * 70}")
-    print("  All done. ")
-    print(f"{'=' * 70}\n")
+    # Return raw latency in ms, matching the original benchmark semantics.
+    return ms
 
 
-def test_chunk_gla_benchmark() -> None:
-    """Allow explicit execution through pytest with default timings."""
-    run_benchmark()
+# only works on post-Ampere GPUs right now
+bench_chunk_gla.run(print_data=True)
