@@ -12,7 +12,6 @@ import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
-from flag_attn.utils import check_shared_mem, input_guard, tensor_cache
 
 
 
