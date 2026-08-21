@@ -12,21 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility helpers for running the GLA kernels without FlagGems."""
+"""Chunked gated linear attention implemented with Triton kernels."""
 
-from collections.abc import Sequence
-from typing import Any
+from flag_attn.FLA.gated_linear_attention.chunk_gla import chunk_gla
 
-import triton
-
-
-def libtuner(
-    *,
-    configs: Sequence[triton.Config],
-    key: Sequence[str],
-    use_cuda_graph: bool = False,
-    **kwargs: Any,
-):
-    """Map FlagGems autotuning metadata to Triton's native autotuner."""
-    del use_cuda_graph
-    return triton.autotune(configs=list(configs), key=list(key), **kwargs)
+__all__ = ["chunk_gla"]

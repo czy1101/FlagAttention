@@ -102,11 +102,6 @@ FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 DEFAULT_WARMUP = 200
 DEFAULT_REP = 300
 KV_SCALE = 0.5
-SEED = 0
-TOPK = 16
-INIT_BLOCKS = 1
-LOCAL_BLOCKS = 2
-DECODE_QLEN = 1
 
 PREFILL_SHAPES = [
     (1, 8192, 16, 96),
@@ -127,6 +122,26 @@ DECODE_SHAPES = [
     (32, 2048, 4, 48),
     (64, 1024, 4, 48),
 ]
+
+
+@dataclass
+class MSABenchmarkArgs:
+    dtype: str = "both"
+    shape: str | None = None
+    topk: int = 16
+    init_blocks: int = 1
+    local_blocks: int = 2
+    all_shapes: bool = False
+    per_step: bool = True
+    identity_pages: bool = False
+    prefill_only: bool = False
+    decode_only: bool = False
+    decode_qlen: int = 1
+    warmup: int = DEFAULT_WARMUP
+    rep: int = DEFAULT_REP
+    seed: int = 0
+    no_vllm: bool = False
+    decode: bool = False
 
 
 @dataclass
@@ -443,129 +458,349 @@ def _supports_fp8_scales() -> bool:
     )
 
 
-def _select_impl(
-    provider: str,
-) -> tuple[Callable, Callable, Callable, Callable, Callable]:
-    if provider == "flag_attn":
-        return (
-            minimax_m3_index_decode,
-            minimax_m3_index_score,
-            minimax_m3_index_topk,
-            minimax_m3_sparse_attn,
-            minimax_m3_sparse_attn_decode,
-        )
-    if provider == "vllm":
-        return (
-            vllm_index_decode,
-            vllm_index_score,
-            vllm_index_topk,
-            vllm_sparse_attn,
-            vllm_sparse_attn_decode,
-        )
-    raise ValueError(f"unknown provider: {provider}")
-
-
-def _provider_vals(dtype_name: str) -> list[str]:
-    vals = ["flag_attn"]
-    if VLLM_AVAILABLE:
-        # vLLM cannot run FP8 without k_scale/v_scale support.
-        if dtype_name == "fp8" and not _supports_fp8_scales():
-            pass
-        else:
-            vals.append("vllm")
-    return vals
-
-
-_DTYPES = ["bf16"] + (["fp8"] if _supports_fp8() else [])
-
-configs = [
-    triton.testing.Benchmark(
-        x_names=["shape"],
-        x_vals=SHAPES,
-        line_arg="provider",
-        line_vals=_provider_vals(dtype_name),
-        line_names=_provider_vals(dtype_name),
-        styles=[("red", "-"), ("blue", "-")],
-        ylabel="ms",
-        plot_name=f"minimax_m3_sparse_attention-{mode}-{dtype_name}",
-        args={"mode": mode, "dtype": dtype_name},
-    )
-    for mode, SHAPES in [("prefill", PREFILL_SHAPES), ("decode", DECODE_SHAPES)]
-    for dtype_name in _DTYPES
-]
-
-
-@triton.testing.perf_report(configs)
-def bench_minimax_sparse_attention(
-    shape, mode, provider, dtype="bf16", device="cuda"
-):
-    _require_cuda()
-    batch, seq_len, num_kv_heads, num_heads = shape
-    decode = mode == "decode"
-
-    if num_heads % num_kv_heads != 0:
-        raise ValueError(
-            f"Invalid shape {shape}: num_heads must be divisible by num_kv_heads"
-        )
-    if decode and DECODE_QLEN > seq_len:
-        raise ValueError(
-            f"Invalid shape {shape}: decode_qlen={DECODE_QLEN} cannot exceed seq_len"
-        )
-
-    generator = torch.Generator(device=device)
-    generator.manual_seed(SEED + (100_000 if decode else 0))
-    data = make_data(
-        batch,
-        seq_len,
-        num_kv_heads,
-        num_heads,
-        torch.device(device),
-        dtype,
-        decode=decode,
-        decode_qlen=DECODE_QLEN,
-        randomize_pages=dtype != "fp8",
-        generator=generator,
-    )
+def _bench_steps(
+    data: MSAData,
+    decode: bool,
+    args: MSABenchmarkArgs,
+    shape: tuple[int, int, int, int],
+) -> dict[str, float]:
+    batch, seq_len, num_kv_heads, _ = shape
     output = torch.empty_like(data.q)
-
-    index_decode, index_score, index_topk, sparse_attn, sparse_attn_decode = (
-        _select_impl(provider)
-    )
-
     if decode:
 
-        def run() -> None:
-            run_decode(
-                index_decode,
-                sparse_attn_decode,
-                data,
+        def index_decode() -> torch.Tensor:
+            return minimax_m3_index_decode(
+                data.idx_q,
+                data.index_kv_cache,
+                data.block_table,
+                data.seq_lens,
                 seq_len,
+                args.topk,
+                args.init_blocks,
+                args.local_blocks,
                 num_kv_heads,
-                TOPK,
-                INIT_BLOCKS,
-                LOCAL_BLOCKS,
-                DECODE_QLEN,
-                output,
+                args.decode_qlen,
+                args.decode_qlen,
             )
 
+        topk_idx = index_decode()
+
+        def attention() -> None:
+            _call_sparse(
+                minimax_m3_sparse_attn_decode,
+                data,
+                topk_idx,
+                output,
+                decode=True,
+                max_query_len=1,
+                num_kv_heads=num_kv_heads,
+                decode_qlen=args.decode_qlen,
+            )
+
+        attention()
+        torch.cuda.synchronize()
+        return {
+            "index_decode": bench_fn(index_decode, args.warmup, args.rep),
+            "attention_decode": bench_fn(attention, args.warmup, args.rep),
+        }
+
+    scores: torch.Tensor | None = None
+    topk_idx: torch.Tensor | None = None
+
+    def index_score() -> None:
+        nonlocal scores
+        scores = minimax_m3_index_score(
+            data.idx_q,
+            data.index_kv_cache,
+            data.block_table,
+            data.cu_q,
+            data.seq_lens,
+            data.prefix_lens,
+            seq_len,
+            seq_len,
+            num_kv_heads,
+        )
+
+    def index_topk() -> None:
+        nonlocal topk_idx
+        assert scores is not None
+        topk_idx = minimax_m3_index_topk(
+            scores,
+            data.cu_q,
+            data.prefix_lens,
+            seq_len,
+            args.topk,
+            args.init_blocks,
+            args.local_blocks,
+        )
+
+    def attention() -> None:
+        assert topk_idx is not None
+        _call_sparse(
+            minimax_m3_sparse_attn,
+            data,
+            topk_idx,
+            output,
+            decode=False,
+            max_query_len=seq_len,
+            num_kv_heads=num_kv_heads,
+            decode_qlen=1,
+        )
+
+    index_score()
+    index_topk()
+    attention()
+    torch.cuda.synchronize()
+    return {
+        "index_score": bench_fn(index_score, args.warmup, args.rep),
+        "index_topk": bench_fn(index_topk, args.warmup, args.rep),
+        "attention": bench_fn(attention, args.warmup, args.rep),
+    }
+
+
+def _parse_shape(value: str) -> tuple[int, int, int, int]:
+    try:
+        shape = tuple(int(item) for item in value.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            "--shape must contain four comma-separated integers: "
+            "batch,seq_len,num_kv_heads,num_heads"
+        ) from exc
+    if len(shape) != 4 or any(item <= 0 for item in shape):
+        raise ValueError(
+            "--shape must contain four positive integers: "
+            "batch,seq_len,num_kv_heads,num_heads"
+        )
+    return shape
+
+
+def _get_shapes(args: MSABenchmarkArgs) -> list[tuple[int, int, int, int]]:
+    if args.shape is not None and not args.all_shapes:
+        return [_parse_shape(args.shape)]
+    return DECODE_SHAPES if args.decode else PREFILL_SHAPES
+
+
+def _format_columns(columns: list[tuple[str, int]]) -> str:
+    return "  ".join(f"{value:>{width}s}" for value, width in columns)
+
+
+def _run_dtype(args: MSABenchmarkArgs, dtype_name: str) -> None:
+    run_vllm = VLLM_AVAILABLE and not args.no_vllm
+    if dtype_name == "fp8" and run_vllm and not _supports_fp8_scales():
+        print("[baseline] vLLM FP8 skipped: k_scale/v_scale are unavailable")
+        run_vllm = False
+
+    mode = f"decode qlen={args.decode_qlen}" if args.decode else "prefill"
+    use_identity_pages = args.identity_pages or dtype_name == "fp8"
+    page_mode = "identity" if use_identity_pages else "random"
+    print(f"\nMiniMax M3 paged sparse attention ({mode})")
+    print(
+        f"dtype={dtype_name}, topk={args.topk}, "
+        f"init/local={args.init_blocks}/{args.local_blocks}, "
+        f"pages={page_mode}, seed={args.seed}, "
+        f"warmup={args.warmup}ms, rep={args.rep}ms"
+    )
+    print("Timing: eager execution with CUDA events")
+    if run_vllm:
+        print("Provider order: alternates by shape")
     else:
+        print("vLLM baseline: unavailable; FlagAttn only")
 
-        def run() -> None:
-            run_prefill(
-                index_score,
-                index_topk,
-                sparse_attn,
-                data,
-                seq_len,
-                num_kv_heads,
-                TOPK,
-                INIT_BLOCKS,
-                LOCAL_BLOCKS,
-                output,
+    headers = [("Shape [B,S,KVH,H]", 22), ("FlagAttn(ms)", 13)]
+    if run_vllm:
+        headers.extend([("vLLM(ms)", 10), ("vLLM/ours", 10)])
+    if args.per_step:
+        if args.decode:
+            headers.extend([("IdxDec(ms)", 11), ("AttnDec(ms)", 11)])
+        else:
+            headers.extend([("Score(ms)", 10), ("TopK(ms)", 10), ("Attn(ms)", 10)])
+    separator = "-" * len(_format_columns(headers))
+    print(separator)
+    print(_format_columns(headers))
+    print(separator)
+
+    device = torch.device("cuda")
+    for shape_index, shape in enumerate(_get_shapes(args)):
+        batch, seq_len, num_kv_heads, num_heads = shape
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"Invalid shape {shape}: num_heads must be divisible by " "num_kv_heads"
+            )
+        if args.decode and args.decode_qlen > seq_len:
+            raise ValueError(
+                f"Invalid shape {shape}: decode_qlen={args.decode_qlen} "
+                "cannot exceed seq_len"
             )
 
-    return bench_fn(run, DEFAULT_WARMUP, DEFAULT_REP)
+        generator = torch.Generator(device=device)
+        generator.manual_seed(args.seed + shape_index + (100_000 if args.decode else 0))
+        data = make_data(
+            batch,
+            seq_len,
+            num_kv_heads,
+            num_heads,
+            device,
+            dtype_name,
+            decode=args.decode,
+            decode_qlen=args.decode_qlen,
+            randomize_pages=not use_identity_pages,
+            generator=generator,
+        )
+        flag_attn_output = torch.empty_like(data.q)
+        vllm_output = torch.empty_like(data.q) if run_vllm else None
+
+        def flag_attn_run() -> None:
+            if args.decode:
+                run_decode(
+                    minimax_m3_index_decode,
+                    minimax_m3_sparse_attn_decode,
+                    data,
+                    seq_len,
+                    num_kv_heads,
+                    args.topk,
+                    args.init_blocks,
+                    args.local_blocks,
+                    args.decode_qlen,
+                    flag_attn_output,
+                )
+            else:
+                run_prefill(
+                    minimax_m3_index_score,
+                    minimax_m3_index_topk,
+                    minimax_m3_sparse_attn,
+                    data,
+                    seq_len,
+                    num_kv_heads,
+                    args.topk,
+                    args.init_blocks,
+                    args.local_blocks,
+                    flag_attn_output,
+                )
+
+        def vllm_run() -> None:
+            assert vllm_output is not None
+            if args.decode:
+                run_decode(
+                    vllm_index_decode,
+                    vllm_sparse_attn_decode,
+                    data,
+                    seq_len,
+                    num_kv_heads,
+                    args.topk,
+                    args.init_blocks,
+                    args.local_blocks,
+                    args.decode_qlen,
+                    vllm_output,
+                )
+            else:
+                run_prefill(
+                    vllm_index_score,
+                    vllm_index_topk,
+                    vllm_sparse_attn,
+                    data,
+                    seq_len,
+                    num_kv_heads,
+                    args.topk,
+                    args.init_blocks,
+                    args.local_blocks,
+                    vllm_output,
+                )
+
+        if run_vllm:
+            providers = (
+                (("flag_attn", flag_attn_run), ("vllm", vllm_run))
+                if shape_index % 2 == 0
+                else (("vllm", vllm_run), ("flag_attn", flag_attn_run))
+            )
+            timings = {
+                name: bench_fn(fn, args.warmup, args.rep) for name, fn in providers
+            }
+            flag_attn_ms = timings["flag_attn"]
+            vllm_ms = timings["vllm"]
+        else:
+            flag_attn_ms = bench_fn(flag_attn_run, args.warmup, args.rep)
+
+        steps = _bench_steps(data, args.decode, args, shape) if args.per_step else {}
+        row = [
+            (f"{batch}x{seq_len}x{num_kv_heads}x{num_heads}", 22),
+            (f"{flag_attn_ms:.4f}", 13),
+        ]
+        if run_vllm:
+            row.extend(
+                [
+                    (f"{vllm_ms:.4f}", 10),
+                    (f"{vllm_ms / flag_attn_ms:.2f}x", 10),
+                ]
+            )
+        if args.per_step:
+            if args.decode:
+                row.extend(
+                    [
+                        (f"{steps['index_decode']:.4f}", 11),
+                        (f"{steps['attention_decode']:.4f}", 11),
+                    ]
+                )
+            else:
+                row.extend(
+                    [
+                        (f"{steps['index_score']:.4f}", 10),
+                        (f"{steps['index_topk']:.4f}", 10),
+                        (f"{steps['attention']:.4f}", 10),
+                    ]
+                )
+        print(_format_columns(row))
+        sys.stdout.flush()
 
 
-# only works on post-Ampere GPUs right now
-bench_minimax_sparse_attention.run(print_data=True)
+def run_benchmark(args: MSABenchmarkArgs) -> None:
+    _require_cuda()
+    if args.topk < 1:
+        raise ValueError("--topk must be positive")
+    if args.decode_qlen < 1:
+        raise ValueError("--decode-qlen must be positive")
+    if args.warmup < 0 or args.rep <= 0:
+        raise ValueError("--warmup must be non-negative and --rep must be positive")
+    capability = torch.cuda.get_device_capability()
+    print(
+        f"[device] {torch.cuda.get_device_name()} "
+        f"capability={capability[0]}.{capability[1]}"
+    )
+    if args.prefill_only:
+        modes = (False,)
+    elif args.decode_only:
+        modes = (True,)
+    else:
+        modes = (False, True)
+    if args.dtype in {"fp8", "both"} and not _supports_fp8():
+        print("[FP8] skipped: this GPU or PyTorch build does not support FP8")
+    if args.dtype == "fp8" and not _supports_fp8():
+        return
+    dtypes = (
+        ("bf16", "fp8")
+        if args.dtype == "both" and _supports_fp8()
+        else ("bf16",) if args.dtype == "both" else (args.dtype,)
+    )
+
+    if args.no_vllm:
+        print("[baseline] vLLM skipped (--no-vllm)")
+    elif VLLM_AVAILABLE:
+        print("[baseline] vLLM enabled")
+    else:
+        print(f"[baseline] vLLM skipped ({VLLM_IMPORT_ERROR})")
+
+    for mode_index, decode in enumerate(modes):
+        args.decode = decode
+        if mode_index:
+            print()
+        for dtype_name in dtypes:
+            _run_dtype(args, dtype_name)
+
+
+def test_msa_benchmark(request) -> None:
+    """Run the MSA benchmark through pytest using benchmark CLI timing options."""
+    args = MSABenchmarkArgs(
+        topk=int(request.config.getoption("--topk", default=16)),
+        warmup=int(request.config.getoption("--warmup", default=DEFAULT_WARMUP)),
+        rep=int(request.config.getoption("--iter", default=DEFAULT_REP)),
+    )
+    run_benchmark(args)

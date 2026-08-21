@@ -8,10 +8,10 @@ import torch
 import triton
 import triton.language as tl
 
-from .compat import libentry, libtuner
-from .index import prepare_chunk_indices, prepare_chunk_offsets
-from .triton_ops_helper import exp
-from .utils import use_cuda_graph
+from flag_attn.FLA.compat import libentry, libtuner
+from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
+from flag_attn.FLA.utils import exp
+from flag_attn.FLA.utils import use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
 

@@ -32,8 +32,12 @@ leaves the prefill kernels (which parallelize over the query dim) idle.
 
 import torch
 import triton
-import triton.experimental.tle.language as tle
 import triton.language as tl
+
+try:
+    import triton.experimental.tle.language as tle
+except ImportError:
+    tle = None
 
 from .utils import current_platform
 
@@ -52,6 +56,185 @@ _FP8_DTYPES = (
 )
 
 
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+        "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
+        * triton.next_power_of_2(args["gqa_group_size"]),
+    }
+)
+@triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
+def _gqa_sparse_fwd_fallback_kernel(
+    q_ptr,
+    kv_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    t_ptr,
+    o_ptr,
+    block_table_ptr,
+    cu_seqlens_q,
+    cu_seqblocks_q,
+    seq_lens,
+    prefix_lens,
+    num_kv_heads,
+    gqa_group_size,
+    head_dim,
+    max_topk,
+    num_q_loop,
+    sm_scale,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_kv_blk,
+    stride_kv_h,
+    stride_kv_pos,
+    stride_kv_d,
+    stride_ks_h,
+    stride_ks_t,
+    stride_vs_h,
+    stride_vs_t,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_on,
+    stride_oh,
+    stride_od,
+    stride_bt_b,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_QH: tl.constexpr,
+    USE_FP8: tl.constexpr,
+    KV_SCALE_MODE: tl.constexpr,
+):
+    sm_scale_log2e = sm_scale * 1.4426950409
+    pid_q = tl.program_id(0)
+    pid_kh = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    pid_h = pid_kh * gqa_group_size
+    q_start = tl.load(cu_seqlens_q + pid_b)
+    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
+    q_block_start = tl.load(cu_seqblocks_q + pid_b)
+    q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
+    seq_len = tl.load(seq_lens + pid_b)
+    prefix_len = tl.load(prefix_lens + pid_b)
+    if pid_q * num_q_loop >= q_block_len:
+        return
+    real_q_loop = min(num_q_loop, q_block_len - pid_q * num_q_loop)
+    bt_row = block_table_ptr + pid_b * stride_bt_b
+    off_n = tl.arange(0, BLOCK_SIZE_K)
+    for j in range(real_q_loop):
+        pid_q_j = pid_q * num_q_loop + j
+        t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
+        q_abs = prefix_len + pid_q_j * BLOCK_SIZE_Q
+        valid_blocks = (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K
+        real_topk = tl.minimum(max_topk, valid_blocks)
+        q_ptrs = tl.make_block_ptr(
+            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
+            shape=(q_len, gqa_group_size, head_dim),
+            strides=(stride_qn, stride_qh, stride_qd),
+            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
+            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
+            order=(2, 1, 0),
+        )
+        q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
+        off_q = (
+            tl.arange(0, BLOCK_SIZE_Q)[:, None]
+            + pid_q_j * BLOCK_SIZE_Q
+            + prefix_len
+            - tl.arange(0, BLOCK_SIZE_K)[None, :]
+        )
+        m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_SIZE_QH,), dtype=tl.float32)
+        acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
+        q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
+        for _ in range(real_topk):
+            blk = tl.load(t_ptr_j).to(tl.int32)
+            t_ptr_j = t_ptr_j + stride_tk
+            c = blk * BLOCK_SIZE_K
+            page = tl.load(bt_row + blk).to(tl.int64)
+            pos = c + off_n
+            pos_mask = pos < seq_len
+            k_base_ptr = kv_cache_ptr + page * stride_kv_blk + pid_kh * stride_kv_h
+            k_ptrs = tl.make_block_ptr(
+                base=k_base_ptr,
+                shape=(head_dim, BLOCK_SIZE_K),
+                strides=(stride_kv_d, stride_kv_pos),
+                offsets=(0, 0),
+                block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_K),
+                order=(0, 1),
+            )
+            k = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero")
+            if USE_FP8:
+                k = k.to(q.dtype)
+                if KV_SCALE_MODE == 1:
+                    k = (k * tl.load(k_scale_ptr)).to(q.dtype)
+                elif KV_SCALE_MODE == 2:
+                    k_scale = tl.load(
+                        k_scale_ptr
+                        + pid_kh * stride_ks_h
+                        + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
+                        mask=pos_mask,
+                        other=1.0,
+                    )
+                    k = (k * k_scale[None, :]).to(q.dtype)
+            is_full_causal = (c + BLOCK_SIZE_K) <= q_abs
+            is_full_seq = (c + BLOCK_SIZE_K) <= seq_len
+            qk = tl.zeros(
+                (BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32
+            )
+            if not is_full_causal:
+                qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
+            qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
+            qk += tl.dot(q, k) * sm_scale_log2e
+            if not is_full_seq:
+                qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            p = tl.exp2(qk - m_ij[:, None])
+            l_ij = tl.sum(p, axis=1)
+            alpha = tl.exp2(m_i - m_ij)
+            acc_o = acc_o * alpha[:, None]
+            l_i = l_i * alpha + l_ij
+            v_base_ptr = k_base_ptr + head_dim * stride_kv_d
+            v_ptrs = tl.make_block_ptr(
+                base=v_base_ptr,
+                shape=(BLOCK_SIZE_K, head_dim),
+                strides=(stride_kv_pos, stride_kv_d),
+                offsets=(0, 0),
+                block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
+                order=(1, 0),
+            )
+            v = tl.load(v_ptrs, boundary_check=(0, 1), padding_option="zero")
+            if USE_FP8:
+                v = v.to(q.dtype)
+                if KV_SCALE_MODE == 1:
+                    v = (v * tl.load(v_scale_ptr)).to(q.dtype)
+                elif KV_SCALE_MODE == 2:
+                    v_scale = tl.load(
+                        v_scale_ptr
+                        + pid_kh * stride_vs_h
+                        + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
+                        mask=pos_mask,
+                        other=1.0,
+                    )
+                    v = (v * v_scale[:, None]).to(q.dtype)
+            acc_o += tl.dot(p.to(v.dtype), v)
+            m_i = m_ij
+        acc_o = acc_o * tl.where(l_i > 0, 1.0 / l_i, 0.0)[:, None]
+        acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
+        o_ptrs = tl.make_block_ptr(
+            base=o_ptr + q_start * stride_on + pid_h * stride_oh,
+            shape=(q_len, gqa_group_size, head_dim),
+            strides=(stride_on, stride_oh, stride_od),
+            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
+            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
+            order=(2, 1, 0),
+        )
+        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
+
+
 # ---------------------------------------------------------------------------
 # GQA block-sparse attention (paged). Main heads attend only to the selected
 # blocks. BLOCK_SIZE_K == 128 so each selected block is one page.
@@ -60,7 +243,7 @@ _FP8_DTYPES = (
 # might lose pointer alignment, which trigger Triton recompiles. we don't actually
 # need pointer alignment for those tensors anyway because we do scalar load.
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
-def _gqa_sparse_fwd_direct(
+def _gqa_sparse_fwd_kernel(
     q_ptr,  # [total_q, num_heads, head_dim]
     kv_cache_ptr,  # main cache: [num_blocks, num_kv_heads, 128, 2*head_dim]
     k_scale_ptr,
@@ -149,7 +332,7 @@ def _gqa_sparse_fwd_direct(
         m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
 
         l_i = tl.zeros((BLOCK_SIZE_QH,), dtype=tl.float32)
-        # Keep the direct kernel's PV accumulator in [QH, D] order.  The
+        # Keep the tl.dot kernel's PV accumulator in [QH, D] order. The
         # transposed [D, QH] form spills heavily for the FP8 QH=32 tile.
         acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
@@ -304,7 +487,7 @@ def _gqa_sparse_fwd_direct(
     }
 )
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
-def _gqa_sparse_fwd_kernel(
+def _gqa_sparse_fwd_tle_kernel(
     q_ptr,  # [total_q, num_heads, head_dim]
     kv_cache_ptr,  # [num_blocks, num_kv_heads, 128, 2*head_dim]
     kv_cache_desc,  # flattened [num_blocks*num_kv_heads*128, 2*head_dim]
@@ -346,13 +529,13 @@ def _gqa_sparse_fwd_kernel(
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_QH: tl.constexpr,
-    USE_DIRECT: tl.constexpr,
+    USE_TL_DOT_PATH: tl.constexpr,
     USE_FP8: tl.constexpr,
     KV_SCALE_MODE: tl.constexpr,
     USE_HALF_KV_PIPE: tl.constexpr,
 ):
-    if USE_DIRECT:
-        _gqa_sparse_fwd_direct(
+    if USE_TL_DOT_PATH:
+        _gqa_sparse_fwd_kernel(
             q_ptr,
             kv_cache_ptr,
             k_scale_ptr,
@@ -1071,11 +1254,58 @@ def minimax_m3_sparse_attn(
     grid = (max_query_len, num_kv_heads, batch)
     block_size_h = triton.next_power_of_2(gqa_group_size)
 
+    if not use_fp8 and block_size_h >= 8 and tle is None:
+        _gqa_sparse_fwd_fallback_kernel[grid](
+            q,
+            kv_cache,
+            k_scale_arg,
+            v_scale_arg,
+            topk_idx,
+            output,
+            block_table,
+            cu_seqlens_q,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            num_kv_heads,
+            gqa_group_size,
+            head_dim,
+            topk,
+            1,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            kv_cache.stride(3),
+            stride_ks_h,
+            stride_ks_t,
+            stride_vs_h,
+            stride_vs_t,
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            block_table.stride(0),
+            BLOCK_SIZE_Q=1,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            BLOCK_SIZE_D=triton.next_power_of_2(head_dim),
+            BLOCK_SIZE_H=block_size_h,
+            BLOCK_SIZE_QH=block_size_h,
+            USE_FP8=False,
+            KV_SCALE_MODE=_KV_SCALE_NONE,
+        )
+        return
+
     # Keep cases that cannot form a legal WGMMA result out of the TLE kernel:
     # FP8 KV has a dtype mismatch with BF16 Q, and a GQA tile below eight heads
     # has an illegal WGMMA N dimension.
     if use_fp8 or block_size_h < 8:
-        _gqa_sparse_fwd_direct[grid](
+        _gqa_sparse_fwd_kernel[grid](
             q,
             kv_cache,
             k_scale_arg,
@@ -1131,9 +1361,10 @@ def minimax_m3_sparse_attn(
         return torch.empty(size, dtype=torch.int8, device=kv_cache.device)
 
     triton.set_allocator(alloc_fn)
-    use_direct = False
+    use_tl_dot_path = False
     use_half_kv_pipe = (
-        not use_direct and block_size_h <= _PREFILL_HALF_KV_MAX_BLOCK_SIZE_QH
+        not use_tl_dot_path
+        and block_size_h <= _PREFILL_HALF_KV_MAX_BLOCK_SIZE_QH
     )
     kv_tma_rows = SPARSE_BLOCK_SIZE // 2 if use_half_kv_pipe else SPARSE_BLOCK_SIZE
     kv_cache_2d = kv_cache.view(-1, 2 * head_dim)
@@ -1143,7 +1374,7 @@ def minimax_m3_sparse_attn(
         strides=[kv_cache_2d.stride(0), kv_cache_2d.stride(1)],
         block_shape=[kv_tma_rows, head_dim],
     )
-    _gqa_sparse_fwd_kernel[grid](
+    _gqa_sparse_fwd_tle_kernel[grid](
         q,
         kv_cache,
         kv_cache_desc,
@@ -1182,12 +1413,12 @@ def minimax_m3_sparse_attn(
         block_table.stride(0),
         BLOCK_SIZE_Q=1,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        USE_DIRECT=use_direct,
+        USE_TL_DOT_PATH=use_tl_dot_path,
         USE_FP8=use_fp8,
         KV_SCALE_MODE=kv_scale_mode,
         USE_HALF_KV_PIPE=use_half_kv_pipe,
         num_warps=4,
-        num_stages=3 if use_direct else 1,
+        num_stages=3 if use_tl_dot_path else 1,
     )
 
 

@@ -32,7 +32,8 @@ import triton
 import triton.language as tl
 from triton.errors import TritonError
 
-from .utils import current_platform, has_triton_tle, round_up
+from ..utils import has_triton_tle
+from .utils import current_platform, round_up
 
 if has_triton_tle(3, 6, 0):
     try:

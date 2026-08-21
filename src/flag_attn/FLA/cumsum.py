@@ -10,9 +10,10 @@ import torch
 import triton
 import triton.language as tl
 
-from .compat import libtuner
-from .index import prepare_chunk_indices
-from .utils import check_shared_mem, input_guard
+from flag_attn.FLA.compat import libtuner
+from flag_attn.FLA.index import prepare_chunk_indices
+from flag_attn.utils import check_shared_mem, input_guard
+import flag_attn.runtime as runtime
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -26,6 +27,7 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 @libtuner(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
     key=["B", "H", "BT", "IS_VARLEN", "REVERSE"],
+    **runtime.autotune_cache_kwargs(),
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_scalar_kernel(
@@ -90,6 +92,7 @@ def chunk_local_cumsum_scalar_kernel(
         for num_warps in [2, 4, 8]
     ],
     key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
+    **runtime.autotune_cache_kwargs(),
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_vector_kernel(

@@ -4,14 +4,15 @@ import torch
 import triton
 import triton.language as tl
 
-from .chunk import chunk_gated_delta_rule_fwd
-from .chunk_gated_delta_direct import (
+from flag_attn.FLA.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
+from flag_attn.FLA.gated_delta_rule.chunk_gated_delta_direct import (
     can_use_chunk_gated_delta_rule_direct,
     chunk_gated_delta_rule_direct_fwd,
 )
-from .chunk_fused_forward import can_use_two_kernel_fused_forward
-from .compat import has_triton_tle, libentry
-from .fused_cumsum_kkt_solve_tril import (
+from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import can_use_two_kernel_fused_forward
+from flag_attn.FLA.compat import libentry
+from flag_attn.utils import has_triton_tle
+from flag_attn.FLA.gated_delta_rule.fused_cumsum_kkt_solve_tril import (
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril,
 )
 

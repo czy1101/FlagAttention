@@ -9,14 +9,12 @@ import torch
 import triton
 import triton.language as tl
 
-from .compat import libentry, libtuner
-from .index import prepare_chunk_indices
-from .triton_ops_helper import exp
-from .utils import (
-    FLA_GDN_FIX_BT,
-    check_shared_mem,
-    is_nvidia_hopper,
-)
+from flag_attn.FLA.compat import libentry, libtuner
+from flag_attn.FLA.index import prepare_chunk_indices
+from flag_attn.FLA.utils import exp
+from flag_attn.FLA.utils import is_nvidia_hopper
+from flag_attn.utils import check_shared_mem
+from flag_attn.FLA.utils import FLA_GDN_FIX_BT
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]

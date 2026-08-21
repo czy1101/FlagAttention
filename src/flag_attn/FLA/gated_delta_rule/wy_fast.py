@@ -11,8 +11,9 @@ import torch
 import triton
 import triton.language as tl
 
-from .compat import has_triton_tle, libentry, libtuner
-from .index import prepare_chunk_indices
+from flag_attn.FLA.compat import libentry, libtuner
+from flag_attn.utils import has_triton_tle
+from flag_attn.FLA.index import prepare_chunk_indices
 
 if has_triton_tle(3, 6, 0):
     try:

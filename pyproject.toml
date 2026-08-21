@@ -28,7 +28,9 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 
-dependencies = []
+dependencies = [
+    "pyyaml>=6.0",
+]
 
 [project.optional-dependencies]
 triton = [
@@ -53,6 +55,9 @@ version_file = "src/flag_attn/_version.py"
 where = ["src"]
 include = ["flag_attn", "flag_attn.*"]
 namespaces = false
+
+[tool.setuptools.package-data]
+"flag_attn.runtime.backend._nvidia" = ["tune_configs.yaml"]
 
 # helps for setting up pytest in pyprojects
 # https://docs.pytest.org/en/7.3.x/reference/customize.html#rootdir
