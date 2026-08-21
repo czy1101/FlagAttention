@@ -39,7 +39,7 @@ try:
 except ImportError:
     tle = None
 
-from .utils import current_platform
+from flag_attn.utils import current_platform
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
