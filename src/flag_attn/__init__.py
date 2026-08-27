@@ -34,5 +34,7 @@ from flag_attn.minimax_sparse_attention import (
     minimax_m3_sparse_attn as minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode,
 )
+from flag_attn.runtime.backend._enflame.kda import chunk_kda as chunk_kda
+from flag_attn.runtime.backend._enflame.gdn2 import chunk_gdn2 as chunk_gdn2
 
 from flag_attn import testing # noqa: F401
