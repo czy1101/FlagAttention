@@ -33,7 +33,7 @@ from flag_attn.minimax_sparse_attention import (
     minimax_m3_sparse_attn_decode,
 )
 
-index_topk_module = importlib.import_module("flag_attn.minimax_sparse_attention.index_topk")
+index_topk_module = importlib.import_module(minimax_m3_index_topk.__module__)
 
 triton.knobs.autotuning.adjust_block_size = False
 BLOCK = SPARSE_BLOCK_SIZE
@@ -59,6 +59,34 @@ def _supports_fp8() -> bool:
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="MSA v1 tests require CUDA"
 )
+
+
+def test_public_exports_use_active_backend() -> None:
+    from flag_attn.runtime.backend import is_metax_backend
+
+    module_name = minimax_m3_sparse_attn.__module__
+    if is_metax_backend():
+        assert module_name.startswith(
+            "flag_attn.runtime.backend._metax.minimax_sparse_attention"
+        )
+    else:
+        assert module_name.startswith("flag_attn.minimax_sparse_attention")
+
+
+def test_metax_public_exports() -> None:
+    from flag_attn.runtime.backend import is_metax_backend
+
+    if not is_metax_backend():
+        pytest.skip("requires the MetaX backend")
+
+    import flag_attn
+    from flag_attn.runtime.backend import _metax
+
+    assert flag_attn.flash_mla is _metax.flash_mla
+    assert flag_attn.flash_mla_with_kvcache is _metax.flash_mla_with_kvcache
+    assert flag_attn.flash_mla_sparse_fwd is _metax.flash_mla_sparse_fwd
+    assert flag_attn.chunk_gdn2 is _metax.chunk_gdn2
+    assert flag_attn.minimax_m3_sparse_attn is _metax.minimax_m3_sparse_attn
 
 
 @dataclass
@@ -648,8 +676,8 @@ def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
 
 
 @pytest.mark.skipif(
-    not index_topk_module._HAS_TLE,
-    reason="requires FlagTree 3.6+ with TLE",
+    not index_topk_module._HAS_TLE_RADIX,
+    reason="requires a backend with TLE radix top-k support",
 )
 @pytest.mark.minimax_sparse_attention_topk
 def test_prefill_topk_radix_path() -> None:

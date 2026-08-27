@@ -35,5 +35,17 @@ from flag_attn.minimax_sparse_attention import (
     minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode,
 )
 
-from flag_attn.runtime.backend._metax.kda import chunk_kda as chunk_kda
+from flag_attn.runtime.backend import is_metax_backend
+
+if is_metax_backend():
+    from flag_attn.runtime.backend._metax import (
+        FlashMLASchedMeta as FlashMLASchedMeta,
+        chunk_gdn2 as chunk_gdn2,
+        chunk_kda as chunk_kda,
+        flash_mla as flash_mla,
+        flash_mla_sparse_fwd as flash_mla_sparse_fwd,
+        flash_mla_with_kvcache as flash_mla_with_kvcache,
+        get_mla_metadata as get_mla_metadata,
+    )
+
 from flag_attn import testing # noqa: F401
