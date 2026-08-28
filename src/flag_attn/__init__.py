@@ -35,4 +35,5 @@ from flag_attn.minimax_sparse_attention import (
     minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode,
 )
 
+from flag_attn.runtime.backend._metax.chunk_kda import chunk_kda as chunk_kda
 from flag_attn import testing # noqa: F401
