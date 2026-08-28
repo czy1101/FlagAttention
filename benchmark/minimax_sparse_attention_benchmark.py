@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUDA benchmark for the MiniMax M3 paged MSA kernels.
+"""Accelerator benchmark for the MiniMax M3 paged MSA kernels.
 
 The benchmark compares the FlagAttention and vLLM implementations on the same
 inputs.  ``fp8`` means FP8 index queries/index keys and FP8 main KV cache,
@@ -21,6 +21,7 @@ with scalar K/V dequantization scales passed to both implementations.
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import sys
 import warnings
@@ -31,6 +32,11 @@ import torch
 import triton
 import triton.knobs
 import triton.testing as triton_testing
+
+try:
+    importlib.import_module("torch_npu")
+except ImportError:
+    pass
 
 from flag_attn.minimax_sparse_attention import (
     SPARSE_BLOCK_SIZE,
@@ -144,9 +150,31 @@ class MSAData:
     v_scale: torch.Tensor | None
 
 
-def _require_cuda() -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("This benchmark requires CUDA.")
+def _get_accelerator_device() -> torch.device | None:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    npu = getattr(torch, "npu", None)
+    if npu is not None and npu.is_available():
+        return torch.device("npu")
+    return None
+
+
+BENCH_DEVICE = _get_accelerator_device()
+
+
+def _require_accelerator(device_type: str) -> torch.device:
+    if BENCH_DEVICE is None:
+        raise RuntimeError("This benchmark requires CUDA or Ascend NPU.")
+    if device_type != BENCH_DEVICE.type:
+        raise RuntimeError(
+            f"Requested {device_type}, but the available accelerator is "
+            f"{BENCH_DEVICE.type}."
+        )
+    return BENCH_DEVICE
+
+
+def _synchronize(device: torch.device) -> None:
+    getattr(torch, device.type).synchronize()
 
 
 def _supports_fp8() -> bool:
@@ -419,10 +447,15 @@ def run_decode(
     )
 
 
-def bench_fn(fn: Callable, warmup: int, rep: int) -> float:
+def bench_fn(
+    fn: Callable,
+    warmup: int,
+    rep: int,
+    device: torch.device,
+) -> float:
     for _ in range(3):
         fn()
-    torch.cuda.synchronize()
+    _synchronize(device)
     return float(
         triton_testing.do_bench(fn, warmup=warmup, rep=rep, return_mode="median")
     )
@@ -467,7 +500,7 @@ def _select_impl(
 
 def _provider_vals(dtype_name: str) -> list[str]:
     vals = ["flag_attn"]
-    if VLLM_AVAILABLE:
+    if VLLM_AVAILABLE and BENCH_DEVICE is not None and BENCH_DEVICE.type == "cuda":
         # vLLM cannot run FP8 without k_scale/v_scale support.
         if dtype_name == "fp8" and not _supports_fp8_scales():
             pass
@@ -477,10 +510,11 @@ def _provider_vals(dtype_name: str) -> list[str]:
 
 
 _DTYPES = ["bf16"] + (["fp8"] if _supports_fp8() else [])
+_DEVICE_TYPE = BENCH_DEVICE.type if BENCH_DEVICE is not None else "cuda"
 
 configs = [
     triton.testing.Benchmark(
-        x_names=["shape"],
+        x_names=["batch", "seq_len", "num_kv_heads", "num_heads"],
         x_vals=SHAPES,
         line_arg="provider",
         line_vals=_provider_vals(dtype_name),
@@ -488,7 +522,7 @@ configs = [
         styles=[("red", "-"), ("blue", "-")],
         ylabel="ms",
         plot_name=f"minimax_m3_sparse_attention-{mode}-{dtype_name}",
-        args={"mode": mode, "dtype": dtype_name},
+        args={"mode": mode, "dtype": dtype_name, "device": _DEVICE_TYPE},
     )
     for mode, SHAPES in [("prefill", PREFILL_SHAPES), ("decode", DECODE_SHAPES)]
     for dtype_name in _DTYPES
@@ -497,10 +531,17 @@ configs = [
 
 @triton.testing.perf_report(configs)
 def bench_minimax_sparse_attention(
-    shape, mode, provider, dtype="bf16", device="cuda"
+    batch,
+    seq_len,
+    num_kv_heads,
+    num_heads,
+    mode,
+    provider,
+    dtype="bf16",
+    device="cuda",
 ):
-    _require_cuda()
-    batch, seq_len, num_kv_heads, num_heads = shape
+    accelerator = _require_accelerator(device)
+    shape = (batch, seq_len, num_kv_heads, num_heads)
     decode = mode == "decode"
 
     if num_heads % num_kv_heads != 0:
@@ -512,14 +553,14 @@ def bench_minimax_sparse_attention(
             f"Invalid shape {shape}: decode_qlen={DECODE_QLEN} cannot exceed seq_len"
         )
 
-    generator = torch.Generator(device=device)
+    generator = torch.Generator(device=accelerator)
     generator.manual_seed(SEED + (100_000 if decode else 0))
     data = make_data(
         batch,
         seq_len,
         num_kv_heads,
         num_heads,
-        torch.device(device),
+        accelerator,
         dtype,
         decode=decode,
         decode_qlen=DECODE_QLEN,
@@ -564,8 +605,12 @@ def bench_minimax_sparse_attention(
                 output,
             )
 
-    return bench_fn(run, DEFAULT_WARMUP, DEFAULT_REP)
+    return bench_fn(run, DEFAULT_WARMUP, DEFAULT_REP, accelerator)
 
 
-# only works on post-Ampere GPUs right now
-bench_minimax_sparse_attention.run(print_data=True)
+def test_minimax_sparse_attention_benchmark() -> None:
+    bench_minimax_sparse_attention.run(print_data=True)
+
+
+if __name__ == "__main__":
+    bench_minimax_sparse_attention.run(print_data=True)

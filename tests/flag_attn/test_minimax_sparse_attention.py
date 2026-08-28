@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUDA correctness tests for the MiniMax M3 paged MSA kernels."""
+"""Accelerator correctness tests for the MiniMax M3 paged MSA kernels."""
 
 from __future__ import annotations
 
 import importlib
+import os
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -33,6 +34,11 @@ from flag_attn.minimax_sparse_attention import (
     minimax_m3_sparse_attn_decode,
 )
 
+try:
+    importlib.import_module("torch_npu")
+except ImportError:
+    pass
+
 index_topk_module = importlib.import_module("flag_attn.minimax_sparse_attention.index_topk")
 
 triton.knobs.autotuning.adjust_block_size = False
@@ -47,17 +53,42 @@ BF16_ATOL = 2e-2
 BF16_RTOL = 2e-2
 FP8_ATOL = 6e-2
 FP8_RTOL = 8e-2
+_NPU_FP8_EMULATE = os.getenv("FLAG_ATTN_NPU_FP8_EMULATE") == "1"
 
 
-def _supports_fp8() -> bool:
-    if FP8_DTYPE is None or not torch.cuda.is_available():
-        return False
-    # NVIDIA FP8 Tensor Core support starts with Ada (8.9) and Hopper (9.0).
-    return torch.cuda.get_device_capability() >= (8, 9)
+def _get_accelerator_device() -> torch.device | None:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    npu = getattr(torch, "npu", None)
+    if npu is not None and npu.is_available():
+        return torch.device("npu")
+    return None
+
+
+TEST_DEVICE = _get_accelerator_device()
+
+
+
+
+def _require_accelerator() -> torch.device:
+    if TEST_DEVICE is None:
+        pytest.skip("MSA v1 tests require CUDA or Ascend NPU")
+    return TEST_DEVICE
+
+
+def _synchronize() -> None:
+    device = _require_accelerator()
+    getattr(torch, device.type).synchronize()
+
+
+def _require_fp8_dtype() -> torch.dtype:
+    if FP8_DTYPE is None:
+        pytest.fail("PyTorch does not provide float8_e4m3fn")
+    return FP8_DTYPE
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="MSA v1 tests require CUDA"
+    TEST_DEVICE is None, reason="MSA v1 tests require CUDA or Ascend NPU"
 )
 
 
@@ -79,9 +110,10 @@ class MSAData:
 
 
 def _encode_fp8(value: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    if FP8_DTYPE is None:
-        pytest.skip("PyTorch does not provide float8_e4m3fn")
-    return (value / scale).to(FP8_DTYPE)
+    if value.device.type == "npu":
+        encoded = (value.float().cpu() / scale).to(_require_fp8_dtype())
+        return encoded.to(value.device)
+    return (value / scale).to(_require_fp8_dtype())
 
 
 def _storage(
@@ -89,9 +121,32 @@ def _storage(
     device: torch.device,
     use_fp8: bool,
     scale: float = 1.0,
+    emulate_fp8: bool = False,
 ) -> torch.Tensor:
     value = torch.randn(shape, device=device, dtype=torch.bfloat16) * 0.5
-    return _encode_fp8(value, scale) if use_fp8 else value
+    if not use_fp8:
+        return value
+    if emulate_fp8:
+        encoded = (value.float().cpu() / scale).to(_require_fp8_dtype())
+        decoded = encoded.float() * scale
+        return decoded.to(device=device, dtype=torch.bfloat16)
+    return _encode_fp8(value, scale)
+
+
+def _page_permute(
+    logical: torch.Tensor,
+    physical_pages: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    if device.type == "npu" and FP8_DTYPE is not None and logical.dtype == FP8_DTYPE:
+        logical_cpu = logical.cpu()
+        physical_pages_cpu = physical_pages.cpu()
+        cache_cpu = torch.empty_like(logical_cpu)
+        cache_cpu[physical_pages_cpu] = logical_cpu
+        return cache_cpu.to(device)
+    cache = torch.empty_like(logical)
+    cache[physical_pages] = logical
+    return cache
 
 
 def make_data(
@@ -107,8 +162,6 @@ def make_data(
 ) -> MSAData:
     if mode not in {"bf16", "fp8_index", "fp8_kv", "fp8_full"}:
         raise ValueError(f"unsupported mode: {mode}")
-    if mode != "bf16" and not _supports_fp8():
-        pytest.skip("FP8 tests require an NVIDIA GPU with FP8 support")
     if not seq_lens or any(length <= 0 for length in seq_lens):
         raise ValueError("seq_lens must contain positive lengths")
     if num_kv_heads <= 0 or group_size <= 0:
@@ -117,7 +170,7 @@ def make_data(
         raise ValueError("decode_qlen must not exceed the shortest sequence")
 
     torch.manual_seed(seed)
-    device = torch.device("cuda")
+    device = _require_accelerator()
     batch = len(seq_lens)
     max_seq_len = max(seq_lens)
     if decode:
@@ -137,15 +190,23 @@ def make_data(
         raise ValueError("invalid number of query heads")
     total_q = sum(query_lens)
     num_heads = num_kv_heads * group_size
-    index_fp8 = mode in {"fp8_index", "fp8_full"}
-    kv_fp8 = mode in {"fp8_kv", "fp8_full"}
+    emulate_fp8 = _NPU_FP8_EMULATE and device.type == "npu"
+    requested_index_fp8 = mode in {"fp8_index", "fp8_full"}
+    requested_kv_fp8 = mode in {"fp8_kv", "fp8_full"}
+    index_fp8 = requested_index_fp8 and not emulate_fp8
+    kv_fp8 = requested_kv_fp8 and not emulate_fp8
     kv_scale_value = 0.5
 
     q = (
         torch.randn((total_q, num_heads, HEAD_DIM), device=device, dtype=torch.bfloat16)
         * 0.5
     )
-    idx_q = _storage((total_q, num_kv_heads, HEAD_DIM), device, index_fp8)
+    idx_q = _storage(
+        (total_q, num_kv_heads, HEAD_DIM),
+        device,
+        requested_index_fp8,
+        emulate_fp8=emulate_fp8,
+    )
 
     blocks_per_request = [(seq + BLOCK - 1) // BLOCK for seq in seq_lens]
     total_blocks = sum(blocks_per_request)
@@ -153,19 +214,21 @@ def make_data(
     logical_kv = torch.empty(
         (total_blocks, num_kv_heads, BLOCK, 2 * HEAD_DIM),
         device=device,
-        dtype=torch.float8_e4m3fn if kv_fp8 else torch.bfloat16,
+        dtype=_require_fp8_dtype() if kv_fp8 else torch.bfloat16,
     )
     logical_k = _storage(
         (total_blocks * BLOCK, num_kv_heads, HEAD_DIM),
         device,
-        kv_fp8,
+        requested_kv_fp8,
         kv_scale_value,
+        emulate_fp8,
     )
     logical_v = _storage(
         (total_blocks * BLOCK, num_kv_heads, HEAD_DIM),
         device,
-        kv_fp8,
+        requested_kv_fp8,
         kv_scale_value,
+        emulate_fp8,
     )
     logical_k = logical_k.reshape(total_blocks, BLOCK, num_kv_heads, HEAD_DIM).permute(
         0, 2, 1, 3
@@ -177,7 +240,10 @@ def make_data(
     logical_kv[..., HEAD_DIM:] = logical_v
 
     logical_index_k = _storage(
-        (total_blocks * BLOCK, HEAD_DIM), device, index_fp8
+        (total_blocks * BLOCK, HEAD_DIM),
+        device,
+        requested_index_fp8,
+        emulate_fp8=emulate_fp8,
     ).reshape(total_blocks, BLOCK, HEAD_DIM)
     physical_pages = torch.randperm(total_blocks, device=device)
     block_table = torch.zeros((batch, max_blocks), device=device, dtype=torch.int32)
@@ -186,10 +252,8 @@ def make_data(
         block_table[request, :num_blocks] = physical_pages[offset : offset + num_blocks]
         offset += num_blocks
 
-    kv_cache = torch.empty_like(logical_kv)
-    index_kv_cache = torch.empty_like(logical_index_k)
-    kv_cache[physical_pages] = logical_kv
-    index_kv_cache[physical_pages] = logical_index_k
+    kv_cache = _page_permute(logical_kv, physical_pages, device)
+    index_kv_cache = _page_permute(logical_index_k, physical_pages, device)
 
     cu_q = torch.tensor(
         [0, *torch.tensor(query_lens).cumsum(0).tolist()],
@@ -555,7 +619,7 @@ def _run_prefill(case: tuple, mode: str) -> None:
         output,
         **sparse_kwargs,
     )
-    torch.cuda.synchronize()
+    _synchronize()
 
     ref_scores = _ref_index_score(data)
     ref_topk = _ref_topk(ref_scores, data, topk, init_blocks, local_blocks)
@@ -590,6 +654,7 @@ def _run_decode(case: tuple, mode: str) -> None:
         decode_qlen,
         decode_qlen,
     )
+    _synchronize()
     output = torch.empty_like(data.q)
     sparse_kwargs = {}
     if data.k_scale is not None:
@@ -606,7 +671,7 @@ def _run_decode(case: tuple, mode: str) -> None:
         decode_qlen,
         **sparse_kwargs,
     )
-    torch.cuda.synchronize()
+    _synchronize()
 
     ref_topk = _ref_decode_index(data, topk, init_blocks, local_blocks, decode_qlen)
     ref_output = _ref_decode_attn(data, ref_topk, decode_qlen)
@@ -615,6 +680,10 @@ def _run_decode(case: tuple, mode: str) -> None:
 
 
 @pytest.mark.minimax_sparse_attention_topk
+@pytest.mark.skipif(
+    TEST_DEVICE is not None and TEST_DEVICE.type == "npu",
+    reason="streaming Top-K path test is not supported on Ascend NPU",
+)
 def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
     """Invalid lanes must lose even when every valid score is negative infinity."""
     num_score_blocks = 96
@@ -647,11 +716,12 @@ def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(
-    not index_topk_module._HAS_TLE,
-    reason="requires FlagTree 3.6+ with TLE",
-)
+
 @pytest.mark.minimax_sparse_attention_topk
+@pytest.mark.skipif(
+    TEST_DEVICE is not None and TEST_DEVICE.type == "npu",
+    reason="radix Top-K path test is not supported on Ascend NPU",
+)
 def test_prefill_topk_radix_path() -> None:
     """Exercise the actual wide-row TLE path instead of accepting fallback."""
     num_score_blocks = 1024
@@ -773,13 +843,13 @@ def test_decode_topk_identity_out_and_score_out_bf16() -> None:
     out = torch.full(
         (num_kv_heads, total_q + 1, topk),
         -2,
-        device="cuda",
+        device=data.q.device,
         dtype=torch.int32,
     )
     score_out = torch.full(
         (num_kv_heads, total_q, max_blocks),
         float("nan"),
-        device="cuda",
+        device=data.q.device,
         dtype=torch.float32,
     )
 
@@ -798,7 +868,7 @@ def test_decode_topk_identity_out_and_score_out_bf16() -> None:
         out=out,
         score_out=score_out,
     )
-    torch.cuda.synchronize()
+    _synchronize()
 
     expected = _ref_decode_index(data, topk, 1, 2, decode_qlen)
     _assert_topk_match(actual, expected, data, topk, decode=True)
@@ -812,10 +882,6 @@ def test_decode_topk_identity_out_and_score_out_bf16() -> None:
             assert torch.all(torch.isfinite(score_out[:, query_id, :valid_blocks]))
 
 
-@pytest.mark.skipif(
-    not _supports_fp8(),
-    reason="FP8 tests require an NVIDIA GPU with FP8 support",
-)
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
 @pytest.mark.parametrize("case", PREFILL_CASES[:2], ids=("boundary", "selection"))
 @pytest.mark.minimax_sparse_attention_prefill
@@ -823,10 +889,6 @@ def test_prefill_fp8(mode: str, case: tuple) -> None:
     _run_prefill(case, mode)
 
 
-@pytest.mark.skipif(
-    not _supports_fp8(),
-    reason="FP8 tests require an NVIDIA GPU with FP8 support",
-)
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
 @pytest.mark.parametrize("case", DECODE_CASES[:2], ids=("boundary", "selection"))
 @pytest.mark.minimax_sparse_attention_decode
