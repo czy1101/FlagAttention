@@ -126,8 +126,8 @@ _T_DTYPES = [
 
 configs = [
     triton.testing.Benchmark(
-        x_names=["shape"],
-        x_vals=[(B, T, H, D) for B, T, H, D in _SHAPES],
+        x_names=["B", "T", "H", "D"],
+        x_vals=_SHAPES,
         line_arg="provider",
         line_vals=["flag_attn"] + (["fla"] if _HAS_FLA_CHUNK else []),
         line_names=["flag_attn"] + (["fla"] if _HAS_FLA_CHUNK else []),
@@ -142,9 +142,8 @@ configs = [
 
 
 @triton.testing.perf_report(configs)
-def bench_chunk_gla(shape, mode, provider, dtype=torch.bfloat16, device="cuda"):
+def bench_chunk_gla(B, T, H, D, mode, provider, dtype=torch.bfloat16, device="cuda"):
     assert mode in ["fwd", "bwd"]
-    B, T, H, D = shape
 
     is_bwd = mode == "bwd"
     kwargs = _make_kwargs(D)

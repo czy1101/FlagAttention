@@ -14,6 +14,11 @@
 
 """Chunked gated linear attention implemented with Triton kernels."""
 
-from .chunk_gla import chunk_gla
+import torch
+
+if "metax" in str(torch.__version__).lower():
+    from flag_attn.runtime.backend._metax import chunk_gla
+else:
+    from .chunk_gla import chunk_gla
 
 __all__ = ["chunk_gla"]
