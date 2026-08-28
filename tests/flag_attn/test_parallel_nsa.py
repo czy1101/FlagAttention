@@ -292,7 +292,7 @@ def test_parallel_varlen(
 
 def test_parallel_nsa_public_route():
     assert parallel_nsa.__module__ == (
-        "flag_attn.runtime.backend._metax.parallel_nsa"
+        "flag_attn.runtime.backend._metax.nsa.parallel_nsa"
     )
 
 

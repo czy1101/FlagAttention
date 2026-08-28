@@ -12,11 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .gla import chunk_gla
-from .nsa import parallel_nsa, parallel_nsa_compression
+from .chunk_gla import chunk_gla
 
-__all__ = [
-    "chunk_gla",
-    "parallel_nsa",
-    "parallel_nsa_compression",
-]
+__all__ = ["chunk_gla"]

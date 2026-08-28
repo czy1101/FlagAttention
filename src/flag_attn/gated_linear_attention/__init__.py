@@ -17,7 +17,7 @@
 import torch
 
 if "metax" in str(torch.__version__).lower():
-    from flag_attn.runtime.backend._metax import chunk_gla
+    from flag_attn.runtime.backend._metax.gla import chunk_gla
 else:
     from .chunk_gla import chunk_gla
 

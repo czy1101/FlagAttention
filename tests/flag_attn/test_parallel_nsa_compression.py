@@ -284,6 +284,6 @@ def test_parallel_nsa_compression_g4_backward_reference():
 
 def test_parallel_nsa_compression_public_route():
     assert parallel_nsa_compression.__module__ == (
-        "flag_attn.runtime.backend._metax."
+        "flag_attn.runtime.backend._metax.nsa."
         "parallel_nsa_compression"
     )
