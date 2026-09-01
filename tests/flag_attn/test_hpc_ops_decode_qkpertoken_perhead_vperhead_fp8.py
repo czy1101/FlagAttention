@@ -16,10 +16,11 @@
 
 from __future__ import annotations
 
-import importlib.util
 import math
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
@@ -28,30 +29,54 @@ import triton
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
-BENCHMARK_ROOT = REPO_ROOT / "benchmark"
 sys.path.insert(0, str(SRC_ROOT))
 
 from flag_attn.hpc_ops_attention.decode import HAS_TLE  # noqa: E402
+from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
+    fp8_qkpertoken_perhead_vperhead_dynamic as fp8_dynamic,
+)
+from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
+    fp8_qkpertoken_perhead_vperhead_static as fp8_static,
+)
 
 
-def _load_fp8_benchmark_module():
-    benchmark_path = BENCHMARK_ROOT / "bench_hpc_ops_decode_fp8.py"
-    module_name = "bench_hpc_ops_decode_fp8"
-    spec = importlib.util.spec_from_file_location(module_name, benchmark_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load benchmark module from {benchmark_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+BLOCK_SIZE = fp8_static.BLOCK_SIZE
+HEAD_DIM = fp8_static.HEAD_DIM
 
 
-_fp8_benchmark = _load_fp8_benchmark_module()
-BLOCK_SIZE = _fp8_benchmark.BLOCK_SIZE
-HEAD_DIM = _fp8_benchmark.HEAD_DIM
-Panel = _fp8_benchmark.Panel
-_implementation = _fp8_benchmark._implementation
-_inputs = _fp8_benchmark._inputs
+@dataclass
+class _Panel:
+    q: torch.Tensor
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    block_ids: torch.Tensor
+    kv_lens: torch.Tensor
+    q_scale: torch.Tensor
+    k_scale: torch.Tensor
+    v_scale: torch.Tensor
+
+
+_IMPLEMENTATIONS = {
+    "static": fp8_static,
+    "dynamic": fp8_dynamic,
+}
+
+
+def _implementation(schedule: str) -> ModuleType:
+    return _IMPLEMENTATIONS[schedule]
+
+
+def _inputs(panel: _Panel, implementation: ModuleType) -> object:
+    return implementation.FP8DecodeInputs(
+        panel.q,
+        panel.k_cache,
+        panel.v_cache,
+        panel.block_ids,
+        panel.kv_lens,
+        panel.q_scale,
+        panel.k_scale,
+        panel.v_scale,
+    )
 
 
 FP8_ATOL = {
@@ -135,7 +160,7 @@ def _official_make_inputs(
     num_head_q: int,
     layout: str,
     quant_type: str,
-) -> Panel:
+) -> _Panel:
     """Reproduce the official FP8 correctness-test input distribution."""
     torch.manual_seed(41)
     torch.cuda.manual_seed(41)
@@ -248,7 +273,7 @@ def _official_make_inputs(
         k_cache = storage[:, 0]
         v_cache = storage[:, 1]
 
-    return Panel(
+    return _Panel(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -404,9 +429,9 @@ def test_attn_fp8_sm90(
         kvcache_shape,
         QUANT_TYPE,
     )
-    inputs = _inputs(panel)
     schedule = "dynamic" if use_dynamic_sched else "static"
-    implementation = _implementation(schedule, QUANT_TYPE)
+    implementation = _implementation(schedule)
+    inputs = _inputs(panel, implementation)
     workspace = implementation.prepare_decode_workspace(inputs)
     actual = implementation.attention_decode_fp8(
         inputs, workspace

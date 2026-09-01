@@ -1,17 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Self-contained Hopper attention-decode implementation."""
 
 from __future__ import annotations
@@ -887,6 +873,47 @@ def _compute_mtp1___cluster_paired_head_finalize_mtp1(SPLIT_OUT, LSE, OUT, FINAL
         acc += partial * chunk_weight[None, :, :]
     tl.debug_barrier()
     tl.store(OUT + batch * O_STRIDE_B + offs_m[None, None, :] * O_STRIDE_M + hq[None, :, None] * O_STRIDE_H + offs_v[:, None, None], acc, mask=valid_head[None, :, None] & (denom[None, :, :] > 0.0))
+
+
+@builtin
+def _compute_mtp1___memdesc_subslice(
+    value, shape: tl.constexpr, offsets: tl.constexpr, _semantic=None,
+):
+    """Return a zero-copy shared-memory subslice through the public builder."""
+    shape = [int(tl_core._unwrap_if_constexpr(dim)) for dim in shape]
+    layout = value.type.layout
+    result_ty = gpu_types.buffered_tensor_type(
+        value.dtype, shape, value.type.storage, layout, _semantic,
+        alloc_shape=value.type.alloc_shape,
+    )
+    handle = _semantic.builder.create_memdesc_subslice(
+        result_ty.to_ir(_semantic.builder), value.handle, list(offsets),
+    )
+    return gpu_types.buffered_tensor(
+        handle, value.dtype, shape, value.type.storage, layout, _semantic,
+        alloc_shape=value.type.alloc_shape,
+    )
+
+
+@builtin
+def _compute_mtp1___memdesc_transpose_2d(value, _semantic=None):
+    """Return a zero-copy transposed view of a rank-2 shared memdesc."""
+    if len(value.type.shape) != 2:
+        raise ValueError('_compute_mtp1___memdesc_transpose_2d expects rank 2')
+    order = [1, 0]
+    handle = _semantic.builder.create_memdesc_trans(value.handle, order)
+    shape = [value.type.shape[i] for i in order]
+    alloc_shape = value.type.alloc_shape
+    leading_rank = len(alloc_shape) - len(value.type.shape)
+    alloc_tail = alloc_shape[leading_rank:]
+    transposed_alloc_shape = (
+        alloc_shape[:leading_rank] + [alloc_tail[i] for i in order]
+    )
+    layout = value.type.layout.make_permute(order)
+    return gpu_types.buffered_tensor(
+        handle, value.dtype, shape, value.type.storage, layout, _semantic,
+        alloc_shape=transposed_alloc_shape,
+    )
 
 
 @triton.jit

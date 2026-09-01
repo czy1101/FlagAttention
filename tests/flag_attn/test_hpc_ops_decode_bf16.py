@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,21 +33,19 @@ SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from flag_attn.hpc_ops_attention.decode import HAS_TLE  # noqa: E402
-from flag_attn.hpc_ops_attention.decode.dynamic.bf16_dynamic import (  # noqa: E402
-    DynamicBF16Inputs,
-    attention_decode_bf16_dynamic,
-    prepare_dynamic_bf16_workspace,
+from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
+    bf16_dynamic,
 )
 
 
 SUPPORTED_TEST_MTP = (1, 2, 3) if HAS_TLE else (1,)
-from flag_attn.hpc_ops_attention.decode.static.bf16_static import (  # noqa: E402
-    BLOCK_SIZE,
-    HEAD_DIM,
-    StaticBF16Inputs,
-    attention_decode_bf16_tle,
-    prepare_static_bf16_workspace,
+from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
+    bf16_static,
 )
+
+
+BLOCK_SIZE = bf16_static.BLOCK_SIZE
+HEAD_DIM = bf16_static.HEAD_DIM
 
 
 @dataclass
@@ -56,6 +55,46 @@ class _Panel:
     v: torch.Tensor
     block_ids: torch.Tensor
     kv_lens: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _DecodeImplementation:
+    inputs_type: Callable[..., object]
+    prepare_workspace: Callable[[object], object]
+    attention_decode: Callable[[object, object], torch.Tensor]
+
+
+_IMPLEMENTATIONS = {
+    "static": _DecodeImplementation(
+        bf16_static.StaticBF16Inputs,
+        bf16_static.prepare_static_bf16_workspace,
+        bf16_static.attention_decode_bf16_tle,
+    ),
+    "dynamic": _DecodeImplementation(
+        bf16_dynamic.DynamicBF16Inputs,
+        bf16_dynamic.prepare_dynamic_bf16_workspace,
+        bf16_dynamic.attention_decode_bf16_dynamic,
+    ),
+}
+
+
+def _implementation(schedule: str) -> _DecodeImplementation:
+    return _IMPLEMENTATIONS[schedule]
+
+
+def _inputs(
+    panel: _Panel,
+    kvcache_shape: str,
+    implementation: _DecodeImplementation,
+) -> object:
+    return implementation.inputs_type(
+        panel.q,
+        panel.k,
+        panel.v,
+        panel.block_ids,
+        panel.kv_lens,
+        kvcache_shape,
+    )
 
 
 def _make_inputs(
@@ -237,28 +276,11 @@ def test_attn_bf16_sm90(
         num_head_q,
         kvcache_shape,
     )
-    if use_dynamic_sched:
-        inputs = DynamicBF16Inputs(
-            panel.q,
-            panel.k,
-            panel.v,
-            panel.block_ids,
-            panel.kv_lens,
-            kvcache_shape,
-        )
-        workspace = prepare_dynamic_bf16_workspace(inputs)
-        actual = attention_decode_bf16_dynamic(inputs, workspace)
-    else:
-        inputs = StaticBF16Inputs(
-            panel.q,
-            panel.k,
-            panel.v,
-            panel.block_ids,
-            panel.kv_lens,
-            kvcache_shape,
-        )
-        workspace = prepare_static_bf16_workspace(inputs)
-        actual = attention_decode_bf16_tle(inputs, workspace)
+    schedule = "dynamic" if use_dynamic_sched else "static"
+    implementation = _implementation(schedule)
+    inputs = _inputs(panel, kvcache_shape, implementation)
+    workspace = implementation.prepare_workspace(inputs)
+    actual = implementation.attention_decode(inputs, workspace)
 
     actual = actual.detach().clone()
     expected = _pytorch_reference(panel, num_seq_q)
