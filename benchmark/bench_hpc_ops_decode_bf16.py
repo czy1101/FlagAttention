@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import argparse
 import gc
 import math
 import statistics
@@ -27,6 +26,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import triton
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +48,23 @@ from flag_attn.hpc_ops_attention.decode.static.bf16_static import (  # noqa: E40
     attention_decode_bf16_tle,
     prepare_static_bf16_workspace,
 )
+
+
+# Fixed pytest benchmark matrix.  Use pytest node IDs or ``-k`` to select a
+# subset without changing the benchmark configuration in the source file.
+BENCH_MTP = (1, 2, 3)
+BENCH_CASES = tuple(OFFICIAL_CASES)
+BENCH_METHODS = ("static", "dynamic")
+BENCH_LAYOUTS = ("NHD", "HND")
+BENCH_NUM_HEAD_KV = 1
+BENCH_NUM_HEAD_Q = 8
+BENCH_WARMUP = 100
+BENCH_ITERS = 300
+BENCH_REPEAT = 5
+BENCH_MIN_PROCESS_LEN = 64
+BENCH_GRAPH = True
+BENCH_CHECK = False
+PERF_RESULTS = []
 
 
 @dataclass
@@ -183,7 +200,7 @@ def pytorch_reference(panel: Panel, mtp: int) -> torch.Tensor:
     return torch.stack(outputs).reshape(batch * mtp, hq, HEAD_DIM).bfloat16()
 
 
-def _bench_us(call, warmup: int, iters: int, graph_mode: bool) -> float:
+def _bench_ms(call, warmup: int, iters: int, graph_mode: bool) -> float:
     for _ in range(warmup):
         call()
     torch.cuda.synchronize()
@@ -208,7 +225,7 @@ def _bench_us(call, warmup: int, iters: int, graph_mode: bool) -> float:
         call()
         end.record()
     torch.cuda.synchronize()
-    samples = sorted(start.elapsed_time(end) * 1000.0 for start, end in events)
+    samples = sorted(start.elapsed_time(end) for start, end in events)
     return samples[len(samples) // 2]
 
 
@@ -221,7 +238,7 @@ def _measure(calls, warmup, iters, repeat, graph_mode):
             order.reverse()
         for name in order:
             samples[name].append(
-                _bench_us(calls[name], warmup, iters, graph_mode)
+                _bench_ms(calls[name], warmup, iters, graph_mode)
             )
     return {
         name: (statistics.median(values), min(values), max(values))
@@ -229,204 +246,165 @@ def _measure(calls, warmup, iters, repeat, graph_mode):
     }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mtp", nargs="+", type=int, choices=(1, 2, 3),
-                        default=[1, 2, 3])
-    parser.add_argument("--cases", nargs="+", choices=OFFICIAL_CASES,
-                        default=list(OFFICIAL_CASES))
-    parser.add_argument("--methods", nargs="+", choices=("static", "dynamic"),
-                        default=["static", "dynamic"])
-    parser.add_argument("--layout", nargs="+", choices=("NHD", "HND"),
-                        default=["NHD", "HND"])
-    parser.add_argument("--num-head-kv", type=int, default=1)
-    parser.add_argument("--num-head-q", type=int, default=8)
-    parser.add_argument("--warmup", type=int, default=100)
-    parser.add_argument("--iters", type=int, default=300)
-    parser.add_argument("--repeat", type=int, default=5)
-    parser.add_argument("--min-process-len", type=int, default=64)
-    parser.add_argument("--check", action="store_true")
-    parser.add_argument("--no-graph", dest="graph", action="store_false")
-    parser.set_defaults(graph=True)
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    if (args.num_head_kv, args.num_head_q) not in ((1, 8), (4, 32)):
-        raise ValueError("validated BF16 policy requires official GQA8 heads")
+@pytest.fixture(scope="module")
+def hpc_baseline():
     triton.set_allocator(lambda size, _align, _stream: torch.empty(
         size, dtype=torch.int8, device="cuda",
     ))
-    hpc = _load_hpc()
-    if not HAS_TLE:
-        skipped = [mtp for mtp in args.mtp if mtp != 1]
-        if skipped:
-            print("TLE unavailable; pure Triton fallback supports MTP=1 only; "
-                  f"skipping MTP={skipped}", file=sys.stderr)
-        args.mtp = [mtp for mtp in args.mtp if mtp == 1]
-        if not args.mtp:
-            raise ValueError("pure Triton fallback supports only --mtp 1")
-    ratios = {
-        (method, mtp, layout): []
-        for method in args.methods
-        for mtp in args.mtp
-        for layout in args.layout
-    }
-    backend_label = "triton+tle" if HAS_TLE else "pure triton"
-    if hpc is None:
-        header = (f"{'case':>20} | {'method':>7} | {'mtp':>3} | {'layout':>6} | "
-                  f"{backend_label:>12} | {'min':>9} | {'max':>9}")
-    else:
-        header = (f"{'case':>20} | {'method':>7} | {'mtp':>3} | {'layout':>6} | {'cuda':>9} | "
-                  f"{backend_label:>12} | {'min':>9} | {'max':>9} | {'vs cuda':>8}")
-    runtime = "Triton+TLE" if HAS_TLE else "Pure Triton"
-    comparison = (
-        f"HPC CUDA vs {runtime}"
-        if hpc is not None
-        else f"{runtime} | HPC CUDA unavailable"
-    )
-    title = f"Attention Decode BF16 | {comparison} | latency in us"
-    if hpc is not None:
-        title += (
-            f"; x = CUDA / {runtime}; CUDA dynamic "
-            f"min_process_len={args.min_process_len}"
-        )
-    width = max(len(header), len(title))
-    print("=" * width, flush=True)
-    print(title, flush=True)
-    print("-" * width, flush=True)
-    print(header, flush=True)
-    print("-" * width, flush=True)
+    return _load_hpc()
 
-    for mtp in args.mtp:
-        for case in args.cases:
-            for layout in args.layout:
-                panel = make_inputs(
-                    OFFICIAL_CASES[case], mtp, args.num_head_kv,
-                    args.num_head_q, layout,
-                )
-                reference = pytorch_reference(panel, mtp) if args.check else None
-                for method in args.methods:
-                    cuda_out = torch.empty_like(panel.q) if hpc is not None else None
-                    if method == "static":
-                        inputs = StaticBF16Inputs(
-                            panel.q, panel.k, panel.v, panel.block_ids,
-                            panel.kv_lens, layout,
-                        )
-                        workspace = prepare_static_bf16_workspace(inputs)
-                        cuda_task_map = None
-                        cuda_call = None if hpc is None else lambda: hpc.attention_decode_bf16(
-                            panel.q, panel.k, panel.v, panel.block_ids,
-                            panel.kv_lens, mtp=mtp - 1,
-                            new_kv_included=True, splitk=True,
-                            output=cuda_out,
-                        )
-                        tle_call = lambda: attention_decode_bf16_tle(
-                            inputs, workspace,
-                        )
-                    else:
-                        inputs = DynamicBF16Inputs(
-                            panel.q, panel.k, panel.v, panel.block_ids,
-                            panel.kv_lens, layout,
-                        )
-                        workspace = prepare_dynamic_bf16_workspace(inputs)
-                        if HAS_TLE and getattr(workspace, "mtp", None) != mtp:
-                            raise AssertionError(
-                                f"official {case}/MTP{mtp} did not select a fixed route"
-                            )
-                        if HAS_TLE and not getattr(workspace, "route", ""):
-                            raise AssertionError(
-                                f"official {case}/MTP{mtp} has no production route label"
-                            )
-                        cuda_task_map = (_make_cuda_task_map(
-                            hpc, panel.kv_lens, args.num_head_kv, mtp,
-                            args.min_process_len,
-                        ) if hpc is not None else None)
-                        cuda_call = None if hpc is None else lambda: hpc.attention_decode_bf16(
-                            panel.q, panel.k, panel.v, panel.block_ids,
-                            panel.kv_lens, mtp=mtp - 1,
-                            new_kv_included=True, splitk=True,
-                            task_map=cuda_task_map, output=cuda_out,
-                        )
-                        tle_call = lambda: attention_decode_bf16_dynamic(
-                            inputs, workspace,
-                        )
 
-                    if args.check:
-                        actual = tle_call().detach().clone()
-                        torch.cuda.synchronize()
-                        torch.testing.assert_close(
-                            actual, reference, atol=0.016, rtol=1e-5,
-                        )
-                        if cuda_call is not None:
-                            expected = cuda_call().detach().clone()
-                            torch.testing.assert_close(expected, reference, atol=0.016, rtol=1e-5)
-                            torch.testing.assert_close(actual, expected, atol=0.032, rtol=1e-5)
-                        if not torch.isfinite(actual).all():
-                            raise AssertionError("non-finite BF16 output")
-                        if (
-                            method == "dynamic"
-                            and not bf16_dynamic_workspace_is_reset(workspace)
-                        ):
-                            raise AssertionError(
-                                "cooperative finalization counter was not reset"
-                            )
-
-                    calls = {"triton+tle": tle_call}
-                    if cuda_call is not None:
-                        calls["cuda"] = cuda_call
-                    timing = _measure(
-                        calls,
-                        args.warmup, args.iters, args.repeat, args.graph,
-                    )
-                    tle_us, minimum, maximum = timing["triton+tle"]
-                    if cuda_call is None:
-                        print(f"{case:>20} | {method:>7} | {mtp:3d} | {layout:>6} | "
-                              f"{tle_us:12.2f} | {minimum:9.2f} | {maximum:9.2f}", flush=True)
-                    else:
-                        cuda_us = timing["cuda"][0]
-                        ratio = cuda_us / tle_us
-                        ratios[method, mtp, layout].append(ratio)
-                        print(f"{case:>20} | {method:>7} | {mtp:3d} | {layout:>6} | "
-                              f"{cuda_us:9.2f} | {tle_us:12.2f} | {minimum:9.2f} | "
-                              f"{maximum:9.2f} | {ratio:8.3f}x", flush=True)
-                    del inputs, workspace, cuda_out
-                    if cuda_task_map is not None:
-                        del cuda_task_map
-                del panel, reference
-                gc.collect()
-                torch.cuda.empty_cache()
-
-    print("=" * width, flush=True)
-    if hpc is None:
-        print("BF16 benchmark complete (CUDA baseline unavailable)", flush=True)
-        print("=" * width, flush=True)
+def _print_performance_table():
+    if not PERF_RESULTS:
         return
-    print("Attention Decode BF16 summary", flush=True)
-    for method in args.methods:
-        for mtp in args.mtp:
-            for layout in args.layout:
-                values = ratios[method, mtp, layout]
-                print(
-                    f"{method} | mtp={mtp} | {layout} | bf16 | "
-                    f"{min(values):.3f}x-{max(values):.3f}x",
-                    flush=True,
-                )
-    for method in args.methods:
-        for layout in args.layout:
-            values = [
-                ratio
-                for mtp in args.mtp
-                for ratio in ratios[method, mtp, layout]
-            ]
-            print(
-                f"overall | {method} | {layout} | bf16 | "
-                f"{min(values):.3f}x-{max(values):.3f}x",
-                flush=True,
+    headers = (
+        "Case",
+        "Method",
+        "MTP",
+        "Layout",
+        "FlagAttention Impl",
+        "FlagAttention (ms)",
+        "HPC CUDA (ms)",
+        "HPC/FlagAttention",
+    )
+    rows = [headers]
+    for result in PERF_RESULTS:
+        rows.append(
+            (
+                result["case"],
+                result["method"],
+                str(result["mtp"]),
+                result["layout"],
+                result["flagattention_impl"],
+                f'{result["flagattention_ms"]:.4f}',
+                (
+                    f'{result["hpc_ms"]:.4f}'
+                    if result["hpc_ms"] is not None else "N/A"
+                ),
+                (
+                    f'{result["hpc_ms"] / result["flagattention_ms"]:.3f}x'
+                    if result["hpc_ms"] is not None else "N/A"
+                ),
             )
-    print("=" * width, flush=True)
+        )
+
+    widths = [max(len(row[index]) for row in rows) for index in range(len(headers))]
+    separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+
+    def format_row(row):
+        return (
+            "| "
+            + " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
+            + " |"
+        )
+
+    print("\n\nHPC-Opc Decode Attention BF16 performance summary (CUDA Graph replay median)")
+    print(
+        f"Warmup replays: {BENCH_WARMUP}; Timed samples: {BENCH_ITERS}; "
+        f"Repeats: {BENCH_REPEAT}"
+    )
+    print(separator)
+    print(format_row(rows[0]))
+    print(separator)
+    for row in rows[1:]:
+        print(format_row(row))
+    print(separator)
+    print(
+        "HPC/FlagAttention > 1: FlagAttention is faster; "
+        "HPC/FlagAttention < 1: HPC CUDA is faster."
+    )
 
 
-if __name__ == "__main__":
-    main()
+@pytest.fixture(scope="module", autouse=True)
+def report_performance_results():
+    yield
+    _print_performance_table()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("mtp", BENCH_MTP, ids=lambda value: f"mtp{value}")
+@pytest.mark.parametrize("case", BENCH_CASES)
+@pytest.mark.parametrize("method", BENCH_METHODS)
+@pytest.mark.parametrize("layout", BENCH_LAYOUTS)
+def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
+    if not HAS_TLE and mtp != 1:
+        pytest.skip("pure Triton fallback supports MTP=1 only")
+
+    hpc = hpc_baseline
+    panel = make_inputs(
+        OFFICIAL_CASES[case], mtp, BENCH_NUM_HEAD_KV,
+        BENCH_NUM_HEAD_Q, layout,
+    )
+    reference = pytorch_reference(panel, mtp) if BENCH_CHECK else None
+    cuda_out = torch.empty_like(panel.q) if hpc is not None else None
+
+    if method == "static":
+        inputs = StaticBF16Inputs(
+            panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens, layout,
+        )
+        workspace = prepare_static_bf16_workspace(inputs)
+        cuda_task_map = None
+        cuda_call = (
+            None if hpc is None else lambda: hpc.attention_decode_bf16(
+                panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens,
+                mtp=mtp - 1, new_kv_included=True, splitk=True,
+                output=cuda_out,
+            )
+        )
+        tle_call = lambda: attention_decode_bf16_tle(inputs, workspace)
+    else:
+        inputs = DynamicBF16Inputs(
+            panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens, layout,
+        )
+        workspace = prepare_dynamic_bf16_workspace(inputs)
+        if HAS_TLE:
+            assert getattr(workspace, "mtp", None) == mtp
+            assert getattr(workspace, "route", "")
+        cuda_task_map = (
+            _make_cuda_task_map(
+                hpc, panel.kv_lens, BENCH_NUM_HEAD_KV, mtp,
+                BENCH_MIN_PROCESS_LEN,
+            ) if hpc is not None else None
+        )
+        cuda_call = (
+            None if hpc is None else lambda: hpc.attention_decode_bf16(
+                panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens,
+                mtp=mtp - 1, new_kv_included=True, splitk=True,
+                task_map=cuda_task_map, output=cuda_out,
+            )
+        )
+        tle_call = lambda: attention_decode_bf16_dynamic(inputs, workspace)
+
+    if BENCH_CHECK:
+        actual = tle_call().detach().clone()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, reference, atol=0.016, rtol=1e-5)
+        assert torch.isfinite(actual).all()
+        if cuda_call is not None:
+            expected = cuda_call().detach().clone()
+            torch.testing.assert_close(expected, reference, atol=0.016, rtol=1e-5)
+            torch.testing.assert_close(actual, expected, atol=0.032, rtol=1e-5)
+        if method == "dynamic":
+            assert bf16_dynamic_workspace_is_reset(workspace)
+
+    calls = {"triton+tle": tle_call}
+    if cuda_call is not None:
+        calls["cuda"] = cuda_call
+    timing = _measure(
+        calls, BENCH_WARMUP, BENCH_ITERS, BENCH_REPEAT, BENCH_GRAPH,
+    )
+    flagattention_ms = timing["triton+tle"][0]
+    hpc_ms = timing["cuda"][0] if cuda_call is not None else None
+    PERF_RESULTS.append({
+        "case": case,
+        "method": method,
+        "mtp": mtp,
+        "layout": layout,
+        "flagattention_impl": "TLE" if HAS_TLE else "Triton",
+        "flagattention_ms": flagattention_ms,
+        "hpc_ms": hpc_ms,
+    })
+
+    del panel, reference, inputs, workspace, cuda_out, cuda_task_map
+    gc.collect()
+    torch.cuda.empty_cache()

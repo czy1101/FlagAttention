@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import argparse
 import gc
 import math
 import statistics
@@ -26,6 +25,7 @@ from pathlib import Path
 
 import torch
 import triton
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +58,23 @@ _IMPLEMENTATIONS = {
     ("dynamic", "qkpertoken_perhead_vperhead"): fp8_qk_dynamic,
     ("dynamic", "qpertoken_perhead_kvpertensor"): fp8_kv_dynamic,
 }
+
+# Fixed pytest benchmark matrix.  Select a subset with a pytest node ID or
+# ``-k`` instead of command-line benchmark arguments.
+BENCH_MTP = SUPPORTED_MTP
+BENCH_QUANT_TYPES = tuple(QUANT_TYPES)
+BENCH_SCHEDULES = ("static", "dynamic")
+BENCH_CASES = tuple(OFFICIAL_CASES)
+BENCH_LAYOUTS = ("NHD", "HND")
+BENCH_NUM_HEAD_KV = 1
+BENCH_NUM_HEAD_Q = 8
+BENCH_WARMUP = 50
+BENCH_ITERS = 300
+BENCH_REPEAT = 5
+BENCH_MIN_PROCESS_LEN = 512
+BENCH_GRAPH = True
+BENCH_CHECK = False
+PERF_RESULTS = []
 
 
 def _implementation(schedule: str, quant_type: str):
@@ -253,7 +270,7 @@ def _run_cuda(
     )
 
 
-def _bench_us(call, warmup: int, iters: int, graph_mode: bool) -> float:
+def _bench_ms(call, warmup: int, iters: int, graph_mode: bool) -> float:
     for _ in range(warmup):
         call()
     torch.cuda.synchronize()
@@ -278,7 +295,7 @@ def _bench_us(call, warmup: int, iters: int, graph_mode: bool) -> float:
         call()
         end.record()
     torch.cuda.synchronize()
-    values = sorted(start.elapsed_time(end) * 1000.0 for start, end in events)
+    values = sorted(start.elapsed_time(end) for start, end in events)
     return values[len(values) // 2]
 
 
@@ -291,7 +308,7 @@ def _measure(calls, warmup, iters, repeat, graph_mode):
             order.reverse()
         for name in order:
             samples[name].append(
-                _bench_us(calls[name], warmup, iters, graph_mode)
+                _bench_ms(calls[name], warmup, iters, graph_mode)
             )
     return {
         name: (statistics.median(values), min(values), max(values))
@@ -299,181 +316,145 @@ def _measure(calls, warmup, iters, repeat, graph_mode):
     }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mtp", nargs="+", type=int, choices=SUPPORTED_MTP,
-                        default=list(SUPPORTED_MTP))
-    parser.add_argument("--quant-types", nargs="+", choices=QUANT_TYPES,
-                        default=list(QUANT_TYPES))
-    parser.add_argument("--schedules", nargs="+", choices=("static", "dynamic"),
-                        default=["static", "dynamic"])
-    parser.add_argument("--cases", nargs="+", choices=OFFICIAL_CASES,
-                        default=list(OFFICIAL_CASES))
-    parser.add_argument("--layout", nargs="+", choices=("NHD", "HND"),
-                        default=["NHD", "HND"])
-    parser.add_argument("--num-head-kv", type=int, default=1)
-    parser.add_argument("--num-head-q", type=int, default=8)
-    parser.add_argument("--warmup", type=int, default=50)
-    parser.add_argument("--iters", type=int, default=300)
-    parser.add_argument("--repeat", type=int, default=5)
-    parser.add_argument("--min-process-len", type=int, default=512)
-    parser.add_argument("--check", action="store_true")
-    parser.add_argument("--no-graph", dest="graph", action="store_false")
-    parser.set_defaults(graph=True)
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    if (args.num_head_q, args.num_head_kv) != (8, 1):
-        raise ValueError("validated final FP8 policies require Hq=8 and Hkv=1")
+@pytest.fixture(scope="module")
+def hpc_baseline():
     triton.set_allocator(lambda size, _align, _stream: torch.empty(
         size, dtype=torch.int8, device="cuda"
     ))
-    hpc = _load_hpc()
-    if not HAS_TLE:
-        skipped = [mtp for mtp in args.mtp if mtp != 1]
-        if skipped:
-            print("TLE unavailable; pure Triton fallback supports MTP=1 only; "
-                  f"skipping MTP={skipped}", file=sys.stderr)
-        args.mtp = [mtp for mtp in args.mtp if mtp == 1]
-        if not args.mtp:
-            raise ValueError("pure Triton fallback supports only --mtp 1")
-    if hpc is None and args.check:
-        print("CUDA baseline unavailable; FP8 --check is limited to finite-output "
-              "and workspace-reset checks", file=sys.stderr)
-    ratios = {
-        (schedule, mtp, quant_type, layout): []
-        for schedule in args.schedules
-        for mtp in args.mtp
-        for quant_type in args.quant_types
-        for layout in args.layout
-    }
-    backend_label = "triton+tle" if HAS_TLE else "pure triton"
-    if hpc is None:
-        header = (f"{'case':>18} | {'sched':>7} | {'mtp':>3} | {'layout':>6} | "
-                  f"{'quant_type':>34} | {backend_label:>10} | {'min':>9} | {'max':>9}")
-    else:
-        header = (f"{'case':>18} | {'sched':>7} | {'mtp':>3} | {'layout':>6} | "
-                  f"{'quant_type':>34} | {'cuda':>10} | {backend_label:>10} | "
-                  f"{'min':>9} | {'max':>9} | {'vs cuda':>8}")
-    runtime = "Triton+TLE" if HAS_TLE else "Pure Triton"
-    comparison = (
-        f"HPC CUDA vs {runtime}"
-        if hpc is not None
-        else f"{runtime} | HPC CUDA unavailable"
-    )
-    title = f"Attention Decode FP8 | {comparison} | latency in us"
-    if hpc is not None:
-        title += f"; x = CUDA / {runtime}"
-    width = max(len(header), len(title))
-    print("=" * width, flush=True)
-    print(title, flush=True)
-    print("-" * width, flush=True)
-    print(header, flush=True)
-    print("-" * width, flush=True)
+    return _load_hpc()
 
-    for mtp in args.mtp:
-        for quant_type in args.quant_types:
-            for layout in args.layout:
-                for case in args.cases:
-                    panel = make_inputs(
-                        OFFICIAL_CASES[case], mtp, args.num_head_kv,
-                        args.num_head_q, layout, quant_type,
-                    )
-                    inputs = _inputs(panel)
-                    cuda_output = (torch.empty_like(panel.q, dtype=torch.bfloat16)
-                                   if hpc is not None else None)
-                    for schedule in args.schedules:
-                        implementation = _implementation(schedule, quant_type)
-                        workspace = implementation.prepare_decode_workspace(
-                            inputs,
-                        )
-                        task_map = (
-                            _cuda_task_map(
-                                hpc, panel, mtp, args.min_process_len,
-                            )
-                            if hpc is not None and schedule == "dynamic" else None
-                        )
-                        tle_call = lambda: implementation.attention_decode_fp8(
-                            inputs, workspace,
-                        )
-                        cuda_call = (None if hpc is None else lambda: _run_cuda(
-                            hpc, panel, cuda_output, mtp, quant_type, task_map,
-                        ))
-                        if args.check:
-                            actual = tle_call().detach().clone()
-                            torch.cuda.synchronize()
-                            reset = implementation.workspace_is_reset(workspace)
-                            close = True
-                            if cuda_call is not None:
-                                expected = cuda_call().detach().clone()
-                                close = bool(torch.allclose(actual, expected, atol=0.2, rtol=0.2))
-                            if not bool(torch.isfinite(actual).all()) or not close or not reset:
-                                expected = actual if cuda_call is None else expected
-                                diff = (actual.float() - expected.float()).abs()
-                                raise AssertionError(
-                                    f"{schedule}/mtp={mtp}/{quant_type}/"
-                                    f"{case}/{layout}: close={close}, reset={reset}, "
-                                    f"mae={diff.mean().item():.6f}, "
-                                    f"max={diff.max().item():.6f}"
-                                )
-                        calls = {"tle": tle_call}
-                        if cuda_call is not None:
-                            calls["cuda"] = cuda_call
-                        timing = _measure(
-                            calls,
-                            args.warmup, args.iters, args.repeat, args.graph,
-                        )
-                        tle_us, minimum, maximum = timing["tle"]
-                        if cuda_call is None:
-                            print(f"{case:>18} | {schedule:>7} | {mtp:3d} | "
-                                  f"{layout:>6} | {quant_type:>34} | {tle_us:10.2f} | "
-                                  f"{minimum:9.2f} | {maximum:9.2f}", flush=True)
-                        else:
-                            cuda_us = timing["cuda"][0]
-                            ratio = cuda_us / tle_us
-                            ratios[(schedule, mtp, quant_type, layout)].append(ratio)
-                            print(f"{case:>18} | {schedule:>7} | {mtp:3d} | "
-                                  f"{layout:>6} | {quant_type:>34} | {cuda_us:10.2f} | "
-                                  f"{tle_us:10.2f} | {minimum:9.2f} | {maximum:9.2f} | "
-                                  f"{ratio:7.3f}x", flush=True)
-                        del workspace, tle_call, cuda_call, task_map
-                    del panel, inputs, cuda_output
-                    gc.collect()
-                    torch.cuda.empty_cache()
 
-    print("=" * width, flush=True)
-    if hpc is None:
-        print("FP8 benchmark complete (CUDA baseline unavailable)", flush=True)
-        print("=" * width, flush=True)
+def _print_performance_table():
+    if not PERF_RESULTS:
         return
-    print("Attention Decode FP8 summary", flush=True)
-    for schedule in args.schedules:
-        for mtp in args.mtp:
-            for quant_type in args.quant_types:
-                for layout in args.layout:
-                    values = ratios[(schedule, mtp, quant_type, layout)]
-                    print(
-                        f"{schedule} | mtp={mtp} | {layout} | {quant_type} | "
-                        f"{min(values):.3f}x-{max(values):.3f}x",
-                        flush=True,
-                    )
-    for layout in args.layout:
-        values = [
-            ratio
-            for schedule in args.schedules
-            for mtp in args.mtp
-            for quant_type in args.quant_types
-            for ratio in ratios[(schedule, mtp, quant_type, layout)]
-        ]
-        print(
-            f"overall | {layout} | fp8 | "
-            f"{min(values):.3f}x-{max(values):.3f}x",
-            flush=True,
+    headers = (
+        "Case",
+        "Schedule",
+        "MTP",
+        "Layout",
+        "Quant Type",
+        "FlagAttention Impl",
+        "FlagAttention (ms)",
+        "HPC CUDA (ms)",
+        "HPC/FlagAttention",
+    )
+    rows = [headers]
+    for result in PERF_RESULTS:
+        rows.append(
+            (
+                result["case"],
+                result["schedule"],
+                str(result["mtp"]),
+                result["layout"],
+                result["quant_type"],
+                result["flagattention_impl"],
+                f'{result["flagattention_ms"]:.4f}',
+                (
+                    f'{result["hpc_ms"]:.4f}'
+                    if result["hpc_ms"] is not None else "N/A"
+                ),
+                (
+                    f'{result["hpc_ms"] / result["flagattention_ms"]:.3f}x'
+                    if result["hpc_ms"] is not None else "N/A"
+                ),
+            )
         )
-    print("=" * width, flush=True)
+
+    widths = [max(len(row[index]) for row in rows) for index in range(len(headers))]
+    separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+
+    def format_row(row):
+        return (
+            "| "
+            + " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
+            + " |"
+        )
+
+    print("\n\nHPC-Opc Decode Attention FP8 performance summary (CUDA Graph replay median)")
+    print(
+        f"Warmup replays: {BENCH_WARMUP}; Timed samples: {BENCH_ITERS}; "
+        f"Repeats: {BENCH_REPEAT}"
+    )
+    print(separator)
+    print(format_row(rows[0]))
+    print(separator)
+    for row in rows[1:]:
+        print(format_row(row))
+    print(separator)
+    print(
+        "HPC/FlagAttention > 1: FlagAttention is faster; "
+        "HPC/FlagAttention < 1: HPC CUDA is faster."
+    )
 
 
-if __name__ == "__main__":
-    main()
+@pytest.fixture(scope="module", autouse=True)
+def report_performance_results():
+    yield
+    _print_performance_table()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("mtp", BENCH_MTP, ids=lambda value: f"mtp{value}")
+@pytest.mark.parametrize("quant_type", BENCH_QUANT_TYPES)
+@pytest.mark.parametrize("schedule", BENCH_SCHEDULES)
+@pytest.mark.parametrize("case", BENCH_CASES)
+@pytest.mark.parametrize("layout", BENCH_LAYOUTS)
+def test_attention_decode_fp8_perf(
+    hpc_baseline, mtp, quant_type, schedule, case, layout,
+):
+    if not HAS_TLE and mtp != 1:
+        pytest.skip("pure Triton fallback supports MTP=1 only")
+
+    hpc = hpc_baseline
+    panel = make_inputs(
+        OFFICIAL_CASES[case], mtp, BENCH_NUM_HEAD_KV,
+        BENCH_NUM_HEAD_Q, layout, quant_type,
+    )
+    inputs = _inputs(panel)
+    implementation = _implementation(schedule, quant_type)
+    workspace = implementation.prepare_decode_workspace(inputs)
+    cuda_output = (
+        torch.empty_like(panel.q, dtype=torch.bfloat16) if hpc is not None else None
+    )
+    task_map = (
+        _cuda_task_map(hpc, panel, mtp, BENCH_MIN_PROCESS_LEN)
+        if hpc is not None and schedule == "dynamic" else None
+    )
+    tle_call = lambda: implementation.attention_decode_fp8(inputs, workspace)
+    cuda_call = (
+        None if hpc is None else
+        lambda: _run_cuda(hpc, panel, cuda_output, mtp, quant_type, task_map)
+    )
+
+    if BENCH_CHECK:
+        actual = tle_call().detach().clone()
+        torch.cuda.synchronize()
+        reset = implementation.workspace_is_reset(workspace)
+        assert torch.isfinite(actual).all()
+        assert reset, "decode workspace was not reset"
+        if cuda_call is not None:
+            expected = cuda_call().detach().clone()
+            torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
+
+    calls = {"tle": tle_call}
+    if cuda_call is not None:
+        calls["cuda"] = cuda_call
+    timing = _measure(
+        calls, BENCH_WARMUP, BENCH_ITERS, BENCH_REPEAT, BENCH_GRAPH,
+    )
+    flagattention_ms = timing["tle"][0]
+    hpc_ms = timing["cuda"][0] if cuda_call is not None else None
+    PERF_RESULTS.append({
+        "case": case,
+        "schedule": schedule,
+        "mtp": mtp,
+        "layout": layout,
+        "quant_type": quant_type,
+        "flagattention_impl": "TLE" if HAS_TLE else "Triton",
+        "flagattention_ms": flagattention_ms,
+        "hpc_ms": hpc_ms,
+    })
+
+    del panel, inputs, workspace, cuda_output, task_map
+    gc.collect()
+    torch.cuda.empty_cache()
