@@ -3896,6 +3896,7 @@ if HAS_TLE:
             dtype=q.dtype.element_ty,
             layout=None,
             scope=tle.gpu.smem,
+            nv_mma_shared_layout=False,
         )
 
         sQ_r = tle.gpu.alloc(
@@ -3903,6 +3904,7 @@ if HAS_TLE:
             dtype=q.dtype.element_ty,
             layout=None,
             scope=tle.gpu.smem,
+            nv_mma_shared_layout=False,
         )
 
         if HAVE_TAIL:
@@ -3911,6 +3913,7 @@ if HAS_TLE:
                 dtype=q.dtype.element_ty,
                 layout=None,
                 scope=tle.gpu.smem,
+                nv_mma_shared_layout=False,
             )
 
         offs_h = tl.arange(0, BH)

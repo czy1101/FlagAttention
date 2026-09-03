@@ -1021,7 +1021,7 @@ if HAS_TLE_GDN2:
             p_w = tl.make_block_ptr(
                 w_wy, (T, K), (H * K, 1), (i_t * BT, 0), (BT, 64), (1, 0)
             )
-            b_w_blk = tl.load(p_w, boundary_check=(0, 1))
+            b_w_blk = tl.load(p_w, boundary_check=(0, 1), padding_option="zero")
             if STATE_V_FIRST:
                 b_v_new = tl.dot(b_w_blk, tl.trans(b_h1).to(b_w_blk.dtype))
             else:
@@ -1031,7 +1031,7 @@ if HAS_TLE_GDN2:
                 p_w = tl.make_block_ptr(
                     w_wy, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0)
                 )
-                b_w_blk = tl.load(p_w, boundary_check=(0, 1))
+                b_w_blk = tl.load(p_w, boundary_check=(0, 1), padding_option="zero")
                 if STATE_V_FIRST:
                     b_v_new += tl.dot(b_w_blk, tl.trans(b_h2).to(b_w_blk.dtype))
                 else:
@@ -1041,7 +1041,7 @@ if HAS_TLE_GDN2:
                 p_w = tl.make_block_ptr(
                     w_wy, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0)
                 )
-                b_w_blk = tl.load(p_w, boundary_check=(0, 1))
+                b_w_blk = tl.load(p_w, boundary_check=(0, 1), padding_option="zero")
                 if STATE_V_FIRST:
                     b_v_new += tl.dot(b_w_blk, tl.trans(b_h3).to(b_w_blk.dtype))
                 else:
@@ -1051,7 +1051,7 @@ if HAS_TLE_GDN2:
                 p_w = tl.make_block_ptr(
                     w_wy, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0)
                 )
-                b_w_blk = tl.load(p_w, boundary_check=(0, 1))
+                b_w_blk = tl.load(p_w, boundary_check=(0, 1), padding_option="zero")
                 if STATE_V_FIRST:
                     b_v_new += tl.dot(b_w_blk, tl.trans(b_h4).to(b_w_blk.dtype))
                 else:
@@ -1060,13 +1060,13 @@ if HAS_TLE_GDN2:
             p_u = tl.make_block_ptr(
                 u_wy, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
             )
-            b_v_new = tl.load(p_u, boundary_check=(0, 1)) - b_v_new
+            b_v_new = tl.load(p_u, boundary_check=(0, 1), padding_option="zero") - b_v_new
 
             # o = scale * qg @ h + Aqk @ v_new
             p_qg = tl.make_block_ptr(
                 qg, (T, K), (H * K, 1), (i_t * BT, 0), (BT, 64), (1, 0)
             )
-            b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
+            b_qg_blk = tl.load(p_qg, boundary_check=(0, 1), padding_option="zero")
             if STATE_V_FIRST:
                 b_o = tl.dot(b_qg_blk, tl.trans(b_h1).to(b_qg_blk.dtype))
             else:
@@ -1076,7 +1076,7 @@ if HAS_TLE_GDN2:
                 p_qg = tl.make_block_ptr(
                     qg, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0)
                 )
-                b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
+                b_qg_blk = tl.load(p_qg, boundary_check=(0, 1), padding_option="zero")
                 if STATE_V_FIRST:
                     b_o += tl.dot(b_qg_blk, tl.trans(b_h2).to(b_qg_blk.dtype))
                 else:
@@ -1086,7 +1086,7 @@ if HAS_TLE_GDN2:
                 p_qg = tl.make_block_ptr(
                     qg, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0)
                 )
-                b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
+                b_qg_blk = tl.load(p_qg, boundary_check=(0, 1), padding_option="zero")
                 if STATE_V_FIRST:
                     b_o += tl.dot(b_qg_blk, tl.trans(b_h3).to(b_qg_blk.dtype))
                 else:
@@ -1096,7 +1096,7 @@ if HAS_TLE_GDN2:
                 p_qg = tl.make_block_ptr(
                     qg, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0)
                 )
-                b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
+                b_qg_blk = tl.load(p_qg, boundary_check=(0, 1), padding_option="zero")
                 if STATE_V_FIRST:
                     b_o += tl.dot(b_qg_blk, tl.trans(b_h4).to(b_qg_blk.dtype))
                 else:
@@ -1106,7 +1106,7 @@ if HAS_TLE_GDN2:
             p_Aqk = tl.make_block_ptr(
                 Aqk, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
             )
-            b_Aqk = tl.load(p_Aqk, boundary_check=(0, 1))
+            b_Aqk = tl.load(p_Aqk, boundary_check=(0, 1), padding_option="zero")
             b_o += tl.dot(b_Aqk.to(b_v_new.dtype), b_v_new)
 
             p_o = tl.make_block_ptr(
@@ -1161,7 +1161,7 @@ if HAS_TLE_GDN2:
             p_kg = tl.make_block_ptr(
                 kg, (K, T), (1, H * K), (0, i_t * BT), (64, BT), (0, 1)
             )
-            b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
+            b_kg_blk = tl.load(p_kg, boundary_check=(0, 1), padding_option="zero")
             if STATE_V_FIRST:
                 b_h1 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
             else:
@@ -1171,7 +1171,7 @@ if HAS_TLE_GDN2:
                 p_kg = tl.make_block_ptr(
                     kg, (K, T), (1, H * K), (64, i_t * BT), (64, BT), (0, 1)
                 )
-                b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
+                b_kg_blk = tl.load(p_kg, boundary_check=(0, 1), padding_option="zero")
                 if STATE_V_FIRST:
                     b_h2 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
                 else:
@@ -1181,7 +1181,7 @@ if HAS_TLE_GDN2:
                 p_kg = tl.make_block_ptr(
                     kg, (K, T), (1, H * K), (128, i_t * BT), (64, BT), (0, 1)
                 )
-                b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
+                b_kg_blk = tl.load(p_kg, boundary_check=(0, 1), padding_option="zero")
                 if STATE_V_FIRST:
                     b_h3 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
                 else:
@@ -1191,7 +1191,7 @@ if HAS_TLE_GDN2:
                 p_kg = tl.make_block_ptr(
                     kg, (K, T), (1, H * K), (192, i_t * BT), (64, BT), (0, 1)
                 )
-                b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
+                b_kg_blk = tl.load(p_kg, boundary_check=(0, 1), padding_option="zero")
                 if STATE_V_FIRST:
                     b_h4 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
                 else:
