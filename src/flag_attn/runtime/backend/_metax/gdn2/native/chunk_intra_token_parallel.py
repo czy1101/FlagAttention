@@ -21,7 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.runtime.backend._metax.compat import autotune_cache_kwargs, exp2
+from flag_attn.runtime.backend._metax.gdn2.compat import autotune_cache_kwargs, exp2
 
 
 @triton.heuristics(

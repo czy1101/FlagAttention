@@ -24,7 +24,7 @@ from .minimax_sparse_attention import (
     minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode,
 )
-from .chunk_gdn2 import chunk_gdn2
+from .gdn2 import chunk_gdn2
 
 __all__ = [
     "SPARSE_BLOCK_SIZE",

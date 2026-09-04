@@ -19,13 +19,14 @@ from __future__ import annotations
 import argparse
 import importlib
 import math
+from functools import partial
 
 import torch
 import triton
 import triton.knobs
 
 from flag_attn.runtime.backend._metax import chunk_gdn2
-from flag_attn.runtime.backend._metax.gdn2_native.chunk_fwd import chunk_gdn2_fwd
+from flag_attn.runtime.backend._metax.gdn2.native.chunk_fwd import chunk_gdn2_fwd
 
 
 SHAPES = (
@@ -128,7 +129,7 @@ def main() -> None:
         raise RuntimeError("This benchmark requires a CUDA-compatible device.")
     triton.knobs.autotuning.adjust_block_size = False
     gdn2_module = importlib.import_module(
-        "flag_attn.runtime.backend._metax.chunk_gdn2"
+        "flag_attn.runtime.backend._metax.gdn2.chunk_gdn2"
     )
     if not gdn2_module.HAS_TLE_GDN2:
         raise RuntimeError("This benchmark requires FlagTree 3.6+ with TLE GDN2.")
@@ -143,9 +144,11 @@ def main() -> None:
             scale = shape[3] ** -0.5
             with torch.inference_mode():
                 native_ms = _bench(
-                    lambda: _native(inputs, scale), args.warmup, args.rep
+                    partial(_native, inputs, scale), args.warmup, args.rep
                 )
-                tle_ms = _bench(lambda: _tle(inputs, scale), args.warmup, args.rep)
+                tle_ms = _bench(
+                    partial(_tle, inputs, scale), args.warmup, args.rep
+                )
             shape_text = "(" + ",".join(map(str, shape)) + ")"
             print(
                 f"| {shape_text} | {native_ms:.6f} | {tle_ms:.6f} | "

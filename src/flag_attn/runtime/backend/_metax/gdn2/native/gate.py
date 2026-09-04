@@ -14,7 +14,7 @@ import triton.language as tl
 
 from flag_attn.gated_delta_rule.index import prepare_chunk_indices
 from flag_attn.gated_delta_rule.triton_ops_helper import exp
-from flag_attn.runtime.backend._metax.compat import autotune_cache_kwargs
+from flag_attn.runtime.backend._metax.gdn2.compat import autotune_cache_kwargs
 
 
 def input_guard(fn):

@@ -285,7 +285,7 @@ def test_chunk_gdn2_matches_independent_torch(case):
     )
 
     module = importlib.import_module(
-        "flag_attn.runtime.backend._metax.chunk_gdn2"
+        "flag_attn.runtime.backend._metax.gdn2.chunk_gdn2"
     )
     original_has_tle = module.HAS_TLE_GDN2
     original_tle = getattr(module, "chunk_gdn2_fwd_infer", None)

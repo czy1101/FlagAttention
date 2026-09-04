@@ -24,12 +24,12 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.runtime.backend._metax.gdn2_native.chunk_intra_token_parallel import (
+from flag_attn.runtime.backend._metax.gdn2.native.chunk_intra_token_parallel import (
     chunk_gdn2_fwd_intra_token_parallel,
 )
 from flag_attn.gated_delta_rule.index import prepare_chunk_indices
-from flag_attn.runtime.backend._metax.compat import autotune_cache_kwargs, exp2
-from flag_attn.runtime.backend._metax.gdn2_native.wy_fast import (
+from flag_attn.runtime.backend._metax.gdn2.compat import autotune_cache_kwargs, exp2
+from flag_attn.runtime.backend._metax.gdn2.native.wy_fast import (
     recompute_w_u_fwd_gdn2,
 )
 

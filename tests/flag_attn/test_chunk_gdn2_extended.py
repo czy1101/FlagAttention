@@ -167,7 +167,7 @@ def test_chunk_gdn2_extended_matrix(shape, dtype, impl):
     inputs_before = tuple(tensor.clone() for tensor in args)
 
     module = importlib.import_module(
-        "flag_attn.runtime.backend._metax.chunk_gdn2"
+        "flag_attn.runtime.backend._metax.gdn2.chunk_gdn2"
     )
     assert module.chunk_gdn2 is chunk_gdn2
     original_has_tle = module.HAS_TLE_GDN2
