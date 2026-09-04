@@ -53,14 +53,29 @@ def _has_tle_gpu_apis(*names: str) -> bool:
     return _HAS_TLE and all(hasattr(tle.gpu, name) for name in names)
 
 
+def _has_tle_builder_apis(*names: str) -> bool:
+    if not _HAS_TLE:
+        return False
+    try:
+        from triton._C import libtriton
+    except (AttributeError, ImportError):
+        return False
+    return all(hasattr(libtriton.ir.builder, name) for name in names)
+
 _HAS_TLE_SYNC = _has_tle_gpu_apis("alloc", "local_ptr")
-_HAS_TLE_ASYNC_MMA = _has_tle_gpu_apis(
-    "alloc_barriers",
-    "barrier_wait",
-    "barrier_arrive",
-    "wgmma",
-    "wgmma_wait",
-    "READY",
+_HAS_TLE_ASYNC_MMA = (
+    _has_tle_gpu_apis(
+        "alloc_barriers",
+        "barrier_wait",
+        "barrier_arrive",
+        "wgmma",
+        "wgmma_wait",
+        "READY",
+    )
+    and _has_tle_builder_apis(
+        "make_nv_mma_shared_encoding_attr",
+        "create_memdesc_index",
+    )
 )
 
 # One sparse block == one KV page.
@@ -415,6 +430,7 @@ def _gqa_sparse_fwd_tle_sync(
         dtype=kv_cache_ptr.dtype.element_ty,
         layout=None,
         scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
     )
     kv_local_ptrs = tle.gpu.local_ptr(kv_smem)
 
