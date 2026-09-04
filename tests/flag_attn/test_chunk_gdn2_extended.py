@@ -14,6 +14,7 @@
 
 import importlib
 import math
+import os
 
 import pytest
 import torch
@@ -149,6 +150,13 @@ def _assert_close(name, actual, expected):
         )
 
 
+@pytest.mark.skipif(
+    os.environ.get("FLAG_ATTN_RUN_GDN2_EXTENDED") != "1",
+    reason=(
+        "set FLAG_ATTN_RUN_GDN2_EXTENDED=1 "
+        "to run the complete 48-case GDN2 matrix"
+    ),
+)
 @pytest.mark.parametrize("impl", GDN2_IMPLS)
 @pytest.mark.parametrize("dtype", GDN2_DTYPES)
 @pytest.mark.parametrize("shape", GDN2_TEST_SHAPES)
