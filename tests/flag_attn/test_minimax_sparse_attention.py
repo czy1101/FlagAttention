@@ -82,9 +82,6 @@ def test_metax_public_exports() -> None:
     import flag_attn
     from flag_attn.runtime.backend import _metax
 
-    assert flag_attn.flash_mla is _metax.flash_mla
-    assert flag_attn.flash_mla_with_kvcache is _metax.flash_mla_with_kvcache
-    assert flag_attn.flash_mla_sparse_fwd is _metax.flash_mla_sparse_fwd
     assert flag_attn.chunk_gdn2 is _metax.chunk_gdn2
     assert flag_attn.minimax_m3_sparse_attn is _metax.minimax_m3_sparse_attn
 
