@@ -30,6 +30,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .tuning import get_tuned_config
+
 from flag_attn.gated_delta_rule.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -142,19 +144,22 @@ if HAS_TLE_GDN2:
         }
     )
     @triton.autotune(
-        configs=[
-            triton.Config(
-                {"BK": BK, "BV": BV},
-                num_warps=num_warps,
-                num_stages=num_stages,
-                maxnreg=maxnreg,
-            )
-            for BK in [16, 32, 64]
-            for BV in [16, 32, 64]
-            for num_warps in [1, 2, 4]
-            for num_stages in [1, 2]
-            for maxnreg in [None, *INTRA_TLE_MAXNREG_CANDIDATES]
-        ],
+        configs=get_tuned_config(
+            "_chunk_gdn2_fwd_intra_infer_kernel",
+            fallback=[
+                triton.Config(
+                    {"BK": BK, "BV": BV},
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                    maxnreg=maxnreg,
+                )
+                for BK in [16, 32, 64]
+                for BV in [16, 32, 64]
+                for num_warps in [1, 2, 4]
+                for num_stages in [1, 2]
+                for maxnreg in [None, *INTRA_TLE_MAXNREG_CANDIDATES]
+            ],
+        ),
         key=["H", "K", "V", "BT"],
         **autotune_cache_kwargs,
     )
@@ -775,6 +780,7 @@ if HAS_TLE_GDN2:
             for num_warps in [2, 4]
         ],
         key=["H", "K", "V", "BT"],
+        **autotune_cache_kwargs,
     )
     @triton.jit(do_not_specialize=["T"])
     def _chunk_gdn2_fwd_h_o_infer_kernel(

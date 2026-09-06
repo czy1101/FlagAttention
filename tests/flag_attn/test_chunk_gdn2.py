@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import importlib
 import math
-import os
 
 import pytest
 import torch
@@ -118,22 +117,6 @@ CASES = [
         id="fallback_bf16_t17_initial_kv",
     ),
 ]
-
-# Keep the default acceptance gate bounded while retaining every case for
-# explicit extended validation.
-_RUN_GDN2_EXTENDED = (
-    os.environ.get("FLAG_ATTN_RUN_GDN2_EXTENDED") == "1"
-)
-_DEFAULT_GDN2_CASE_IDS = {
-    "tle_bf16_t15_no_state_no_final",
-    "tle_fp16_b2_t32_multi_chunk",
-    "fallback_bf16_t17_initial_kv",
-}
-if not _RUN_GDN2_EXTENDED:
-    CASES = [
-        case for case in CASES
-        if case.id in _DEFAULT_GDN2_CASE_IDS
-    ]
 
 
 def _make_inputs(case):

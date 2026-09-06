@@ -24,6 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ..tuning import get_tuned_config
+
 from flag_attn.runtime.backend._metax.gdn2.native.chunk_intra_token_parallel import (
     chunk_gdn2_fwd_intra_token_parallel,
 )
@@ -181,11 +183,14 @@ def chunk_gdn2_fwd_kernel_intra_sub_chunk(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
-    ],
+    configs=get_tuned_config(
+        "chunk_gdn2_fwd_kernel_inter_solve_fused",
+        fallback=[
+            triton.Config({"BK": BK}, num_warps=num_warps)
+            for BK in [32, 64]
+            for num_warps in [1, 2, 4]
+        ],
+    ),
     key=["H", "K", "BC"],
     **autotune_cache_kwargs,
 )

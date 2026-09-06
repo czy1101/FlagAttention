@@ -10,7 +10,7 @@
 import torch
 
 from flag_attn.gated_delta_rule.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from flag_attn.gated_linear_attention.chunk_gla import chunk_gla_fwd_o_gk
+from .output import chunk_gdn2_fwd_o as chunk_gla_fwd_o_gk
 from flag_attn.gated_linear_attention.cumsum import chunk_local_cumsum
 from flag_attn.runtime.backend._metax.gdn2.native.chunk_intra import (
     chunk_gdn2_fwd_intra,
