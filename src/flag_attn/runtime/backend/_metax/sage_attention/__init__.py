@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .attn_qk_int8_per_block import forward
+from .native import forward
 from .quant_per_block import per_block_int8
 
 __all__ = ["forward", "per_block_int8"]
