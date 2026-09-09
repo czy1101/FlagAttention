@@ -24,52 +24,25 @@ from flag_attn.piecewise import attention as piecewise_attention # noqa: F401
 from flag_attn.flash import attention as flash_attention # noqa: F401
 from flag_attn.split_kv import attention as flash_attention_split_kv # noqa: F401
 from flag_attn.paged import attention as paged_attention # noqa: F401
-import importlib
-from flag_attn.minimax_sparse_attention import (
-    minimax_m3_index_decode as minimax_m3_index_decode,
-    minimax_m3_index_decode_score as minimax_m3_index_decode_score,
-    minimax_m3_index_score as minimax_m3_index_score,
-    minimax_m3_index_topk as minimax_m3_index_topk,
-    minimax_m3_sparse_attn as minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode,
-)
+try:
+    from flag_attn.diffkv_attention import diffkv_attention # noqa: F401
+except ImportError:
+    # Keep the rest of the package importable when Triton itself is optional.
+    pass
+from flag_attn.gated_delta_rule import chunk_gated_delta_rule # noqa: F401
+from flag_attn.gated_linear_attention import chunk_gla as chunk_gla
+try:
+    from flag_attn.minimax_sparse_attention import (
+        minimax_m3_index_decode as minimax_m3_index_decode,
+        minimax_m3_index_decode_score as minimax_m3_index_decode_score,
+        minimax_m3_index_score as minimax_m3_index_score,
+        minimax_m3_index_topk as minimax_m3_index_topk,
+        minimax_m3_sparse_attn as minimax_m3_sparse_attn,
+        minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode,
+    )
+except ImportError:
+    # MiniMax sparse attention currently has a hard TLE dependency.  It is
+    # optional here so DiffKV can still use the standard Triton fallback.
+    pass
 
 from flag_attn import testing # noqa: F401
-
-_FLA_EXPORTS = {
-    "chunk_gated_delta_rule": (
-        "flag_attn.FLA.gated_delta_rule",
-        "chunk_gated_delta_rule",
-    ),
-    "chunk_gla": (
-        "flag_attn.FLA.gated_linear_attention",
-        "chunk_gla",
-    ),
-}
-
-
-def __getattr__(name: str):
-    """Lazily expose FLA operators without importing their Triton kernels at package init."""
-    try:
-        module_name, attribute_name = _FLA_EXPORTS[name]
-    except KeyError as exc:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
-    value = getattr(importlib.import_module(module_name), attribute_name)
-    globals()[name] = value
-    return value
-
-
-__all__ = [
-    "piecewise_attention",
-    "flash_attention",
-    "flash_attention_split_kv",
-    "paged_attention",
-    "chunk_gated_delta_rule",
-    "chunk_gla",
-    "minimax_m3_index_decode",
-    "minimax_m3_index_decode_score",
-    "minimax_m3_index_score",
-    "minimax_m3_index_topk",
-    "minimax_m3_sparse_attn",
-    "minimax_m3_sparse_attn_decode",
-]
