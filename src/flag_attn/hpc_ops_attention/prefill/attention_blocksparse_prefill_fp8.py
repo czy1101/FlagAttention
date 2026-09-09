@@ -25,7 +25,9 @@ portable Triton implementation.  Explicit ``_tle``/``_hopper`` and ``_triton``
 entry points are retained for benchmarks that need to pin a provider.
 """
 
+from dataclasses import dataclass
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -33,7 +35,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ...gated_delta_rule.compat import has_triton_tle
+from ...utils import has_triton_tle, is_sm90_device
 
 _BLOCK_M = 128
 _BLOCK_N = 128
@@ -42,13 +44,47 @@ _FP8_P_SCALE = 256.0
 _LOG2E = 1.4426950408889634
 
 
+def _has_tle_raw_cuda_toolchain() -> bool:
+    """Probe the same Clang/CUDA command used to materialize TLE raw sources."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        from triton.experimental.tle.raw.cuda.runtime import (
+            _clang_flags,
+            _get_cuda_gpu_arch,
+            _resolve_clang,
+        )
+
+        result = subprocess.run(
+            [
+                _resolve_clang(),
+                "-x",
+                "cuda",
+                "--cuda-device-only",
+                _get_cuda_gpu_arch(),
+                "-emit-llvm",
+                "-S",
+                "-",
+                "-o",
+                "-",
+                *_clang_flags(),
+            ],
+            input=b'extern "C" __device__ void flag_attn_tle_probe() {}',
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (ImportError, OSError, RuntimeError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def _next_power_of_2(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
-def _normalize_sparsity_bucket(
-    block_mask: Optional[torch.Tensor], sparsity_bucket: Optional[int]
-) -> int:
+def _normalize_sparsity_bucket(block_mask: Optional[torch.Tensor], sparsity_bucket: Optional[int]) -> int:
     # Exact mask density is deliberately not read from the GPU here: doing so
     # would synchronize every production launch.  Workload generators that
     # already know the density (including our benchmark) can supply buckets
@@ -63,34 +99,15 @@ def _normalize_sparsity_bucket(
     return value
 
 
-def _configs_from_yaml(name, fallback):
-    """Load one migrated FlagGems config section when PyYAML is available."""
+def _load_autotune_configs(name, fallback):
+    """Use the shared backend config loader, with local defaults as a fallback."""
     try:
-        import yaml
-    except ImportError:
-        return fallback()
+        from ...runtime import get_tuned_config
 
-    try:
-        config_path = (
-            Path(__file__).parents[2]
-            / "runtime"
-            / "backend"
-            / "_nvidia"
-            / "tune_configs.yaml"
-        )
-        with config_path.open() as config_file:
-            document = yaml.safe_load(config_file)
-        entries = document[name]
-        return [
-            triton.Config(
-                dict(entry.get("META", {})),
-                num_warps=int(entry["num_warps"]),
-                num_stages=int(entry["num_stages"]),
-            )
-            for entry in entries
-        ]
-    except (KeyError, OSError, TypeError, ValueError, yaml.YAMLError):
+        configs = get_tuned_config(name)
+    except (ImportError, OSError, TypeError, ValueError):
         return fallback()
+    return configs or fallback()
 
 
 def _portable_autotune_configs():
@@ -105,14 +122,8 @@ def _portable_autotune_configs():
         try:
             num_stages, num_warps = map(int, forced.split(","))
         except ValueError as exc:
-            raise ValueError(
-                "HPC_BSA_TRITON_FORCE_CONFIG must be STAGES,WARPS"
-            ) from exc
-        configs = [
-            config
-            for config in configs
-            if config.num_stages == num_stages and config.num_warps == num_warps
-        ]
+            raise ValueError("HPC_BSA_TRITON_FORCE_CONFIG must be STAGES,WARPS") from exc
+        configs = [config for config in configs if config.num_stages == num_stages and config.num_warps == num_warps]
         if not configs:
             raise ValueError(f"unsupported forced portable BSA config: {forced}")
     return configs
@@ -120,6 +131,7 @@ def _portable_autotune_configs():
 
 def _hopper_autotune_configs_fallback():
     """Build Hopper/TLE configs when the optional YAML parser is unavailable."""
+
     def env_bool(name):
         value = os.environ.get(name, "0")
         if value not in ("0", "1"):
@@ -159,10 +171,7 @@ def _hopper_autotune_configs_fallback():
     if len(values) == 3 and values[0] in (0, 1):
         persistent, consumer_num_regs, pingpong = values
         if consumer_num_regs not in (192, 208, 224, 232) or pingpong not in (0, 1):
-            raise ValueError(
-                "Hopper force config must be "
-                "PERSISTENT(0/1),CONSUMER_REGS(192/208/224/232),PINGPONG(0/1)"
-            )
+            raise ValueError("Hopper force config must be PERSISTENT(0/1),CONSUMER_REGS(192/208/224/232),PINGPONG(0/1)")
         return [
             config
             for config in configs
@@ -178,8 +187,7 @@ def _hopper_autotune_configs_fallback():
             raise ValueError("legacy WORKER_REGS must be positive")
     else:
         raise ValueError(
-            f"{force_name} must be PERSISTENT,CONSUMER_REGS,PINGPONG or "
-            "the legacy STAGES,WARPS,MAXNREG[,WORKER_REGS]"
+            f"{force_name} must be PERSISTENT,CONSUMER_REGS,PINGPONG or the legacy STAGES,WARPS,MAXNREG[,WORKER_REGS]"
         )
     if pipeline_stages != 2 or num_warps != 4 or maxnreg not in (152, 160, 168):
         raise ValueError(f"unsupported legacy Hopper BSA force config: {forced}")
@@ -193,15 +201,11 @@ def _hopper_autotune_configs_fallback():
 
 
 def _autotune_configs():
-    return _configs_from_yaml(
-        "attention_blocksparse_prefill_fp8", _portable_autotune_configs
-    )
+    return _load_autotune_configs("attention_blocksparse_prefill_fp8", _portable_autotune_configs)
 
 
 def _hopper_autotune_configs():
-    return _configs_from_yaml(
-        "attention_blocksparse_prefill_fp8_hopper", _hopper_autotune_configs_fallback
-    )
+    return _load_autotune_configs("attention_blocksparse_prefill_fp8_hopper", _hopper_autotune_configs_fallback)
 
 
 @triton.autotune(
@@ -296,16 +300,10 @@ def _bsa_fp8_prefill_kernel(
     offs_d = tl.arange(0, HEAD_DIM)
     q_valid = offs_m < q_len
 
-    q_offsets = (
-        (q_begin + offs_m[:, None]) * stride_q_token
-        + q_head * stride_q_head
-        + offs_d[None, :] * stride_q_dim
-    )
+    q_offsets = (q_begin + offs_m[:, None]) * stride_q_token + q_head * stride_q_head + offs_d[None, :] * stride_q_dim
     q = tl.load(q_ptr + q_offsets, mask=q_valid[:, None], other=0.0)
 
-    qs_offsets = (
-        batch * stride_qs_batch + q_head * stride_qs_head + offs_m * stride_qs_token
-    )
+    qs_offsets = batch * stride_qs_batch + q_head * stride_qs_head + offs_m * stride_qs_token
     q_scale = tl.load(qscale_ptr + qs_offsets, mask=q_valid, other=0.0).to(tl.float32)
 
     # The CUDA implementation accumulates both softmax state and PV in FP32.
@@ -357,9 +355,7 @@ def _bsa_fp8_prefill_kernel(
             kv_valid = kv_tokens < kv_len
             logical_pages = kv_tokens // PAGE_SIZE
             tokens_in_page = kv_tokens % PAGE_SIZE
-            page_offsets = (
-                batch * stride_block_ids_batch + logical_pages * stride_block_ids_page
-            )
+            page_offsets = batch * stride_block_ids_batch + logical_pages * stride_block_ids_page
             physical_pages = tl.load(
                 block_ids_ptr + page_offsets,
                 mask=kv_valid,
@@ -442,9 +438,7 @@ def _bsa_fp8_prefill_kernel(
     # BSA tile for every valid Q tile.
     output = acc * (v_scale / FP8_P_SCALE) / l_i[:, None]
     out_offsets = (
-        (q_begin + offs_m[:, None]) * stride_out_token
-        + q_head * stride_out_head
-        + offs_d[None, :] * stride_out_dim
+        (q_begin + offs_m[:, None]) * stride_out_token + q_head * stride_out_head + offs_d[None, :] * stride_out_dim
     )
     tl.store(out_ptr + out_offsets, output.to(tl.bfloat16), mask=q_valid[:, None])
 
@@ -486,20 +480,11 @@ def _check_inputs(
             raise ValueError(f"{name} must be on {q.device}")
 
     fp8_dtype = getattr(torch, "float8_e4m3fn", None)
-    if (
-        fp8_dtype is None
-        or q.dtype != fp8_dtype
-        or kcache.dtype != fp8_dtype
-        or vcache.dtype != fp8_dtype
-    ):
+    if fp8_dtype is None or q.dtype != fp8_dtype or kcache.dtype != fp8_dtype or vcache.dtype != fp8_dtype:
         raise TypeError("q, kcache and vcache must use torch.float8_e4m3fn")
     if q.ndim != 3 or kcache.ndim != 4 or vcache.ndim != 4:
         raise ValueError("q must be rank 3 and kcache/vcache must be rank 4")
-    if (
-        q.shape[2] != _HEAD_DIM
-        or kcache.shape[3] != _HEAD_DIM
-        or vcache.shape[3] != _HEAD_DIM
-    ):
+    if q.shape[2] != _HEAD_DIM or kcache.shape[3] != _HEAD_DIM or vcache.shape[3] != _HEAD_DIM:
         raise ValueError("only head_dim=128 is supported")
     if kcache.shape[:3] != vcache.shape[:3]:
         raise ValueError("kcache and vcache page/token/head dimensions must match")
@@ -507,20 +492,12 @@ def _check_inputs(
         raise ValueError("num_head_q must be divisible by num_head_kv")
     if kcache.shape[1] not in (32, 64) or _BLOCK_N % kcache.shape[1] != 0:
         raise ValueError("paged BSA currently supports page sizes 32 and 64")
-    if (
-        cu_seqlens_q.dtype != torch.int32
-        or block_ids.dtype != torch.int32
-        or seqlens_kvcache.dtype != torch.int32
-    ):
+    if cu_seqlens_q.dtype != torch.int32 or block_ids.dtype != torch.int32 or seqlens_kvcache.dtype != torch.int32:
         raise TypeError("cu_seqlens_q, block_ids and seqlens_kvcache must be int32")
     if cu_seqlens_q.ndim != 1 or seqlens_kvcache.ndim != 1 or block_ids.ndim != 2:
         raise ValueError("invalid sequence metadata rank")
     num_batch = cu_seqlens_q.numel() - 1
-    if (
-        num_batch <= 0
-        or seqlens_kvcache.numel() != num_batch
-        or block_ids.shape[0] != num_batch
-    ):
+    if num_batch <= 0 or seqlens_kvcache.numel() != num_batch or block_ids.shape[0] != num_batch:
         raise ValueError("batch dimensions of sequence metadata do not match")
     if block_ids.shape[1] <= 0:
         raise ValueError("block_ids must contain at least one logical KV page")
@@ -535,9 +512,7 @@ def _check_inputs(
             raise TypeError("per-tensor K/V mode requires float32 scalar scales")
     else:
         if kscale.element_size() not in (1, 4):
-            raise TypeError(
-                "per-token K scale must be an FP32 tensor or its FP8 byte view"
-            )
+            raise TypeError("per-token K scale must be an FP32 tensor or its FP8 byte view")
         if vscale.numel() != kcache.shape[2]:
             raise ValueError("per-head vscale must contain num_head_kv elements")
     if max_seqlens_q <= 0:
@@ -545,22 +520,14 @@ def _check_inputs(
 
     expected_q_tiles = triton.cdiv(max_seqlens_q, _BLOCK_M)
     if block_mask is not None:
-        if (
-            block_mask.device != q.device
-            or block_mask.dtype != torch.uint8
-            or not block_mask.is_contiguous()
-        ):
-            raise ValueError(
-                "block_mask must be a contiguous uint8 tensor on the Q device"
-            )
+        if block_mask.device != q.device or block_mask.dtype != torch.uint8 or not block_mask.is_contiguous():
+            raise ValueError("block_mask must be a contiguous uint8 tensor on the Q device")
         if block_mask.ndim != 4 or block_mask.shape[:3] != (
             num_batch,
             q.shape[1],
             expected_q_tiles,
         ):
-            raise ValueError(
-                "block_mask must have shape [batch, num_head_q, ceil(max_seqlens_q/128), Kb]"
-            )
+            raise ValueError("block_mask must have shape [batch, num_head_q, ceil(max_seqlens_q/128), Kb]")
         if block_mask.shape[3] <= 0:
             raise ValueError("block_mask Kb dimension must be positive")
 
@@ -568,9 +535,71 @@ def _check_inputs(
         if output.device != q.device or output.dtype != torch.bfloat16:
             raise ValueError("output must be a bfloat16 tensor on the Q device")
         if output.shape != q.shape or not output.is_contiguous():
-            raise ValueError(
-                "output must be contiguous with shape [total_seq_q, num_head_q, 128]"
-            )
+            raise ValueError("output must be contiguous with shape [total_seq_q, num_head_q, 128]")
+
+
+@dataclass(frozen=True)
+class _LaunchContext:
+    output: torch.Tensor
+    kscale: torch.Tensor
+    num_batch: int
+    num_head_q: int
+    num_head_kv: int
+    page_size: int
+    max_kv_tokens: int
+    q_len_bucket: int
+    kv_len_bucket: int
+    sparsity_bucket: int
+    kv_layout: int
+    has_mask: bool
+    num_mask_kv_tiles: int
+    mask_arg: torch.Tensor
+    mask_strides: tuple[int, int, int, int]
+
+
+def _prepare_launch_context(
+    q: torch.Tensor,
+    kcache: torch.Tensor,
+    kscale: torch.Tensor,
+    block_ids: torch.Tensor,
+    max_seqlens_q: int,
+    quant_type: int,
+    block_mask: Optional[torch.Tensor],
+    output: Optional[torch.Tensor],
+    sparsity_bucket: Optional[int],
+) -> _LaunchContext:
+    if output is None:
+        output = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+
+    kernel_kscale = kscale
+    if quant_type == 0 and kscale.element_size() == 1:
+        if kscale.shape[-1] % 4 != 0:
+            raise ValueError("the FP8 K-scale byte view must have a last dimension divisible by 4")
+        kernel_kscale = kscale.view(torch.float32)
+
+    num_batch = block_ids.shape[0]
+    num_head_q = q.shape[1]
+    num_head_kv = kcache.shape[2]
+    page_size = kcache.shape[1]
+    max_kv_tokens = block_ids.shape[1] * page_size
+    has_mask = block_mask is not None
+    return _LaunchContext(
+        output=output,
+        kscale=kernel_kscale,
+        num_batch=num_batch,
+        num_head_q=num_head_q,
+        num_head_kv=num_head_kv,
+        page_size=page_size,
+        max_kv_tokens=max_kv_tokens,
+        q_len_bucket=_next_power_of_2(max_seqlens_q),
+        kv_len_bucket=_next_power_of_2(max_kv_tokens),
+        sparsity_bucket=_normalize_sparsity_bucket(block_mask, sparsity_bucket),
+        kv_layout=int(kcache.stride(1) < kcache.stride(2)),
+        has_mask=has_mask,
+        num_mask_kv_tiles=block_mask.shape[3] if has_mask else 0,
+        mask_arg=block_mask if has_mask else q,
+        mask_strides=block_mask.stride() if has_mask else (0, 0, 0, 0),
+    )
 
 
 def attention_with_kvcache_blocksparse_prefill_fp8_triton(
@@ -608,38 +637,32 @@ def attention_with_kvcache_blocksparse_prefill_fp8_triton(
         output,
     )
 
-    if output is None:
-        output = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-
-    # The per-token K scale may be passed as an FP8 byte view of packed FP32
-    # values.  Restore its pointer type and logical last dimension without a
-    # memory copy, matching the native CUDA entry point.
-    kscale_kernel = kscale
-    if quant_type_value == 0 and kscale.element_size() == 1:
-        if kscale.shape[-1] % 4 != 0:
-            raise ValueError(
-                "the FP8 K-scale byte view must have a last dimension divisible by 4"
-            )
-        kscale_kernel = kscale.view(torch.float32)
-
-    num_batch = cu_seqlens_q.numel() - 1
-    num_head_q = q.shape[1]
-    num_head_kv = kcache.shape[2]
-    page_size = kcache.shape[1]
-    max_kv_tokens = block_ids.shape[1] * page_size
-    q_len_bucket = _next_power_of_2(max_seqlens_q)
-    kv_len_bucket = _next_power_of_2(max_kv_tokens)
-    workload_sparsity_bucket = _normalize_sparsity_bucket(block_mask, sparsity_bucket)
-    # NHD has token stride greater than head stride; the transposed HND view
-    # has the opposite relationship.  The integer is only an autotune key.
-    kv_layout = int(kcache.stride(1) < kcache.stride(2))
-    has_mask = block_mask is not None
-    num_mask_kv_tiles = block_mask.shape[3] if has_mask else 0
-
-    # A valid pointer is still supplied for constexpr-disabled mask code so the
-    # launcher does not depend on Triton's handling of None pointer arguments.
-    mask_arg = block_mask if has_mask else q
-    mask_strides = block_mask.stride() if has_mask else (0, 0, 0, 0)
+    launch = _prepare_launch_context(
+        q,
+        kcache,
+        kscale,
+        block_ids,
+        max_seqlens_q,
+        quant_type_value,
+        block_mask,
+        output,
+        sparsity_bucket,
+    )
+    output = launch.output
+    kscale_kernel = launch.kscale
+    num_batch = launch.num_batch
+    num_head_q = launch.num_head_q
+    num_head_kv = launch.num_head_kv
+    page_size = launch.page_size
+    max_kv_tokens = launch.max_kv_tokens
+    q_len_bucket = launch.q_len_bucket
+    kv_len_bucket = launch.kv_len_bucket
+    workload_sparsity_bucket = launch.sparsity_bucket
+    kv_layout = launch.kv_layout
+    has_mask = launch.has_mask
+    num_mask_kv_tiles = launch.num_mask_kv_tiles
+    mask_arg = launch.mask_arg
+    mask_strides = launch.mask_strides
     ks_strides = kscale_kernel.stride() if quant_type_value == 0 else (0, 0, 0, 0)
 
     grid = (triton.cdiv(max_seqlens_q, _BLOCK_M), num_head_q, num_batch)
@@ -684,22 +707,24 @@ def attention_with_kvcache_blocksparse_prefill_fp8_triton(
     return output
 
 
-class HopperBSAUnavailableError(RuntimeError):
-    """Raised when the strict Hopper/TLE implementation cannot be selected."""
+def _load_tle_hopper_dependencies():
+    """Load optional TLE dependencies without using exceptions for control flow."""
+    if not (has_triton_tle(3, 6, 0) and _has_tle_raw_cuda_toolchain()):
+        return None, None
 
+    try:
+        import triton.experimental.tle.language as tle_module
+        import triton.experimental.tle.language.raw as tle_raw_module
+        from triton.experimental.tle.raw import dialect as tle_dialect
+        from triton.language.core import (
+            _unwrap_if_constexpr as unwrap_if_constexpr,
+        )
+        from triton.language.core import builtin as tle_builtin
+        from triton.tools.tensor_descriptor import TensorDescriptor as descriptor_type
+    except (ImportError, AttributeError, RuntimeError) as exc:
+        return None, exc
 
-try:
-    if not has_triton_tle(3, 6, 0):
-        raise ImportError("TLE requires Triton/FlagTree 3.6.0 or newer")
-
-    import triton.experimental.tle.language as tle
-    import triton.experimental.tle.language.raw as tle_raw
-    from triton.experimental.tle.raw import dialect
-    from triton.language.core import _unwrap_if_constexpr as triton_unwrap_if_constexpr
-    from triton.language.core import builtin as triton_builtin
-    from triton.tools.tensor_descriptor import TensorDescriptor
-
-    _required_gpu_apis = (
+    required_gpu_apis = (
         "alloc",
         "alloc_barrier",
         "alloc_barriers",
@@ -715,33 +740,44 @@ try:
         "wgmma",
         "wgmma_wait",
     )
-    _missing_gpu_apis = tuple(
-        name for name in _required_gpu_apis if not hasattr(tle.gpu, name)
-    )
-    if _missing_gpu_apis:
-        raise AttributeError(
-            "TLE GPU API is missing " + ", ".join(sorted(_missing_gpu_apis))
-        )
+    missing_gpu_apis = tuple(name for name in required_gpu_apis if not hasattr(tle_module.gpu, name))
+    if missing_gpu_apis:
+        error = AttributeError("TLE GPU API is missing " + ", ".join(sorted(missing_gpu_apis)))
+        return None, error
     if not hasattr(tl, "float8e4nv"):
-        raise AttributeError("Triton language is missing float8e4nv")
-    _HAS_TLE_HOPPER = True
-    _TLE_HOPPER_IMPORT_ERROR: Optional[BaseException] = None
-except (ImportError, AttributeError, RuntimeError) as exc:
-    # Importing FlagAttention must remain possible with stable Triton.  The
-    # public dispatcher selects the portable kernel when this capability probe
-    # fails; the explicit TLE entry point retains its strict error semantics.
+        return None, AttributeError("Triton language is missing float8e4nv")
+
+    dependencies = (
+        tle_module,
+        tle_raw_module,
+        tle_dialect,
+        unwrap_if_constexpr,
+        tle_builtin,
+        descriptor_type,
+    )
+    return dependencies, None
+
+
+_TLE_HOPPER_DEPENDENCIES, _TLE_HOPPER_IMPORT_ERROR = _load_tle_hopper_dependencies()
+_HAS_TLE_HOPPER = _TLE_HOPPER_DEPENDENCIES is not None
+if _HAS_TLE_HOPPER:
+    (
+        tle,
+        tle_raw,
+        dialect,
+        triton_unwrap_if_constexpr,
+        triton_builtin,
+        TensorDescriptor,
+    ) = _TLE_HOPPER_DEPENDENCIES
+else:
     tle = None
-    _HAS_TLE_HOPPER = False
-    _TLE_HOPPER_IMPORT_ERROR = exc
 
 
 if _HAS_TLE_HOPPER:
 
     @dialect(
         name="cuda",
-        file=Path(__file__).with_name(
-            "attention_blocksparse_prefill_fp8_hopper_vtranspose.cu"
-        ),
+        file=Path(__file__).with_name("attention_blocksparse_prefill_fp8_hopper_vtranspose.cu"),
         extern_func_name="bsa_compact_active_tiles",
         deferred=True,
     )
@@ -751,9 +787,7 @@ if _HAS_TLE_HOPPER:
 
     @dialect(
         name="cuda",
-        file=Path(__file__).with_name(
-            "attention_blocksparse_prefill_fp8_hopper_vtranspose.cu"
-        ),
+        file=Path(__file__).with_name("attention_blocksparse_prefill_fp8_hopper_vtranspose.cu"),
         extern_func_name="bsa_fp8_vtranspose_128x128",
         deferred=True,
     )
@@ -844,9 +878,7 @@ if _HAS_TLE_HOPPER:
         )
 
     @triton.jit
-    def _hopper_decode_scheduled_tile(
-        schedule_idx, total_tiles, num_q_tiles, num_head_q
-    ):
+    def _hopper_decode_scheduled_tile(schedule_idx, total_tiles, num_q_tiles, num_head_q):
         """Decode the CUDA-compatible heavy-to-light persistent schedule."""
         head_batch_count = total_tiles // num_q_tiles
         reverse_idx = total_tiles - schedule_idx - 1
@@ -965,20 +997,12 @@ if _HAS_TLE_HOPPER:
             tle.gpu.barrier_wait(list_empty, phaseIdx=q_phase)
             q_tile_end = tl.minimum(q_local_start + BLOCK_M, q_len)
             causal_kv_end = q_start_in_kv + q_tile_end
-            num_causal_kv_tiles = tl.maximum(
-                0, (causal_kv_end + BLOCK_N - 1) // BLOCK_N
-            )
+            num_causal_kv_tiles = tl.maximum(0, (causal_kv_end + BLOCK_N - 1) // BLOCK_N)
             num_causal_kv_tiles = tl.minimum(num_causal_kv_tiles, KV_TILE_BUCKET)
 
             if HAS_BLOCK_MASK:
-                mask_base_offset = (
-                    batch * stride_mask_batch
-                    + q_head * stride_mask_head
-                    + q_tile * stride_mask_qtile
-                )
-                num_tile_kv = tl.where(program_valid, num_causal_kv_tiles, 0).to(
-                    tl.int32
-                )
+                mask_base_offset = batch * stride_mask_batch + q_head * stride_mask_head + q_tile * stride_mask_qtile
+                num_tile_kv = tl.where(program_valid, num_causal_kv_tiles, 0).to(tl.int32)
                 num_tile_with_mask = tl.minimum(num_tile_kv, num_mask_kv_tiles)
                 compacted = tle_raw.call_smem(
                     _compact_active_tiles_raw,
@@ -995,9 +1019,7 @@ if _HAS_TLE_HOPPER:
                 producer_active_tiles = compacted[0]
                 producer_active_count = compacted[1]
             else:
-                num_active = tl.where(program_valid, num_causal_kv_tiles, 0).to(
-                    tl.int32
-                )
+                num_active = tl.where(program_valid, num_causal_kv_tiles, 0).to(tl.int32)
                 producer_active_tiles = active_tiles_smem
                 producer_active_count = active_count_smem
                 tl.store(
@@ -1015,9 +1037,7 @@ if _HAS_TLE_HOPPER:
             for active_idx in range(0, KV_TILE_BUCKET):
                 if active_idx < num_active:
                     if HAS_BLOCK_MASK:
-                        kv_tile = tl.load(
-                            tle.gpu.local_ptr(producer_active_tiles, (active_idx,))
-                        )
+                        kv_tile = tl.load(tle.gpu.local_ptr(producer_active_tiles, (active_idx,)))
                     else:
                         kv_tile = active_idx
 
@@ -1039,9 +1059,7 @@ if _HAS_TLE_HOPPER:
                     # The public kernel supports PAGE_SIZE 32/64, hence at most
                     # four physical pages per 128-token WGMMA tile.
                     page_table_base = (
-                        block_ids_ptr
-                        + batch * stride_block_ids_batch
-                        + first_logical_page * stride_block_ids_page
+                        block_ids_ptr + batch * stride_block_ids_batch + first_logical_page * stride_block_ids_page
                     )
                     physical_page0 = tl.load(
                         page_table_base,
@@ -1283,9 +1301,7 @@ if _HAS_TLE_HOPPER:
             for active_idx in range(0, KV_TILE_BUCKET):
                 if active_idx < num_active:
                     if HAS_BLOCK_MASK:
-                        kv_tile = tl.load(
-                            tle.gpu.local_ptr(active_tiles_smem, (active_idx,))
-                        )
+                        kv_tile = tl.load(tle.gpu.local_ptr(active_tiles_smem, (active_idx,)))
                     else:
                         kv_tile = active_idx
                     tl.device_assert(
@@ -1339,7 +1355,7 @@ if _HAS_TLE_HOPPER:
                                 _vtranspose_128x128_raw,
                                 [v_smem.slot(stage), vt_smem.slot(stage)],
                                 output_indices=[1],
-                                hint=("bsa-vtranspose-single-writer-" "ldsm-prmt-stsm"),
+                                hint=("bsa-vtranspose-single-writer-ldsm-prmt-stsm"),
                             )
                             if EARLY_V_RELEASE:
                                 # Raw has consumed every source-V byte and its
@@ -1400,16 +1416,12 @@ if _HAS_TLE_HOPPER:
                     # masked here, matching the native kernel: rows are
                     # independent and the epilogue suppresses their stores.
                     kv_tile_last = kv_tile * BLOCK_N + (BLOCK_N - 1)
-                    score_tile_needs_mask = (kv_tile_last >= kv_len) | (
-                        kv_tile_last > min_q_position
-                    )
+                    score_tile_needs_mask = (kv_tile_last >= kv_len) | (kv_tile_last > min_q_position)
                     row_has_valid_score = tl.full((BM_SPLIT,), True, tl.int1)
                     if score_tile_needs_mask:
                         kv_tokens = kv_tile * BLOCK_N + offs_n
                         q_positions = q_start_in_kv + offs_m
-                        score_invalid = (kv_tokens[None, :] >= kv_len) | (
-                            kv_tokens[None, :] > q_positions[:, None]
-                        )
+                        score_invalid = (kv_tokens[None, :] >= kv_len) | (kv_tokens[None, :] > q_positions[:, None])
                         scaled_scores = tl.where(
                             score_invalid,
                             -float("inf"),
@@ -1418,16 +1430,12 @@ if _HAS_TLE_HOPPER:
                         # A block-sparse frontier tile can begin after some
                         # rows in this Q half.  Those rows have no valid score
                         # in this tile even though the tile itself is active.
-                        row_has_valid_score = (kv_tile * BLOCK_N < kv_len) & (
-                            kv_tile * BLOCK_N <= q_positions
-                        )
+                        row_has_valid_score = (kv_tile * BLOCK_N < kv_len) & (kv_tile * BLOCK_N <= q_positions)
 
                     if FUSE_SCORE_SCALE and not K_SCALE_PER_TOKEN:
                         tile_max = tl.max(scaled_scores, axis=1) * score_scale_row
                     else:
-                        tile_max = (
-                            tl.max(scaled_scores, axis=1) * SCALE_LOG2E_OVER_SQRT_D
-                        )
+                        tile_max = tl.max(scaled_scores, axis=1) * SCALE_LOG2E_OVER_SQRT_D
                     new_max = tl.maximum(m_i, tile_max)
                     # Preserve the online-softmax state for a row whose current
                     # sparse tile contains no causal key.  Evaluating the usual
@@ -1483,7 +1491,7 @@ if _HAS_TLE_HOPPER:
                                 vt_smem.slot(consumer_idx).slot(stage),
                             ],
                             output_indices=[1],
-                            hint=("bsa-vtranspose-consumer-" "ldsm-prmt-stsm"),
+                            hint=("bsa-vtranspose-consumer-ldsm-prmt-stsm"),
                         )
                         tle.gpu.barrier_wait(consumer_sync)
 
@@ -1937,14 +1945,7 @@ if _HAS_TLE_HOPPER:
         )
 
 
-def _is_sm90_device(device: torch.device) -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability(device)
-    return major == 9 and minor == 0
-
-
-def attention_with_kvcache_blocksparse_prefill_fp8_hopper(
+def _attention_with_kvcache_blocksparse_prefill_fp8_hopper_impl(
     q: torch.Tensor,
     kcache: torch.Tensor,
     vcache: torch.Tensor,
@@ -1961,12 +1962,10 @@ def attention_with_kvcache_blocksparse_prefill_fp8_hopper(
     *,
     sparsity_bucket: Optional[int] = None,
 ) -> torch.Tensor:
-    """Run the full SM90 TLE-Struct/TMA implementation.
+    """Run the selected SM90 TLE-Struct/TMA implementation.
 
-    Fallback is intentionally owned by :func:`hpc.attention_with_kvcache_`
-    ``blocksparse_prefill_fp8_hopper``.  Calling this implementation directly
-    reports an unavailable TLE/SM90 target instead of silently changing the
-    selected kernel.
+    Capability checks are performed by the public selector before this
+    implementation is entered.
     """
     quant_type_value = _quant_type_value(quant_type)
     _check_inputs(
@@ -1985,87 +1984,31 @@ def attention_with_kvcache_blocksparse_prefill_fp8_hopper(
         output,
     )
 
-    if not _HAS_TLE_HOPPER:
-        raise HopperBSAUnavailableError(
-            "cannot launch Hopper BSA kernel: TLE-Struct Hopper APIs are "
-            f"unavailable ({_TLE_HOPPER_IMPORT_ERROR})"
-        )
-    if not _is_sm90_device(q.device):
-        raise HopperBSAUnavailableError(
-            "cannot launch Hopper BSA kernel: device is not SM90"
-        )
-
-    if output is None:
-        output = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-
-    # The native API may expose packed FP32 per-token scales through an FP8
-    # byte view.  Restore the logical pointer type without copying.
-    kscale_kernel = kscale
-    if quant_type_value == 0 and kscale.element_size() == 1:
-        if kscale.shape[-1] % 4 != 0:
-            raise ValueError(
-                "the FP8 K-scale byte view must have a last dimension " "divisible by 4"
-            )
-        kscale_kernel = kscale.view(torch.float32)
-
-    num_batch = cu_seqlens_q.numel() - 1
-    num_head_q = q.shape[1]
-    num_head_kv = kcache.shape[2]
-    page_size = kcache.shape[1]
-    max_kv_tokens = block_ids.shape[1] * page_size
-    q_len_bucket = _next_power_of_2(max_seqlens_q)
-    kv_len_bucket = _next_power_of_2(max_kv_tokens)
-    workload_sparsity_bucket = _normalize_sparsity_bucket(block_mask, sparsity_bucket)
-    kv_layout = int(kcache.stride(1) < kcache.stride(2))
-    has_mask = block_mask is not None
-    num_mask_kv_tiles = block_mask.shape[3] if has_mask else 0
-
-    if q.stride(2) != 1 or q.stride(1) != _HEAD_DIM:
-        raise ValueError("Hopper Q TMA requires contiguous [token, head, 128] storage")
-    if output.stride(2) != 1 or output.stride(1) != _HEAD_DIM:
-        raise ValueError(
-            "Hopper output TMA requires contiguous [token, head, 128] storage"
-        )
-    expected_qs_strides = (
-        num_head_q * qscale.shape[2],
-        qscale.shape[2],
-        1,
+    launch = _prepare_launch_context(
+        q,
+        kcache,
+        kscale,
+        block_ids,
+        max_seqlens_q,
+        quant_type_value,
+        block_mask,
+        output,
+        sparsity_bucket,
     )
-    if (
-        qscale.shape[2] < max_seqlens_q
-        or qscale.shape[2] % 4 != 0
-        or tuple(qscale.stride()) != expected_qs_strides
-    ):
-        raise ValueError(
-            "Hopper QScale TMA requires contiguous [batch, head, padded_q] storage"
-        )
-
-    expected_nhd = (
-        page_size * num_head_kv * _HEAD_DIM,
-        num_head_kv * _HEAD_DIM,
-        _HEAD_DIM,
-        1,
-    )
-    expected_hnd = (
-        num_head_kv * page_size * _HEAD_DIM,
-        _HEAD_DIM,
-        page_size * _HEAD_DIM,
-        1,
-    )
-    expected_cache_strides = expected_hnd if kv_layout else expected_nhd
-    if tuple(kcache.stride()) != expected_cache_strides:
-        raise ValueError(
-            "Hopper paged TMA supports contiguous NHD or HND cache views; "
-            f"got K strides {tuple(kcache.stride())}"
-        )
-    if tuple(vcache.stride()) != expected_cache_strides:
-        raise ValueError(
-            "K/V cache views must use the same contiguous NHD or HND layout"
-        )
-
-    # Supply a valid pointer even when the constexpr mask path is disabled.
-    mask_arg = block_mask if has_mask else q
-    mask_strides = block_mask.stride() if has_mask else (0, 0, 0, 0)
+    output = launch.output
+    kscale_kernel = launch.kscale
+    num_batch = launch.num_batch
+    num_head_q = launch.num_head_q
+    num_head_kv = launch.num_head_kv
+    page_size = launch.page_size
+    q_len_bucket = launch.q_len_bucket
+    kv_len_bucket = launch.kv_len_bucket
+    workload_sparsity_bucket = launch.sparsity_bucket
+    kv_layout = launch.kv_layout
+    has_mask = launch.has_mask
+    num_mask_kv_tiles = launch.num_mask_kv_tiles
+    mask_arg = launch.mask_arg
+    mask_strides = launch.mask_strides
 
     def descriptor_allocator(size: int, align: int, stream: Optional[int]):
         del align, stream
@@ -2114,26 +2057,6 @@ def attention_with_kvcache_blocksparse_prefill_fp8_hopper(
     )
     scale_groups_per_page = page_size // 32
     if quant_type_value == 0:
-        expected_ks_shape = (
-            kcache.shape[0],
-            scale_groups_per_page,
-            num_head_kv,
-            32,
-        )
-        expected_ks_strides = (
-            scale_groups_per_page * num_head_kv * 32,
-            num_head_kv * 32,
-            32,
-            1,
-        )
-        if (
-            tuple(kscale_kernel.shape) != expected_ks_shape
-            or tuple(kscale_kernel.stride()) != expected_ks_strides
-        ):
-            raise ValueError(
-                "Hopper KScale TMA requires contiguous "
-                "[page, page_size/32, head, 32] FP32 storage"
-            )
         desc_ks = TensorDescriptor(
             kscale_kernel,
             shape=[
@@ -2203,10 +2126,154 @@ def attention_with_kvcache_blocksparse_prefill_fp8_hopper(
     return output
 
 
+def _hopper_prefill_available(device: torch.device) -> bool:
+    """Return whether the Hopper implementation may be entered."""
+    return _HAS_TLE_HOPPER and device.is_cuda and is_sm90_device(device)
+
+
+def _hopper_prefill_layout_compatible(
+    q: torch.Tensor,
+    kcache: torch.Tensor,
+    vcache: torch.Tensor,
+    qscale: torch.Tensor,
+    kscale: torch.Tensor,
+    output: Optional[torch.Tensor],
+    max_seqlens_q: int,
+    quant_type: object,
+) -> bool:
+    """Check TMA layout requirements before entering the Hopper implementation."""
+    try:
+        quant_type_value = _quant_type_value(quant_type)
+        if q.ndim != 3 or q.stride(2) != 1 or q.stride(1) != _HEAD_DIM:
+            return False
+        if output is not None and (output.ndim != 3 or output.stride(2) != 1 or output.stride(1) != _HEAD_DIM):
+            return False
+        if qscale.ndim != 3:
+            return False
+        expected_qs_strides = (
+            q.shape[1] * qscale.shape[2],
+            qscale.shape[2],
+            1,
+        )
+        if qscale.shape[2] < max_seqlens_q or qscale.shape[2] % 4 != 0 or tuple(qscale.stride()) != expected_qs_strides:
+            return False
+        if kcache.ndim != 4 or vcache.ndim != 4:
+            return False
+        page_size = kcache.shape[1]
+        num_head_kv = kcache.shape[2]
+        kv_layout = int(kcache.stride(1) < kcache.stride(2))
+        expected_nhd = (
+            page_size * num_head_kv * _HEAD_DIM,
+            num_head_kv * _HEAD_DIM,
+            _HEAD_DIM,
+            1,
+        )
+        expected_hnd = (
+            num_head_kv * page_size * _HEAD_DIM,
+            _HEAD_DIM,
+            page_size * _HEAD_DIM,
+            1,
+        )
+        expected_cache_strides = expected_hnd if kv_layout else expected_nhd
+        if tuple(kcache.stride()) != expected_cache_strides or tuple(vcache.stride()) != expected_cache_strides:
+            return False
+        if quant_type_value == 0:
+            if kscale.element_size() == 1:
+                if kscale.shape[-1] % 4 != 0:
+                    return False
+                kscale = kscale.view(torch.float32)
+            scale_groups_per_page = page_size // 32
+            expected_shape = (kcache.shape[0], scale_groups_per_page, num_head_kv, 32)
+            expected_strides = (
+                scale_groups_per_page * num_head_kv * 32,
+                num_head_kv * 32,
+                32,
+                1,
+            )
+            if tuple(kscale.shape) != expected_shape or tuple(kscale.stride()) != expected_strides:
+                return False
+    except (IndexError, RuntimeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _hopper_prefill_compatible(
+    q: torch.Tensor,
+    kcache: torch.Tensor,
+    vcache: torch.Tensor,
+    qscale: torch.Tensor,
+    kscale: torch.Tensor,
+    output: Optional[torch.Tensor],
+    max_seqlens_q: int,
+    quant_type: object,
+) -> bool:
+    return _hopper_prefill_available(q.device) and _hopper_prefill_layout_compatible(
+        q,
+        kcache,
+        vcache,
+        qscale,
+        kscale,
+        output,
+        max_seqlens_q,
+        quant_type,
+    )
+
+
+def attention_with_kvcache_blocksparse_prefill_fp8_hopper(
+    q: torch.Tensor,
+    kcache: torch.Tensor,
+    vcache: torch.Tensor,
+    qscale: torch.Tensor,
+    kscale: torch.Tensor,
+    vscale: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    block_ids: torch.Tensor,
+    seqlens_kvcache: torch.Tensor,
+    max_seqlens_q: int,
+    quant_type=1,
+    block_mask: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+    *,
+    sparsity_bucket: Optional[int] = None,
+) -> torch.Tensor:
+    """Select Hopper BSA when available, otherwise use portable Triton."""
+    if not _hopper_prefill_compatible(q, kcache, vcache, qscale, kscale, output, max_seqlens_q, quant_type):
+        return attention_with_kvcache_blocksparse_prefill_fp8_triton(
+            q,
+            kcache,
+            vcache,
+            qscale,
+            kscale,
+            vscale,
+            cu_seqlens_q,
+            block_ids,
+            seqlens_kvcache,
+            max_seqlens_q,
+            quant_type,
+            block_mask,
+            output,
+            sparsity_bucket=sparsity_bucket,
+        )
+    return _attention_with_kvcache_blocksparse_prefill_fp8_hopper_impl(
+        q,
+        kcache,
+        vcache,
+        qscale,
+        kscale,
+        vscale,
+        cu_seqlens_q,
+        block_ids,
+        seqlens_kvcache,
+        max_seqlens_q,
+        quant_type,
+        block_mask,
+        output,
+        sparsity_bucket=sparsity_bucket,
+    )
+
+
 # TLE is the implementation technology; Hopper names the supported target.
-attention_with_kvcache_blocksparse_prefill_fp8_tle = (
-    attention_with_kvcache_blocksparse_prefill_fp8_hopper
-)
+attention_with_kvcache_blocksparse_prefill_fp8_tle = attention_with_kvcache_blocksparse_prefill_fp8_hopper
 
 
 def attention_with_kvcache_blocksparse_prefill_fp8(
@@ -2233,8 +2300,8 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
     Use the suffixed entry points to pin one implementation in a benchmark.
     """
     implementation = attention_with_kvcache_blocksparse_prefill_fp8_triton
-    if _HAS_TLE_HOPPER and q.is_cuda and _is_sm90_device(q.device):
-        implementation = attention_with_kvcache_blocksparse_prefill_fp8_hopper
+    if _hopper_prefill_compatible(q, kcache, vcache, qscale, kscale, output, max_seqlens_q, quant_type):
+        implementation = _attention_with_kvcache_blocksparse_prefill_fp8_hopper_impl
 
     return implementation(
         q,

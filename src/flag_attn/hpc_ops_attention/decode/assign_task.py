@@ -13,24 +13,15 @@
 # limitations under the License.
 
 """GPU task-map construction shared by dynamic attention-decode kernels."""
+
 from __future__ import annotations
+
 from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
-from . import USE_TLE, tle
+from . import tle
 
-
-if USE_TLE:
-    @triton.jit
-    def _decode_exclusive_cumsum(values):
-        return tle.cumsum(values, axis=0, reverse=False)
-else:
-    @triton.jit
-    def _decode_exclusive_cumsum(values):
-        """Import-compatible guard for TLE-only schedulers."""
-        tl.static_assert(False, "TLE scheduler called while TLE is unavailable")
-        return values, tl.sum(values, axis=0)
 
 # The no-TLE path deliberately does not emulate ``tle.cumsum``.  It uses the
 # independent scalar scheduler below, matching the proven v3 pure-Triton
@@ -58,9 +49,7 @@ def assign_pure_triton_task_map_kernel(
     b_scan = 0
     while b_scan < B:
         total_len = tl.load(SEQLENS_KV + b_scan)
-        total_tiles_per_head += (
-            total_len + _PURE_TRITON_TILE_N - 1
-        ) // _PURE_TRITON_TILE_N
+        total_tiles_per_head += (total_len + _PURE_TRITON_TILE_N - 1) // _PURE_TRITON_TILE_N
         b_scan += 1
 
     total_tiles = total_tiles_per_head * H_KV
@@ -76,9 +65,7 @@ def assign_pure_triton_task_map_kernel(
         tl.store(TASK_MAP + 3, B)
         tl.store(TASK_MAP + 4, SCHED_INTS * 4)
 
-    num_chunks_base = (
-        (MAX_TASKS * NUM_CTAS + 1) * _PURE_TRITON_TASK_STRIDE
-    )
+    num_chunks_base = (MAX_TASKS * NUM_CTAS + 1) * _PURE_TRITON_TASK_STRIDE
     hkv = 0
     batch = 0
     chunks = 0
@@ -100,9 +87,7 @@ def assign_pure_triton_task_map_kernel(
                 start_tiles = 0
                 if hkv < H_KV:
                     total_len = tl.load(SEQLENS_KV + batch)
-                    tiles_left = (
-                        total_len + _PURE_TRITON_TILE_N - 1
-                    ) // _PURE_TRITON_TILE_N
+                    tiles_left = (total_len + _PURE_TRITON_TILE_N - 1) // _PURE_TRITON_TILE_N
 
             if (tiles_left > 0) & (hkv < H_KV):
                 cur_hkv = hkv
@@ -122,10 +107,7 @@ def assign_pure_triton_task_map_kernel(
                 bucket -= add_tiles
                 chunks += 1
 
-                task_base = (
-                    (MAX_TASKS * cta + slot + 1)
-                    * _PURE_TRITON_TASK_STRIDE
-                )
+                task_base = (MAX_TASKS * cta + slot + 1) * _PURE_TRITON_TASK_STRIDE
                 tl.store(TASK_MAP + task_base + 0, cur_hkv)
                 tl.store(TASK_MAP + task_base + 1, cur_batch)
                 tl.store(TASK_MAP + task_base + 2, chunk)
@@ -134,8 +116,7 @@ def assign_pure_triton_task_map_kernel(
                 tl.store(TASK_MAP + task_base + 5, seq_len)
                 tl.store(
                     TASK_MAP + task_base + 6,
-                    (seq_len + _PURE_TRITON_TILE_N - 1)
-                    // _PURE_TRITON_TILE_N,
+                    (seq_len + _PURE_TRITON_TILE_N - 1) // _PURE_TRITON_TILE_N,
                 )
                 tl.store(
                     TASK_MAP + task_base + 7,
@@ -160,13 +141,9 @@ def assign_pure_triton_task_map_kernel(
                     start_tiles = 0
                     if hkv < H_KV:
                         total_len = tl.load(SEQLENS_KV + batch)
-                        tiles_left = (
-                            total_len + _PURE_TRITON_TILE_N - 1
-                        ) // _PURE_TRITON_TILE_N
+                        tiles_left = (total_len + _PURE_TRITON_TILE_N - 1) // _PURE_TRITON_TILE_N
 
-        terminator = (
-            (MAX_TASKS * cta + slot + 1) * _PURE_TRITON_TASK_STRIDE
-        )
+        terminator = (MAX_TASKS * cta + slot + 1) * _PURE_TRITON_TASK_STRIDE
         tl.store(TASK_MAP + terminator + 0, -1)
         tl.store(TASK_MAP + terminator + 1, -1)
         cta += 1
@@ -189,15 +166,8 @@ def pure_triton_task_map_metadata(
     )
     max_tasks = tiles_per_cta + 1
     chunk_ints = len(lengths) * num_head_kv
-    chunk_pad = (
-        (chunk_ints + PURE_TRITON_TASK_STRIDE - 1)
-        // PURE_TRITON_TASK_STRIDE
-        * PURE_TRITON_TASK_STRIDE
-    )
-    sched_ints = (
-        (max_tasks * num_ctas + 1) * PURE_TRITON_TASK_STRIDE
-        + chunk_pad
-    )
+    chunk_pad = (chunk_ints + PURE_TRITON_TASK_STRIDE - 1) // PURE_TRITON_TASK_STRIDE * PURE_TRITON_TASK_STRIDE
+    sched_ints = (max_tasks * num_ctas + 1) * PURE_TRITON_TASK_STRIDE + chunk_pad
     return max_tasks, sched_ints, sched_ints
 
 
@@ -223,6 +193,8 @@ def launch_pure_triton_task_map(
         num_warps=1,
         num_stages=1,
     )
+
+
 _scheduler_mtp1__TASK_STRIDE = 12
 _scheduler_mtp1__TASK_SLOTS = 2
 _scheduler_mtp1__TILE_N = 64
@@ -257,8 +229,20 @@ _scheduler_mtp1___META_DUMMY_TASKS_JIT = tl.constexpr(_scheduler_mtp1__META_DUMM
 _scheduler_mtp1___META_SCHED_INTS_JIT = tl.constexpr(_scheduler_mtp1__META_SCHED_INTS)
 _scheduler_mtp1___META_INVALID_LENGTHS_JIT = tl.constexpr(_scheduler_mtp1__META_INVALID_LENGTHS)
 
+
 @triton.jit
-def _scheduler_mtp1__assign_cluster_task_prefix_kernel(SEQLENS_KV, OFFSETS, META, TASK_MAP, B: tl.constexpr, H_KV: tl.constexpr, NUM_SEQ_Q: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CHUNK_TOKENS: tl.constexpr, BLOCK_SEQ: tl.constexpr):
+def _scheduler_mtp1__assign_cluster_task_prefix_kernel(
+    SEQLENS_KV,
+    OFFSETS,
+    META,
+    TASK_MAP,
+    B: tl.constexpr,
+    H_KV: tl.constexpr,
+    NUM_SEQ_Q: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr,
+    CHUNK_TOKENS: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+):
     """Compute per-sequence offsets and exact task-map metadata on device."""
     batch = tl.arange(0, BLOCK_SEQ)
     num_sequences = B * H_KV
@@ -267,10 +251,12 @@ def _scheduler_mtp1__assign_cluster_task_prefix_kernel(SEQLENS_KV, OFFSETS, META
     positive = valid & (total_len >= NUM_SEQ_Q)
     num_chunks = tl.where(positive, (total_len + CHUNK_TOKENS - 1) // CHUNK_TOKENS, 0)
     direct = (positive & (num_chunks == 1)).to(tl.int32)
-    reduction_clusters = tl.where(positive & (num_chunks > 1), (num_chunks + CLUSTER_SIZE - 1) // CLUSTER_SIZE, 0).to(tl.int32)
+    reduction_clusters = tl.where(positive & (num_chunks > 1), (num_chunks + CLUSTER_SIZE - 1) // CLUSTER_SIZE, 0).to(
+        tl.int32
+    )
     effective_chunks = tl.where(num_chunks == 1, 1, reduction_clusters)
-    reduction_offsets, reduction_per_head = _decode_exclusive_cumsum(reduction_clusters)
-    direct_offsets, direct_per_head = _decode_exclusive_cumsum(direct)
+    reduction_offsets, reduction_per_head = tle.cumsum(reduction_clusters, axis=0, reverse=False)
+    direct_offsets, direct_per_head = tle.cumsum(direct, axis=0, reverse=False)
     for hkv in range(H_KV):
         seq = hkv * B + batch
         tl.store(OFFSETS + seq * 2 + 0, hkv * reduction_per_head + reduction_offsets, mask=valid)
@@ -281,7 +267,11 @@ def _scheduler_mtp1__assign_cluster_task_prefix_kernel(SEQLENS_KV, OFFSETS, META
     num_clusters = reduction_total + direct_clusters
     physical_ctas = num_clusters * CLUSTER_SIZE
     num_chunks_base = (_scheduler_mtp1___TASK_SLOTS_JIT * physical_ctas + 1) * _scheduler_mtp1___TASK_STRIDE_JIT
-    chunk_pad_ints = (num_sequences + _scheduler_mtp1___TASK_STRIDE_JIT - 1) // _scheduler_mtp1___TASK_STRIDE_JIT * _scheduler_mtp1___TASK_STRIDE_JIT
+    chunk_pad_ints = (
+        (num_sequences + _scheduler_mtp1___TASK_STRIDE_JIT - 1)
+        // _scheduler_mtp1___TASK_STRIDE_JIT
+        * _scheduler_mtp1___TASK_STRIDE_JIT
+    )
     sched_ints = num_chunks_base + chunk_pad_ints
     fine_chunks_max = tl.max(num_chunks, axis=0)
     effective_chunks_max = tl.max(effective_chunks, axis=0)
@@ -304,8 +294,25 @@ def _scheduler_mtp1__assign_cluster_task_prefix_kernel(SEQLENS_KV, OFFSETS, META
     tl.store(TASK_MAP + 3, B)
     tl.store(TASK_MAP + 4, sched_ints * 4)
 
+
 @triton.jit
-def _scheduler_mtp1___store_task_record(TASK_MAP, cta, hkv, batch, chunk, seq_start, seq_len, seq_kvcache, num_tile_kv, num_tile_full, is_causal, mode, group_chunk, group_count, mask):
+def _scheduler_mtp1___store_task_record(
+    TASK_MAP,
+    cta,
+    hkv,
+    batch,
+    chunk,
+    seq_start,
+    seq_len,
+    seq_kvcache,
+    num_tile_kv,
+    num_tile_full,
+    is_causal,
+    mode,
+    group_chunk,
+    group_count,
+    mask,
+):
     task_base = (cta * _scheduler_mtp1___TASK_SLOTS_JIT + 1) * _scheduler_mtp1___TASK_STRIDE_JIT
     tl.store(TASK_MAP + task_base + 0, hkv, mask=mask)
     tl.store(TASK_MAP + task_base + 1, batch, mask=mask)
@@ -323,8 +330,18 @@ def _scheduler_mtp1___store_task_record(TASK_MAP, cta, hkv, batch, chunk, seq_st
     tl.store(TASK_MAP + sentinel_base + 0, -1, mask=mask)
     tl.store(TASK_MAP + sentinel_base + 1, -1, mask=mask)
 
+
 @triton.jit
-def _scheduler_mtp1__assign_cluster_task_records_compact_kernel(SEQLENS_KV, OFFSETS, META, TASK_MAP, B: tl.constexpr, NUM_SEQ_Q: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CHUNK_TOKENS: tl.constexpr):
+def _scheduler_mtp1__assign_cluster_task_records_compact_kernel(
+    SEQLENS_KV,
+    OFFSETS,
+    META,
+    TASK_MAP,
+    B: tl.constexpr,
+    NUM_SEQ_Q: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr,
+    CHUNK_TOKENS: tl.constexpr,
+):
     """Write only this sequence's real chunks and required cluster padding.
 
     A vectorized records kernel would use ``BLOCK_CHUNKS`` equal to the
@@ -355,7 +372,23 @@ def _scheduler_mtp1__assign_cluster_task_records_compact_kernel(SEQLENS_KV, OFFS
         rank = direct_index % CLUSTER_SIZE
         cta = cluster * CLUSTER_SIZE + rank
         seq_kvcache = total_len - NUM_SEQ_Q
-        _scheduler_mtp1___store_task_record(TASK_MAP, cta, hkv, batch, 0, 0, total_len, seq_kvcache, (total_len + _scheduler_mtp1___TILE_N_JIT - 1) // _scheduler_mtp1___TILE_N_JIT, seq_kvcache // _scheduler_mtp1___TILE_N_JIT, 1, _scheduler_mtp1___DIRECT_MODE_JIT, 0, 1, True)
+        _scheduler_mtp1___store_task_record(
+            TASK_MAP,
+            cta,
+            hkv,
+            batch,
+            0,
+            0,
+            total_len,
+            seq_kvcache,
+            (total_len + _scheduler_mtp1___TILE_N_JIT - 1) // _scheduler_mtp1___TILE_N_JIT,
+            seq_kvcache // _scheduler_mtp1___TILE_N_JIT,
+            1,
+            _scheduler_mtp1___DIRECT_MODE_JIT,
+            0,
+            1,
+            True,
+        )
         if direct_index == direct_total - 1:
             clear_rank = tl.arange(0, CLUSTER_SIZE)[:, None]
             clear_field = tl.arange(0, 16)[None, :]
@@ -381,13 +414,43 @@ def _scheduler_mtp1__assign_cluster_task_records_compact_kernel(SEQLENS_KV, OFFS
         is_last = real & (chunk == num_chunks - 1)
         seq_kvcache = tl.where(is_last, seq_len - NUM_SEQ_Q, seq_len)
         num_tile_kv = (seq_len + _scheduler_mtp1___TILE_N_JIT - 1) // _scheduler_mtp1___TILE_N_JIT
-        num_tile_full = tl.where(is_last, tl.maximum(seq_kvcache, 0) // _scheduler_mtp1___TILE_N_JIT, seq_len // _scheduler_mtp1___TILE_N_JIT)
+        num_tile_full = tl.where(
+            is_last, tl.maximum(seq_kvcache, 0) // _scheduler_mtp1___TILE_N_JIT, seq_len // _scheduler_mtp1___TILE_N_JIT
+        )
         mode = tl.where(real, _scheduler_mtp1___GROUP_MODE_JIT, _scheduler_mtp1___DUMMY_MODE_JIT)
-        _scheduler_mtp1___store_task_record(TASK_MAP, cta, hkv, batch, chunk, seq_start, seq_len, seq_kvcache, num_tile_kv, num_tile_full, is_last.to(tl.int32), mode, group_chunk, group_count, True)
+        _scheduler_mtp1___store_task_record(
+            TASK_MAP,
+            cta,
+            hkv,
+            batch,
+            chunk,
+            seq_start,
+            seq_len,
+            seq_kvcache,
+            num_tile_kv,
+            num_tile_full,
+            is_last.to(tl.int32),
+            mode,
+            group_chunk,
+            group_count,
+            True,
+        )
         chunk += 1
 
+
 @triton.jit
-def _scheduler_mtp1__refresh_cluster_task_tail_kernel(SEQLENS_KV, OFFSETS, META, TASK_MAP, B: tl.constexpr, H_KV: tl.constexpr, NUM_SEQ_Q: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CHUNK_TOKENS: tl.constexpr, BLOCK_SEQ: tl.constexpr):
+def _scheduler_mtp1__refresh_cluster_task_tail_kernel(
+    SEQLENS_KV,
+    OFFSETS,
+    META,
+    TASK_MAP,
+    B: tl.constexpr,
+    H_KV: tl.constexpr,
+    NUM_SEQ_Q: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr,
+    CHUNK_TOKENS: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+):
     """Refresh length-dependent tail fields while cluster topology is stable."""
     seq_id = tl.arange(0, BLOCK_SEQ)
     valid = seq_id < B * H_KV
@@ -414,9 +477,14 @@ def _scheduler_mtp1__refresh_cluster_task_tail_kernel(SEQLENS_KV, OFFSETS, META,
     tl.store(TASK_MAP + task_base + 3, seq_start, mask=valid)
     tl.store(TASK_MAP + task_base + 4, seq_len, mask=valid)
     tl.store(TASK_MAP + task_base + 5, seq_kvcache, mask=valid)
-    tl.store(TASK_MAP + task_base + 6, (seq_len + _scheduler_mtp1___TILE_N_JIT - 1) // _scheduler_mtp1___TILE_N_JIT, mask=valid)
+    tl.store(
+        TASK_MAP + task_base + 6,
+        (seq_len + _scheduler_mtp1___TILE_N_JIT - 1) // _scheduler_mtp1___TILE_N_JIT,
+        mask=valid,
+    )
     tl.store(TASK_MAP + task_base + 7, tl.maximum(seq_kvcache, 0) // _scheduler_mtp1___TILE_N_JIT, mask=valid)
     tl.store(TASK_MAP + task_base + 8, 1, mask=valid)
+
 
 @dataclass
 class _scheduler_mtp1__DecodeTaskSchedule:
@@ -436,65 +504,131 @@ class _scheduler_mtp1__DecodeTaskSchedule:
     partial_slots: int = 0
     stats: dict | None = None
 
-def _scheduler_mtp1___capacity(*, num_sequences: int, max_seq_kv: int, cluster_size: int, chunk_tokens: int) -> tuple[int, int, int]:
+
+def _scheduler_mtp1___capacity(
+    *, num_sequences: int, max_seq_kv: int, cluster_size: int, chunk_tokens: int
+) -> tuple[int, int, int]:
     max_chunks = max(1, (max_seq_kv + chunk_tokens - 1) // chunk_tokens)
     max_groups = (max_chunks + cluster_size - 1) // cluster_size
     max_reduction_clusters = num_sequences * max_groups if max_chunks > 1 else 0
     max_direct_clusters = (num_sequences + cluster_size - 1) // cluster_size
     capacity_clusters = max_reduction_clusters + max_direct_clusters
     capacity_ctas = max(capacity_clusters * cluster_size, cluster_size)
-    chunk_pad_ints = (num_sequences + _scheduler_mtp1__TASK_STRIDE - 1) // _scheduler_mtp1__TASK_STRIDE * _scheduler_mtp1__TASK_STRIDE
+    chunk_pad_ints = (
+        (num_sequences + _scheduler_mtp1__TASK_STRIDE - 1)
+        // _scheduler_mtp1__TASK_STRIDE
+        * _scheduler_mtp1__TASK_STRIDE
+    )
     capacity_ints = (_scheduler_mtp1__TASK_SLOTS * capacity_ctas + 1) * _scheduler_mtp1__TASK_STRIDE + chunk_pad_ints
     block_chunks = triton.next_power_of_2(max(max_chunks, cluster_size))
     return (capacity_clusters, capacity_ints, block_chunks)
 
-def _scheduler_mtp1__allocate_cluster_task_map(kv_lens: torch.Tensor, *, num_head_kv: int, max_seq_kv: int, cluster_size: int, chunk_tokens: int) -> _scheduler_mtp1__DecodeTaskSchedule:
+
+def _scheduler_mtp1__allocate_cluster_task_map(
+    kv_lens: torch.Tensor, *, num_head_kv: int, max_seq_kv: int, cluster_size: int, chunk_tokens: int
+) -> _scheduler_mtp1__DecodeTaskSchedule:
     """Allocate capacity and populate a cluster task map entirely on GPU."""
     if not kv_lens.is_cuda:
-        raise ValueError('cluster GPU assignment requires CUDA kv_lens')
+        raise ValueError("cluster GPU assignment requires CUDA kv_lens")
     if cluster_size not in (2, 4, 8):
-        raise ValueError(f'cluster_size must be 2, 4, or 8, got {cluster_size}')
+        raise ValueError(f"cluster_size must be 2, 4, or 8, got {cluster_size}")
     if chunk_tokens < _scheduler_mtp1__TILE_N or chunk_tokens % _scheduler_mtp1__TILE_N:
-        raise ValueError(f'chunk_tokens must be a positive multiple of {_scheduler_mtp1__TILE_N}, got {chunk_tokens}')
+        raise ValueError(f"chunk_tokens must be a positive multiple of {_scheduler_mtp1__TILE_N}, got {chunk_tokens}")
     num_sequences = kv_lens.numel() * num_head_kv
     block_seq = triton.next_power_of_2(kv_lens.numel())
     if block_seq > 1024:
-        raise ValueError(f'cluster GPU assign currently supports B <= 1024, got {kv_lens.numel()}')
-    capacity_clusters, capacity_ints, block_chunks = _scheduler_mtp1___capacity(num_sequences=num_sequences, max_seq_kv=max_seq_kv, cluster_size=cluster_size, chunk_tokens=chunk_tokens)
+        raise ValueError(f"cluster GPU assign currently supports B <= 1024, got {kv_lens.numel()}")
+    capacity_clusters, capacity_ints, block_chunks = _scheduler_mtp1___capacity(
+        num_sequences=num_sequences, max_seq_kv=max_seq_kv, cluster_size=cluster_size, chunk_tokens=chunk_tokens
+    )
     task_map = torch.full((capacity_ints,), -1, dtype=torch.int32, device=kv_lens.device)
-    assignment = _scheduler_mtp1__DecodeTaskSchedule(task_workspace=task_map.view(torch.int8), task_map=task_map, offsets=torch.empty((num_sequences, 2), dtype=torch.int32, device=kv_lens.device), meta=torch.empty((_scheduler_mtp1__META_SIZE,), dtype=torch.int32, device=kv_lens.device), cluster_size=cluster_size, chunk_tokens=chunk_tokens, block_seq=block_seq, block_chunks=block_chunks, capacity_clusters=capacity_clusters, capacity_ints=capacity_ints)
-    _scheduler_mtp1__launch_cluster_task_map_assign(kv_lens, assignment, num_head_kv=num_head_kv, refresh_host_metadata=True)
+    assignment = _scheduler_mtp1__DecodeTaskSchedule(
+        task_workspace=task_map.view(torch.int8),
+        task_map=task_map,
+        offsets=torch.empty((num_sequences, 2), dtype=torch.int32, device=kv_lens.device),
+        meta=torch.empty((_scheduler_mtp1__META_SIZE,), dtype=torch.int32, device=kv_lens.device),
+        cluster_size=cluster_size,
+        chunk_tokens=chunk_tokens,
+        block_seq=block_seq,
+        block_chunks=block_chunks,
+        capacity_clusters=capacity_clusters,
+        capacity_ints=capacity_ints,
+    )
+    _scheduler_mtp1__launch_cluster_task_map_assign(
+        kv_lens, assignment, num_head_kv=num_head_kv, refresh_host_metadata=True
+    )
     return assignment
 
-def _scheduler_mtp1__launch_cluster_task_map_assign(kv_lens: torch.Tensor, assignment: _scheduler_mtp1__DecodeTaskSchedule, *, num_head_kv: int, refresh_host_metadata: bool) -> None:
+
+def _scheduler_mtp1__launch_cluster_task_map_assign(
+    kv_lens: torch.Tensor,
+    assignment: _scheduler_mtp1__DecodeTaskSchedule,
+    *,
+    num_head_kv: int,
+    refresh_host_metadata: bool,
+) -> None:
     """Regenerate an allocated map; fixed-topology calls need no host sync."""
     batch = kv_lens.numel()
     num_sequences = batch * num_head_kv
     if assignment.offsets.numel() != num_sequences * 2:
-        raise ValueError('kv_lens/H_KV shape differs from the allocated cluster task map')
+        raise ValueError("kv_lens/H_KV shape differs from the allocated cluster task map")
     prefix_warps = max(1, min(32, assignment.block_seq // 32))
-    _scheduler_mtp1__assign_cluster_task_prefix_kernel[1,](kv_lens, assignment.offsets, assignment.meta, assignment.task_map, B=batch, H_KV=num_head_kv, NUM_SEQ_Q=1, CLUSTER_SIZE=assignment.cluster_size, CHUNK_TOKENS=assignment.chunk_tokens, BLOCK_SEQ=assignment.block_seq, num_warps=prefix_warps, num_stages=1)
+    _scheduler_mtp1__assign_cluster_task_prefix_kernel[1,](
+        kv_lens,
+        assignment.offsets,
+        assignment.meta,
+        assignment.task_map,
+        B=batch,
+        H_KV=num_head_kv,
+        NUM_SEQ_Q=1,
+        CLUSTER_SIZE=assignment.cluster_size,
+        CHUNK_TOKENS=assignment.chunk_tokens,
+        BLOCK_SEQ=assignment.block_seq,
+        num_warps=prefix_warps,
+        num_stages=1,
+    )
     record_warps = 1
     records_kernel = _scheduler_mtp1__assign_cluster_task_records_compact_kernel
-    record_args = {'B': batch, 'NUM_SEQ_Q': 1, 'CLUSTER_SIZE': assignment.cluster_size, 'CHUNK_TOKENS': assignment.chunk_tokens, 'num_warps': record_warps, 'num_stages': 1}
+    record_args = {
+        "B": batch,
+        "NUM_SEQ_Q": 1,
+        "CLUSTER_SIZE": assignment.cluster_size,
+        "CHUNK_TOKENS": assignment.chunk_tokens,
+        "num_warps": record_warps,
+        "num_stages": 1,
+    }
     records_kernel[num_sequences,](kv_lens, assignment.offsets, assignment.meta, assignment.task_map, **record_args)
     if not refresh_host_metadata:
         return
     values = assignment.meta.detach().cpu().to(torch.int64).tolist()
     invalid_lengths = values[_scheduler_mtp1__META_INVALID_LENGTHS]
     if invalid_lengths:
-        raise ValueError(f'MTP=1 cluster GPU assign found {invalid_lengths} total KV lengths below 1')
+        raise ValueError(f"MTP=1 cluster GPU assign found {invalid_lengths} total KV lengths below 1")
     num_clusters = values[_scheduler_mtp1__META_NUM_CLUSTERS]
     sched_ints = values[_scheduler_mtp1__META_SCHED_INTS]
     if num_clusters > assignment.capacity_clusters or sched_ints > assignment.capacity_ints:
-        raise RuntimeError(f'cluster task-map capacity was underestimated: clusters={num_clusters}/{assignment.capacity_clusters}, ints={sched_ints}/{assignment.capacity_ints}')
+        raise RuntimeError(
+            f"cluster task-map capacity was underestimated: clusters={num_clusters}/{assignment.capacity_clusters}, ints={sched_ints}/{assignment.capacity_ints}"
+        )
     assignment.num_clusters = num_clusters
     assignment.physical_ctas = values[_scheduler_mtp1__META_PHYSICAL_CTAS]
     assignment.sched_ints = sched_ints
     assignment.partial_slots = max(values[_scheduler_mtp1__META_EFFECTIVE_CHUNKS_MAX], 1)
-    assignment.stats = {'cluster_size': assignment.cluster_size, 'num_clusters': num_clusters, 'physical_ctas': values[_scheduler_mtp1__META_PHYSICAL_CTAS], 'compute_tasks': values[_scheduler_mtp1__META_COMPUTE_TASKS], 'fine_chunks_max': values[_scheduler_mtp1__META_FINE_CHUNKS_MAX], 'effective_chunks_max': values[_scheduler_mtp1__META_EFFECTIVE_CHUNKS_MAX], 'direct_tasks': values[_scheduler_mtp1__META_DIRECT_TASKS], 'dummy_tasks': values[_scheduler_mtp1__META_DUMMY_TASKS]}
+    assignment.stats = {
+        "cluster_size": assignment.cluster_size,
+        "num_clusters": num_clusters,
+        "physical_ctas": values[_scheduler_mtp1__META_PHYSICAL_CTAS],
+        "compute_tasks": values[_scheduler_mtp1__META_COMPUTE_TASKS],
+        "fine_chunks_max": values[_scheduler_mtp1__META_FINE_CHUNKS_MAX],
+        "effective_chunks_max": values[_scheduler_mtp1__META_EFFECTIVE_CHUNKS_MAX],
+        "direct_tasks": values[_scheduler_mtp1__META_DIRECT_TASKS],
+        "dummy_tasks": values[_scheduler_mtp1__META_DUMMY_TASKS],
+    }
 
-def _scheduler_mtp1__launch_cluster_task_tail_refresh(kv_lens: torch.Tensor, assignment: _scheduler_mtp1__DecodeTaskSchedule, *, num_head_kv: int) -> None:
+
+def _scheduler_mtp1__launch_cluster_task_tail_refresh(
+    kv_lens: torch.Tensor, assignment: _scheduler_mtp1__DecodeTaskSchedule, *, num_head_kv: int
+) -> None:
     """Update tail records without rebuilding unchanged 512-token topology.
 
     The caller must run ``launch_cluster_task_map_assign`` with refreshed host
@@ -503,10 +637,25 @@ def _scheduler_mtp1__launch_cluster_task_tail_refresh(kv_lens: torch.Tensor, ass
     batch = kv_lens.numel()
     num_sequences = batch * num_head_kv
     if assignment.offsets.numel() != num_sequences * 2:
-        raise ValueError('kv_lens/H_KV shape differs from the allocated cluster task map')
+        raise ValueError("kv_lens/H_KV shape differs from the allocated cluster task map")
     block_seq = triton.next_power_of_2(num_sequences)
     num_warps = max(1, min(8, block_seq // 32))
-    _scheduler_mtp1__refresh_cluster_task_tail_kernel[1,](kv_lens, assignment.offsets, assignment.meta, assignment.task_map, B=batch, H_KV=num_head_kv, NUM_SEQ_Q=1, CLUSTER_SIZE=assignment.cluster_size, CHUNK_TOKENS=assignment.chunk_tokens, BLOCK_SEQ=block_seq, num_warps=num_warps, num_stages=1)
+    _scheduler_mtp1__refresh_cluster_task_tail_kernel[1,](
+        kv_lens,
+        assignment.offsets,
+        assignment.meta,
+        assignment.task_map,
+        B=batch,
+        H_KV=num_head_kv,
+        NUM_SEQ_Q=1,
+        CLUSTER_SIZE=assignment.cluster_size,
+        CHUNK_TOKENS=assignment.chunk_tokens,
+        BLOCK_SEQ=block_seq,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+
+
 _scheduler_mtp24__TASK_STRIDE = 12
 _scheduler_mtp24__TASK_SLOTS = 2
 _scheduler_mtp24__TILE_N = 64
@@ -547,8 +696,24 @@ _scheduler_mtp24___META_INVALID_LENGTHS_JIT = tl.constexpr(_scheduler_mtp24__MET
 _scheduler_mtp24___META_LONG_REDUCTION_CLUSTERS_JIT = tl.constexpr(_scheduler_mtp24__META_LONG_REDUCTION_CLUSTERS)
 _scheduler_mtp24___META_SUBGROUP_TASKS_JIT = tl.constexpr(_scheduler_mtp24__META_SUBGROUP_TASKS)
 
+
 @triton.jit
-def _scheduler_mtp24__assign_cluster_task_prefix_kernel(SEQLENS_KV, OFFSETS, META, TASK_MAP, B: tl.constexpr, H_KV: tl.constexpr, NUM_SEQ_Q: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CHUNK_TOKENS: tl.constexpr, DIRECT_THRESHOLD: tl.constexpr, SHORT_THRESHOLD: tl.constexpr, SHORT_CHUNK_TOKENS: tl.constexpr, SUBGROUP2_THRESHOLD: tl.constexpr, BLOCK_SEQ: tl.constexpr):
+def _scheduler_mtp24__assign_cluster_task_prefix_kernel(
+    SEQLENS_KV,
+    OFFSETS,
+    META,
+    TASK_MAP,
+    B: tl.constexpr,
+    H_KV: tl.constexpr,
+    NUM_SEQ_Q: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr,
+    CHUNK_TOKENS: tl.constexpr,
+    DIRECT_THRESHOLD: tl.constexpr,
+    SHORT_THRESHOLD: tl.constexpr,
+    SHORT_CHUNK_TOKENS: tl.constexpr,
+    SUBGROUP2_THRESHOLD: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+):
     """Compute per-sequence offsets and exact task-map metadata on device."""
     batch = tl.arange(0, BLOCK_SEQ)
     num_sequences = B * H_KV
@@ -560,12 +725,14 @@ def _scheduler_mtp24__assign_cluster_task_prefix_kernel(SEQLENS_KV, OFFSETS, MET
     subgroup_mask = positive & (CLUSTER_SIZE == 4) & (SUBGROUP2_THRESHOLD > 0) & (total_len <= SUBGROUP2_THRESHOLD)
     direct_mask = positive & ~subgroup_mask & ((num_chunks == 1) | (total_len <= DIRECT_THRESHOLD))
     direct = direct_mask.to(tl.int32)
-    long_reduction_clusters = tl.where(positive & ~direct_mask & ~subgroup_mask, (num_chunks + CLUSTER_SIZE - 1) // CLUSTER_SIZE, 0).to(tl.int32)
+    long_reduction_clusters = tl.where(
+        positive & ~direct_mask & ~subgroup_mask, (num_chunks + CLUSTER_SIZE - 1) // CLUSTER_SIZE, 0
+    ).to(tl.int32)
     subgroup = subgroup_mask.to(tl.int32)
     effective_chunks = tl.where(direct_mask | subgroup_mask, 1, long_reduction_clusters)
-    reduction_offsets, reduction_per_head = _decode_exclusive_cumsum(long_reduction_clusters)
-    subgroup_offsets, subgroup_per_head = _decode_exclusive_cumsum(subgroup)
-    direct_offsets, direct_per_head = _decode_exclusive_cumsum(direct)
+    reduction_offsets, reduction_per_head = tle.cumsum(long_reduction_clusters, axis=0, reverse=False)
+    subgroup_offsets, subgroup_per_head = tle.cumsum(subgroup, axis=0, reverse=False)
+    direct_offsets, direct_per_head = tle.cumsum(direct, axis=0, reverse=False)
     for hkv in range(H_KV):
         seq = hkv * B + batch
         long_offset = hkv * reduction_per_head + reduction_offsets
@@ -581,12 +748,22 @@ def _scheduler_mtp24__assign_cluster_task_prefix_kernel(SEQLENS_KV, OFFSETS, MET
     num_clusters = reduction_total + direct_clusters
     physical_ctas = num_clusters * CLUSTER_SIZE
     num_chunks_base = (_scheduler_mtp24___TASK_SLOTS_JIT * physical_ctas + 1) * _scheduler_mtp24___TASK_STRIDE_JIT
-    chunk_pad_ints = (num_sequences + _scheduler_mtp24___TASK_STRIDE_JIT - 1) // _scheduler_mtp24___TASK_STRIDE_JIT * _scheduler_mtp24___TASK_STRIDE_JIT
+    chunk_pad_ints = (
+        (num_sequences + _scheduler_mtp24___TASK_STRIDE_JIT - 1)
+        // _scheduler_mtp24___TASK_STRIDE_JIT
+        * _scheduler_mtp24___TASK_STRIDE_JIT
+    )
     sched_ints = num_chunks_base + chunk_pad_ints
     fine_chunks_max = tl.max(num_chunks, axis=0)
     effective_chunks_max = tl.max(effective_chunks, axis=0)
     compute_tasks = tl.sum(tl.where(direct_mask, 1, tl.where(subgroup_mask, 2, num_chunks)), axis=0) * H_KV
-    long_dummy = tl.sum(tl.where(positive & ~direct_mask & ~subgroup_mask, long_reduction_clusters * CLUSTER_SIZE - num_chunks, 0), axis=0) * H_KV
+    long_dummy = (
+        tl.sum(
+            tl.where(positive & ~direct_mask & ~subgroup_mask, long_reduction_clusters * CLUSTER_SIZE - num_chunks, 0),
+            axis=0,
+        )
+        * H_KV
+    )
     dummy_tasks = long_dummy + (subgroup_total & 1) * 2
     invalid_lengths = tl.sum((valid & (total_len < NUM_SEQ_Q)).to(tl.int32), axis=0) * H_KV
     tl.store(META + _scheduler_mtp24___META_NUM_CLUSTERS_JIT, num_clusters)
@@ -607,8 +784,25 @@ def _scheduler_mtp24__assign_cluster_task_prefix_kernel(SEQLENS_KV, OFFSETS, MET
     tl.store(TASK_MAP + 3, B)
     tl.store(TASK_MAP + 4, sched_ints * 4)
 
+
 @triton.jit
-def _scheduler_mtp24___store_task_record(TASK_MAP, cta, hkv, batch, chunk, seq_start, seq_len, seq_kvcache, num_tile_kv, num_tile_full, is_causal, mode, group_chunk, group_count, mask):
+def _scheduler_mtp24___store_task_record(
+    TASK_MAP,
+    cta,
+    hkv,
+    batch,
+    chunk,
+    seq_start,
+    seq_len,
+    seq_kvcache,
+    num_tile_kv,
+    num_tile_full,
+    is_causal,
+    mode,
+    group_chunk,
+    group_count,
+    mask,
+):
     task_base = (cta * _scheduler_mtp24___TASK_SLOTS_JIT + 1) * _scheduler_mtp24___TASK_STRIDE_JIT
     tl.store(TASK_MAP + task_base + 0, hkv, mask=mask)
     tl.store(TASK_MAP + task_base + 1, batch, mask=mask)
@@ -626,8 +820,22 @@ def _scheduler_mtp24___store_task_record(TASK_MAP, cta, hkv, batch, chunk, seq_s
     tl.store(TASK_MAP + sentinel_base + 0, -1, mask=mask)
     tl.store(TASK_MAP + sentinel_base + 1, -1, mask=mask)
 
+
 @triton.jit
-def _scheduler_mtp24__assign_cluster_task_records_compact_kernel(SEQLENS_KV, OFFSETS, META, TASK_MAP, B: tl.constexpr, NUM_SEQ_Q: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CHUNK_TOKENS: tl.constexpr, DIRECT_THRESHOLD: tl.constexpr, SHORT_THRESHOLD: tl.constexpr, SHORT_CHUNK_TOKENS: tl.constexpr, SUBGROUP2_THRESHOLD: tl.constexpr):
+def _scheduler_mtp24__assign_cluster_task_records_compact_kernel(
+    SEQLENS_KV,
+    OFFSETS,
+    META,
+    TASK_MAP,
+    B: tl.constexpr,
+    NUM_SEQ_Q: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr,
+    CHUNK_TOKENS: tl.constexpr,
+    DIRECT_THRESHOLD: tl.constexpr,
+    SHORT_THRESHOLD: tl.constexpr,
+    SHORT_CHUNK_TOKENS: tl.constexpr,
+    SUBGROUP2_THRESHOLD: tl.constexpr,
+):
     """Write only this sequence's real chunks and required cluster padding.
 
     A vectorized records kernel would use ``BLOCK_CHUNKS`` equal to the
@@ -668,18 +876,98 @@ def _scheduler_mtp24__assign_cluster_task_records_compact_kernel(SEQLENS_KV, OFF
         first_len = tl.minimum(first_tiles * _scheduler_mtp24___TILE_N_JIT, total_len)
         second_len = total_len - first_len
         seq_kvcache = total_len - NUM_SEQ_Q
-        _scheduler_mtp24___store_task_record(TASK_MAP, cluster * CLUSTER_SIZE + first_rank, hkv, batch, 0, 0, first_len, first_len, first_tiles, first_tiles, 0, _scheduler_mtp24___SUBGROUP2_MODE_JIT, 0, 1, True)
-        _scheduler_mtp24___store_task_record(TASK_MAP, cluster * CLUSTER_SIZE + first_rank + 1, hkv, batch, 1, first_len, second_len, second_len - NUM_SEQ_Q, (second_len + _scheduler_mtp24___TILE_N_JIT - 1) // _scheduler_mtp24___TILE_N_JIT, tl.maximum(second_len - NUM_SEQ_Q, 0) // _scheduler_mtp24___TILE_N_JIT, 1, _scheduler_mtp24___SUBGROUP2_MODE_JIT, 0, 1, True)
+        _scheduler_mtp24___store_task_record(
+            TASK_MAP,
+            cluster * CLUSTER_SIZE + first_rank,
+            hkv,
+            batch,
+            0,
+            0,
+            first_len,
+            first_len,
+            first_tiles,
+            first_tiles,
+            0,
+            _scheduler_mtp24___SUBGROUP2_MODE_JIT,
+            0,
+            1,
+            True,
+        )
+        _scheduler_mtp24___store_task_record(
+            TASK_MAP,
+            cluster * CLUSTER_SIZE + first_rank + 1,
+            hkv,
+            batch,
+            1,
+            first_len,
+            second_len,
+            second_len - NUM_SEQ_Q,
+            (second_len + _scheduler_mtp24___TILE_N_JIT - 1) // _scheduler_mtp24___TILE_N_JIT,
+            tl.maximum(second_len - NUM_SEQ_Q, 0) // _scheduler_mtp24___TILE_N_JIT,
+            1,
+            _scheduler_mtp24___SUBGROUP2_MODE_JIT,
+            0,
+            1,
+            True,
+        )
         if subgroup_index == subgroup_total - 1 and subgroup_slot == 0:
-            _scheduler_mtp24___store_task_record(TASK_MAP, cluster * CLUSTER_SIZE + 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, _scheduler_mtp24___SUBGROUP2_MODE_JIT, 0, 1, True)
-            _scheduler_mtp24___store_task_record(TASK_MAP, cluster * CLUSTER_SIZE + 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, _scheduler_mtp24___SUBGROUP2_MODE_JIT, 0, 1, True)
+            _scheduler_mtp24___store_task_record(
+                TASK_MAP,
+                cluster * CLUSTER_SIZE + 2,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                _scheduler_mtp24___SUBGROUP2_MODE_JIT,
+                0,
+                1,
+                True,
+            )
+            _scheduler_mtp24___store_task_record(
+                TASK_MAP,
+                cluster * CLUSTER_SIZE + 3,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                _scheduler_mtp24___SUBGROUP2_MODE_JIT,
+                0,
+                1,
+                True,
+            )
         return
     if direct:
         cluster = reduction_total + direct_index // CLUSTER_SIZE
         rank = direct_index % CLUSTER_SIZE
         cta = cluster * CLUSTER_SIZE + rank
         seq_kvcache = total_len - NUM_SEQ_Q
-        _scheduler_mtp24___store_task_record(TASK_MAP, cta, hkv, batch, 0, 0, total_len, seq_kvcache, (total_len + _scheduler_mtp24___TILE_N_JIT - 1) // _scheduler_mtp24___TILE_N_JIT, seq_kvcache // _scheduler_mtp24___TILE_N_JIT, 1, _scheduler_mtp24___DIRECT_MODE_JIT, 0, 1, True)
+        _scheduler_mtp24___store_task_record(
+            TASK_MAP,
+            cta,
+            hkv,
+            batch,
+            0,
+            0,
+            total_len,
+            seq_kvcache,
+            (total_len + _scheduler_mtp24___TILE_N_JIT - 1) // _scheduler_mtp24___TILE_N_JIT,
+            seq_kvcache // _scheduler_mtp24___TILE_N_JIT,
+            1,
+            _scheduler_mtp24___DIRECT_MODE_JIT,
+            0,
+            1,
+            True,
+        )
         if direct_index == direct_total - 1:
             clear_rank = tl.arange(0, CLUSTER_SIZE)[:, None]
             clear_field = tl.arange(0, 16)[None, :]
@@ -687,7 +975,9 @@ def _scheduler_mtp24__assign_cluster_task_records_compact_kernel(SEQLENS_KV, OFF
             clear_task_base = (clear_cta * _scheduler_mtp24___TASK_SLOTS_JIT + 1) * _scheduler_mtp24___TASK_STRIDE_JIT
             clear_mask = (clear_rank > rank) & (clear_field < _scheduler_mtp24___TASK_STRIDE_JIT)
             tl.store(TASK_MAP + clear_task_base + clear_field, -1, mask=clear_mask)
-            clear_sentinel_base = (clear_cta * _scheduler_mtp24___TASK_SLOTS_JIT + 2) * _scheduler_mtp24___TASK_STRIDE_JIT
+            clear_sentinel_base = (
+                clear_cta * _scheduler_mtp24___TASK_SLOTS_JIT + 2
+            ) * _scheduler_mtp24___TASK_STRIDE_JIT
             sentinel_mask = (clear_rank > rank) & (clear_field < 2)
             tl.store(TASK_MAP + clear_sentinel_base + clear_field, -1, mask=sentinel_mask)
         return
@@ -705,13 +995,48 @@ def _scheduler_mtp24__assign_cluster_task_records_compact_kernel(SEQLENS_KV, OFF
         is_last = real & (chunk == num_chunks - 1)
         seq_kvcache = tl.where(is_last, seq_len - NUM_SEQ_Q, seq_len)
         num_tile_kv = (seq_len + _scheduler_mtp24___TILE_N_JIT - 1) // _scheduler_mtp24___TILE_N_JIT
-        num_tile_full = tl.where(is_last, tl.maximum(seq_kvcache, 0) // _scheduler_mtp24___TILE_N_JIT, seq_len // _scheduler_mtp24___TILE_N_JIT)
+        num_tile_full = tl.where(
+            is_last,
+            tl.maximum(seq_kvcache, 0) // _scheduler_mtp24___TILE_N_JIT,
+            seq_len // _scheduler_mtp24___TILE_N_JIT,
+        )
         mode = tl.where(real, _scheduler_mtp24___GROUP_MODE_JIT, _scheduler_mtp24___DUMMY_MODE_JIT)
-        _scheduler_mtp24___store_task_record(TASK_MAP, cta, hkv, batch, chunk, seq_start, seq_len, seq_kvcache, num_tile_kv, num_tile_full, is_last.to(tl.int32), mode, group_chunk, group_count, True)
+        _scheduler_mtp24___store_task_record(
+            TASK_MAP,
+            cta,
+            hkv,
+            batch,
+            chunk,
+            seq_start,
+            seq_len,
+            seq_kvcache,
+            num_tile_kv,
+            num_tile_full,
+            is_last.to(tl.int32),
+            mode,
+            group_chunk,
+            group_count,
+            True,
+        )
         chunk += 1
 
+
 @triton.jit
-def _scheduler_mtp24__refresh_cluster_task_tail_kernel(SEQLENS_KV, OFFSETS, META, TASK_MAP, B: tl.constexpr, H_KV: tl.constexpr, NUM_SEQ_Q: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CHUNK_TOKENS: tl.constexpr, DIRECT_THRESHOLD: tl.constexpr, SHORT_THRESHOLD: tl.constexpr, SHORT_CHUNK_TOKENS: tl.constexpr, BLOCK_SEQ: tl.constexpr):
+def _scheduler_mtp24__refresh_cluster_task_tail_kernel(
+    SEQLENS_KV,
+    OFFSETS,
+    META,
+    TASK_MAP,
+    B: tl.constexpr,
+    H_KV: tl.constexpr,
+    NUM_SEQ_Q: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr,
+    CHUNK_TOKENS: tl.constexpr,
+    DIRECT_THRESHOLD: tl.constexpr,
+    SHORT_THRESHOLD: tl.constexpr,
+    SHORT_CHUNK_TOKENS: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+):
     """Refresh length-dependent tail fields while cluster topology is stable."""
     seq_id = tl.arange(0, BLOCK_SEQ)
     valid = seq_id < B * H_KV
@@ -739,9 +1064,14 @@ def _scheduler_mtp24__refresh_cluster_task_tail_kernel(SEQLENS_KV, OFFSETS, META
     tl.store(TASK_MAP + task_base + 3, seq_start, mask=valid)
     tl.store(TASK_MAP + task_base + 4, seq_len, mask=valid)
     tl.store(TASK_MAP + task_base + 5, seq_kvcache, mask=valid)
-    tl.store(TASK_MAP + task_base + 6, (seq_len + _scheduler_mtp24___TILE_N_JIT - 1) // _scheduler_mtp24___TILE_N_JIT, mask=valid)
+    tl.store(
+        TASK_MAP + task_base + 6,
+        (seq_len + _scheduler_mtp24___TILE_N_JIT - 1) // _scheduler_mtp24___TILE_N_JIT,
+        mask=valid,
+    )
     tl.store(TASK_MAP + task_base + 7, tl.maximum(seq_kvcache, 0) // _scheduler_mtp24___TILE_N_JIT, mask=valid)
     tl.store(TASK_MAP + task_base + 8, 1, mask=valid)
+
 
 @dataclass
 class _scheduler_mtp24__DecodeTaskSchedule:
@@ -766,76 +1096,168 @@ class _scheduler_mtp24__DecodeTaskSchedule:
     partial_slots: int = 0
     stats: dict | None = None
 
-def _scheduler_mtp24___capacity(*, num_sequences: int, max_seq_kv: int, cluster_size: int, chunk_tokens: int) -> tuple[int, int, int]:
+
+def _scheduler_mtp24___capacity(
+    *, num_sequences: int, max_seq_kv: int, cluster_size: int, chunk_tokens: int
+) -> tuple[int, int, int]:
     max_chunks = max(1, (max_seq_kv + chunk_tokens - 1) // chunk_tokens)
     max_groups = (max_chunks + cluster_size - 1) // cluster_size
     max_reduction_clusters = num_sequences * max_groups if max_chunks > 1 else 0
     max_direct_clusters = (num_sequences + cluster_size - 1) // cluster_size
     capacity_clusters = max_reduction_clusters + max_direct_clusters
     capacity_ctas = max(capacity_clusters * cluster_size, cluster_size)
-    chunk_pad_ints = (num_sequences + _scheduler_mtp24__TASK_STRIDE - 1) // _scheduler_mtp24__TASK_STRIDE * _scheduler_mtp24__TASK_STRIDE
+    chunk_pad_ints = (
+        (num_sequences + _scheduler_mtp24__TASK_STRIDE - 1)
+        // _scheduler_mtp24__TASK_STRIDE
+        * _scheduler_mtp24__TASK_STRIDE
+    )
     capacity_ints = (_scheduler_mtp24__TASK_SLOTS * capacity_ctas + 1) * _scheduler_mtp24__TASK_STRIDE + chunk_pad_ints
     block_chunks = triton.next_power_of_2(max(max_chunks, cluster_size))
     return (capacity_clusters, capacity_ints, block_chunks)
 
-def _scheduler_mtp24__allocate_cluster_task_map(kv_lens: torch.Tensor, *, num_head_kv: int, max_seq_kv: int, cluster_size: int, chunk_tokens: int, direct_threshold: int, subgroup2_threshold: int, num_seq_q: int) -> _scheduler_mtp24__DecodeTaskSchedule:
+
+def _scheduler_mtp24__allocate_cluster_task_map(
+    kv_lens: torch.Tensor,
+    *,
+    num_head_kv: int,
+    max_seq_kv: int,
+    cluster_size: int,
+    chunk_tokens: int,
+    direct_threshold: int,
+    subgroup2_threshold: int,
+    num_seq_q: int,
+) -> _scheduler_mtp24__DecodeTaskSchedule:
     """Allocate capacity and populate a cluster task map entirely on GPU."""
     if not kv_lens.is_cuda:
-        raise ValueError('cluster GPU assignment requires CUDA kv_lens')
+        raise ValueError("cluster GPU assignment requires CUDA kv_lens")
     if cluster_size not in (2, 4, 8):
-        raise ValueError(f'cluster_size must be 2, 4, or 8, got {cluster_size}')
+        raise ValueError(f"cluster_size must be 2, 4, or 8, got {cluster_size}")
     if num_seq_q < 1:
-        raise ValueError(f'num_seq_q must be positive, got {num_seq_q}')
+        raise ValueError(f"num_seq_q must be positive, got {num_seq_q}")
     if chunk_tokens < _scheduler_mtp24__TILE_N or chunk_tokens % _scheduler_mtp24__TILE_N:
-        raise ValueError(f'chunk_tokens must be a positive multiple of {_scheduler_mtp24__TILE_N}, got {chunk_tokens}')
+        raise ValueError(f"chunk_tokens must be a positive multiple of {_scheduler_mtp24__TILE_N}, got {chunk_tokens}")
     if direct_threshold < 0 or direct_threshold % _scheduler_mtp24__TILE_N:
-        raise ValueError(f'direct_threshold must be zero or a multiple of {_scheduler_mtp24__TILE_N}, got {direct_threshold}')
+        raise ValueError(
+            f"direct_threshold must be zero or a multiple of {_scheduler_mtp24__TILE_N}, got {direct_threshold}"
+        )
     if subgroup2_threshold < 0 or subgroup2_threshold % _scheduler_mtp24__TILE_N:
-        raise ValueError(f'subgroup2_threshold must be zero or a multiple of {_scheduler_mtp24__TILE_N}, got {subgroup2_threshold}')
+        raise ValueError(
+            f"subgroup2_threshold must be zero or a multiple of {_scheduler_mtp24__TILE_N}, got {subgroup2_threshold}"
+        )
     if subgroup2_threshold and cluster_size != 4:
-        raise ValueError('subgroup2_threshold requires cluster_size=4')
+        raise ValueError("subgroup2_threshold requires cluster_size=4")
     if 0 % _scheduler_mtp24__TILE_N:
-        raise ValueError(f'short_threshold must be zero or a multiple of {_scheduler_mtp24__TILE_N}, got {0}')
-    short_chunk_tokens = chunk_tokens
+        raise ValueError(f"short_threshold must be zero or a multiple of {_scheduler_mtp24__TILE_N}, got {0}")
     num_sequences = kv_lens.numel() * num_head_kv
     block_seq = triton.next_power_of_2(kv_lens.numel())
     if block_seq > 1024:
-        raise ValueError(f'cluster GPU assign currently supports B <= 1024, got {kv_lens.numel()}')
-    capacity_clusters, capacity_ints, block_chunks = _scheduler_mtp24___capacity(num_sequences=num_sequences, max_seq_kv=max_seq_kv, cluster_size=cluster_size, chunk_tokens=chunk_tokens)
+        raise ValueError(f"cluster GPU assign currently supports B <= 1024, got {kv_lens.numel()}")
+    capacity_clusters, capacity_ints, block_chunks = _scheduler_mtp24___capacity(
+        num_sequences=num_sequences, max_seq_kv=max_seq_kv, cluster_size=cluster_size, chunk_tokens=chunk_tokens
+    )
     task_map = torch.full((capacity_ints,), -1, dtype=torch.int32, device=kv_lens.device)
-    assignment = _scheduler_mtp24__DecodeTaskSchedule(task_workspace=task_map.view(torch.int8), task_map=task_map, offsets=torch.empty((num_sequences, 2), dtype=torch.int32, device=kv_lens.device), meta=torch.empty((_scheduler_mtp24__META_SIZE,), dtype=torch.int32, device=kv_lens.device), cluster_size=cluster_size, chunk_tokens=chunk_tokens, block_seq=block_seq, block_chunks=block_chunks, capacity_clusters=capacity_clusters, capacity_ints=capacity_ints, direct_threshold=direct_threshold, short_threshold=0, short_chunk_tokens=0, subgroup2_threshold=subgroup2_threshold, num_seq_q=num_seq_q)
-    _scheduler_mtp24__launch_cluster_task_map_assign(kv_lens, assignment, num_head_kv=num_head_kv, refresh_host_metadata=True)
+    assignment = _scheduler_mtp24__DecodeTaskSchedule(
+        task_workspace=task_map.view(torch.int8),
+        task_map=task_map,
+        offsets=torch.empty((num_sequences, 2), dtype=torch.int32, device=kv_lens.device),
+        meta=torch.empty((_scheduler_mtp24__META_SIZE,), dtype=torch.int32, device=kv_lens.device),
+        cluster_size=cluster_size,
+        chunk_tokens=chunk_tokens,
+        block_seq=block_seq,
+        block_chunks=block_chunks,
+        capacity_clusters=capacity_clusters,
+        capacity_ints=capacity_ints,
+        direct_threshold=direct_threshold,
+        short_threshold=0,
+        short_chunk_tokens=0,
+        subgroup2_threshold=subgroup2_threshold,
+        num_seq_q=num_seq_q,
+    )
+    _scheduler_mtp24__launch_cluster_task_map_assign(
+        kv_lens, assignment, num_head_kv=num_head_kv, refresh_host_metadata=True
+    )
     return assignment
 
-def _scheduler_mtp24__launch_cluster_task_map_assign(kv_lens: torch.Tensor, assignment: _scheduler_mtp24__DecodeTaskSchedule, *, num_head_kv: int, refresh_host_metadata: bool) -> None:
+
+def _scheduler_mtp24__launch_cluster_task_map_assign(
+    kv_lens: torch.Tensor,
+    assignment: _scheduler_mtp24__DecodeTaskSchedule,
+    *,
+    num_head_kv: int,
+    refresh_host_metadata: bool,
+) -> None:
     """Regenerate an allocated map; fixed-topology calls need no host sync."""
     batch = kv_lens.numel()
     num_sequences = batch * num_head_kv
     if assignment.offsets.numel() != num_sequences * 2:
-        raise ValueError('kv_lens/H_KV shape differs from the allocated cluster task map')
+        raise ValueError("kv_lens/H_KV shape differs from the allocated cluster task map")
     prefix_warps = max(1, min(32, assignment.block_seq // 32))
-    _scheduler_mtp24__assign_cluster_task_prefix_kernel[1,](kv_lens, assignment.offsets, assignment.meta, assignment.task_map, B=batch, H_KV=num_head_kv, NUM_SEQ_Q=assignment.num_seq_q, CLUSTER_SIZE=assignment.cluster_size, CHUNK_TOKENS=assignment.chunk_tokens, DIRECT_THRESHOLD=assignment.direct_threshold, SHORT_THRESHOLD=assignment.short_threshold, SHORT_CHUNK_TOKENS=assignment.short_chunk_tokens, SUBGROUP2_THRESHOLD=assignment.subgroup2_threshold, BLOCK_SEQ=assignment.block_seq, num_warps=prefix_warps, num_stages=1)
+    _scheduler_mtp24__assign_cluster_task_prefix_kernel[1,](
+        kv_lens,
+        assignment.offsets,
+        assignment.meta,
+        assignment.task_map,
+        B=batch,
+        H_KV=num_head_kv,
+        NUM_SEQ_Q=assignment.num_seq_q,
+        CLUSTER_SIZE=assignment.cluster_size,
+        CHUNK_TOKENS=assignment.chunk_tokens,
+        DIRECT_THRESHOLD=assignment.direct_threshold,
+        SHORT_THRESHOLD=assignment.short_threshold,
+        SHORT_CHUNK_TOKENS=assignment.short_chunk_tokens,
+        SUBGROUP2_THRESHOLD=assignment.subgroup2_threshold,
+        BLOCK_SEQ=assignment.block_seq,
+        num_warps=prefix_warps,
+        num_stages=1,
+    )
     record_warps = 1
     records_kernel = _scheduler_mtp24__assign_cluster_task_records_compact_kernel
-    record_args = {'B': batch, 'NUM_SEQ_Q': assignment.num_seq_q, 'CLUSTER_SIZE': assignment.cluster_size, 'CHUNK_TOKENS': assignment.chunk_tokens, 'DIRECT_THRESHOLD': assignment.direct_threshold, 'SHORT_THRESHOLD': assignment.short_threshold, 'SHORT_CHUNK_TOKENS': assignment.short_chunk_tokens, 'SUBGROUP2_THRESHOLD': assignment.subgroup2_threshold, 'num_warps': record_warps, 'num_stages': 1}
+    record_args = {
+        "B": batch,
+        "NUM_SEQ_Q": assignment.num_seq_q,
+        "CLUSTER_SIZE": assignment.cluster_size,
+        "CHUNK_TOKENS": assignment.chunk_tokens,
+        "DIRECT_THRESHOLD": assignment.direct_threshold,
+        "SHORT_THRESHOLD": assignment.short_threshold,
+        "SHORT_CHUNK_TOKENS": assignment.short_chunk_tokens,
+        "SUBGROUP2_THRESHOLD": assignment.subgroup2_threshold,
+        "num_warps": record_warps,
+        "num_stages": 1,
+    }
     records_kernel[num_sequences,](kv_lens, assignment.offsets, assignment.meta, assignment.task_map, **record_args)
     if not refresh_host_metadata:
         return
     values = assignment.meta.detach().cpu().to(torch.int64).tolist()
     invalid_lengths = values[_scheduler_mtp24__META_INVALID_LENGTHS]
     if invalid_lengths:
-        raise ValueError(f'cluster GPU assign found {invalid_lengths} total KV lengths below {assignment.num_seq_q}')
+        raise ValueError(f"cluster GPU assign found {invalid_lengths} total KV lengths below {assignment.num_seq_q}")
     num_clusters = values[_scheduler_mtp24__META_NUM_CLUSTERS]
     sched_ints = values[_scheduler_mtp24__META_SCHED_INTS]
     if num_clusters > assignment.capacity_clusters or sched_ints > assignment.capacity_ints:
-        raise RuntimeError(f'cluster task-map capacity was underestimated: clusters={num_clusters}/{assignment.capacity_clusters}, ints={sched_ints}/{assignment.capacity_ints}')
+        raise RuntimeError(
+            f"cluster task-map capacity was underestimated: clusters={num_clusters}/{assignment.capacity_clusters}, ints={sched_ints}/{assignment.capacity_ints}"
+        )
     assignment.num_clusters = num_clusters
     assignment.physical_ctas = values[_scheduler_mtp24__META_PHYSICAL_CTAS]
     assignment.sched_ints = sched_ints
     assignment.partial_slots = max(values[_scheduler_mtp24__META_EFFECTIVE_CHUNKS_MAX], 1)
-    assignment.stats = {'cluster_size': assignment.cluster_size, 'num_clusters': num_clusters, 'physical_ctas': values[_scheduler_mtp24__META_PHYSICAL_CTAS], 'reduction_clusters': values[_scheduler_mtp24__META_REDUCTION_CLUSTERS], 'compute_tasks': values[_scheduler_mtp24__META_COMPUTE_TASKS], 'fine_chunks_max': values[_scheduler_mtp24__META_FINE_CHUNKS_MAX], 'effective_chunks_max': values[_scheduler_mtp24__META_EFFECTIVE_CHUNKS_MAX], 'direct_tasks': values[_scheduler_mtp24__META_DIRECT_TASKS], 'dummy_tasks': values[_scheduler_mtp24__META_DUMMY_TASKS], 'subgroup2_tasks': values[_scheduler_mtp24__META_SUBGROUP_TASKS]}
+    assignment.stats = {
+        "cluster_size": assignment.cluster_size,
+        "num_clusters": num_clusters,
+        "physical_ctas": values[_scheduler_mtp24__META_PHYSICAL_CTAS],
+        "reduction_clusters": values[_scheduler_mtp24__META_REDUCTION_CLUSTERS],
+        "compute_tasks": values[_scheduler_mtp24__META_COMPUTE_TASKS],
+        "fine_chunks_max": values[_scheduler_mtp24__META_FINE_CHUNKS_MAX],
+        "effective_chunks_max": values[_scheduler_mtp24__META_EFFECTIVE_CHUNKS_MAX],
+        "direct_tasks": values[_scheduler_mtp24__META_DIRECT_TASKS],
+        "dummy_tasks": values[_scheduler_mtp24__META_DUMMY_TASKS],
+        "subgroup2_tasks": values[_scheduler_mtp24__META_SUBGROUP_TASKS],
+    }
 
-def _scheduler_mtp24__launch_cluster_task_tail_refresh(kv_lens: torch.Tensor, assignment: _scheduler_mtp24__DecodeTaskSchedule, *, num_head_kv: int) -> None:
+
+def _scheduler_mtp24__launch_cluster_task_tail_refresh(
+    kv_lens: torch.Tensor, assignment: _scheduler_mtp24__DecodeTaskSchedule, *, num_head_kv: int
+) -> None:
     """Update tail records without rebuilding unchanged 512-token topology.
 
     The caller must run ``launch_cluster_task_map_assign`` with refreshed host
@@ -844,10 +1266,26 @@ def _scheduler_mtp24__launch_cluster_task_tail_refresh(kv_lens: torch.Tensor, as
     batch = kv_lens.numel()
     num_sequences = batch * num_head_kv
     if assignment.offsets.numel() != num_sequences * 2:
-        raise ValueError('kv_lens/H_KV shape differs from the allocated cluster task map')
+        raise ValueError("kv_lens/H_KV shape differs from the allocated cluster task map")
     block_seq = triton.next_power_of_2(num_sequences)
     num_warps = max(1, min(8, block_seq // 32))
-    _scheduler_mtp24__refresh_cluster_task_tail_kernel[1,](kv_lens, assignment.offsets, assignment.meta, assignment.task_map, B=batch, H_KV=num_head_kv, NUM_SEQ_Q=assignment.num_seq_q, CLUSTER_SIZE=assignment.cluster_size, CHUNK_TOKENS=assignment.chunk_tokens, DIRECT_THRESHOLD=assignment.direct_threshold, SHORT_THRESHOLD=assignment.short_threshold, SHORT_CHUNK_TOKENS=assignment.short_chunk_tokens, BLOCK_SEQ=block_seq, num_warps=num_warps, num_stages=1)
+    _scheduler_mtp24__refresh_cluster_task_tail_kernel[1,](
+        kv_lens,
+        assignment.offsets,
+        assignment.meta,
+        assignment.task_map,
+        B=batch,
+        H_KV=num_head_kv,
+        NUM_SEQ_Q=assignment.num_seq_q,
+        CLUSTER_SIZE=assignment.cluster_size,
+        CHUNK_TOKENS=assignment.chunk_tokens,
+        DIRECT_THRESHOLD=assignment.direct_threshold,
+        SHORT_THRESHOLD=assignment.short_threshold,
+        SHORT_CHUNK_TOKENS=assignment.short_chunk_tokens,
+        BLOCK_SEQ=block_seq,
+        num_warps=num_warps,
+        num_stages=1,
+    )
 
 
 # BF16 uses a compact 8-int compute-task ABI after assignment.  Keep that ABI
@@ -860,9 +1298,14 @@ _bf16_compact__TASK_STRIDE_JIT = tl.constexpr(_bf16_compact__TASK_STRIDE)
 
 @triton.jit
 def _bf16_compact__assign_prefix_kernel(
-    KV_LENS, OFFSETS, META,
-    B: tl.constexpr, H_KV: tl.constexpr, NUM_SEQ_Q: tl.constexpr,
-    CLUSTER_SIZE: tl.constexpr, CHUNK_TOKENS: tl.constexpr,
+    KV_LENS,
+    OFFSETS,
+    META,
+    B: tl.constexpr,
+    H_KV: tl.constexpr,
+    NUM_SEQ_Q: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr,
+    CHUNK_TOKENS: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
 ):
     """Compact variable-length sequences into contiguous cluster slots."""
@@ -870,9 +1313,7 @@ def _bf16_compact__assign_prefix_kernel(
     valid = batch < B
     total_len = tl.load(KV_LENS + batch, mask=valid, other=0).to(tl.int32)
     positive = valid & (total_len >= NUM_SEQ_Q)
-    chunks = tl.where(
-        positive, (total_len + CHUNK_TOKENS - 1) // CHUNK_TOKENS, 0
-    )
+    chunks = tl.where(positive, (total_len + CHUNK_TOKENS - 1) // CHUNK_TOKENS, 0)
     groups = (chunks + CLUSTER_SIZE - 1) // CLUSTER_SIZE
     is_direct = positive & (chunks == 1) & (CLUSTER_SIZE > 1)
     is_subgroup2 = positive & (chunks == 2) & (CLUSTER_SIZE >= 4)
@@ -882,16 +1323,10 @@ def _bf16_compact__assign_prefix_kernel(
     direct_tasks = is_direct.to(tl.int32)
     subgroup2_groups = is_subgroup2.to(tl.int32)
     subgroup4_groups = is_subgroup4.to(tl.int32)
-    reduction_offsets, groups_per_head = _decode_exclusive_cumsum(
-        reduction_groups
-    )
-    direct_offsets, direct_per_head = _decode_exclusive_cumsum(direct_tasks)
-    subgroup2_offsets, subgroup2_per_head = _decode_exclusive_cumsum(
-        subgroup2_groups
-    )
-    subgroup4_offsets, subgroup4_per_head = _decode_exclusive_cumsum(
-        subgroup4_groups
-    )
+    reduction_offsets, groups_per_head = tle.cumsum(reduction_groups, axis=0, reverse=False)
+    direct_offsets, direct_per_head = tle.cumsum(direct_tasks, axis=0, reverse=False)
+    subgroup2_offsets, subgroup2_per_head = tle.cumsum(subgroup2_groups, axis=0, reverse=False)
+    subgroup4_offsets, subgroup4_per_head = tle.cumsum(subgroup4_groups, axis=0, reverse=False)
     tl.store(OFFSETS + batch * 2, reduction_offsets, mask=valid)
     tl.store(OFFSETS + batch * 2 + 1, direct_offsets, mask=valid)
     tl.store(OFFSETS + B * 2 + batch * 2, subgroup2_offsets, mask=valid)
@@ -908,12 +1343,20 @@ def _bf16_compact__assign_prefix_kernel(
 
 @triton.jit
 def _bf16_compact__assign_records_kernel(
-    KV_LENS, OFFSETS, TASK_MAP, DIRECT_TASK_MAP,
-    SUBGROUP2_TASK_MAP, SUBGROUP4_TASK_MAP,
-    B: tl.constexpr, H_KV: tl.constexpr,
-    CLUSTER_SIZE: tl.constexpr, CHUNK_TOKENS: tl.constexpr,
-    GROUPS_PER_HEAD: tl.constexpr, DIRECT_PER_HEAD: tl.constexpr,
-    SUBGROUP2_PER_HEAD: tl.constexpr, SUBGROUP4_PER_HEAD: tl.constexpr,
+    KV_LENS,
+    OFFSETS,
+    TASK_MAP,
+    DIRECT_TASK_MAP,
+    SUBGROUP2_TASK_MAP,
+    SUBGROUP4_TASK_MAP,
+    B: tl.constexpr,
+    H_KV: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr,
+    CHUNK_TOKENS: tl.constexpr,
+    GROUPS_PER_HEAD: tl.constexpr,
+    DIRECT_PER_HEAD: tl.constexpr,
+    SUBGROUP2_PER_HEAD: tl.constexpr,
+    SUBGROUP4_PER_HEAD: tl.constexpr,
 ):
     """Emit the compact BF16 consumer records from the shared scheduler."""
     sequence = tl.program_id(0)
@@ -984,20 +1427,21 @@ def _bf16_compact__assign_records_kernel(
                 rank += 1
             group += 1
 
+
 __all__ = [
-    'PURE_TRITON_TASK_STRIDE',
-    'PURE_TRITON_TILE_N',
-    'assign_pure_triton_task_map_kernel',
-    'pure_triton_task_map_metadata',
-    'launch_pure_triton_task_map',
-    '_scheduler_mtp1__DecodeTaskSchedule',
-    '_scheduler_mtp1__allocate_cluster_task_map',
-    '_scheduler_mtp1__launch_cluster_task_map_assign',
-    '_scheduler_mtp1__launch_cluster_task_tail_refresh',
-    '_scheduler_mtp24__DecodeTaskSchedule',
-    '_scheduler_mtp24__allocate_cluster_task_map',
-    '_scheduler_mtp24__launch_cluster_task_map_assign',
-    '_scheduler_mtp24__launch_cluster_task_tail_refresh',
-    '_bf16_compact__assign_prefix_kernel',
-    '_bf16_compact__assign_records_kernel',
+    "PURE_TRITON_TASK_STRIDE",
+    "PURE_TRITON_TILE_N",
+    "assign_pure_triton_task_map_kernel",
+    "pure_triton_task_map_metadata",
+    "launch_pure_triton_task_map",
+    "_scheduler_mtp1__DecodeTaskSchedule",
+    "_scheduler_mtp1__allocate_cluster_task_map",
+    "_scheduler_mtp1__launch_cluster_task_map_assign",
+    "_scheduler_mtp1__launch_cluster_task_tail_refresh",
+    "_scheduler_mtp24__DecodeTaskSchedule",
+    "_scheduler_mtp24__allocate_cluster_task_map",
+    "_scheduler_mtp24__launch_cluster_task_map_assign",
+    "_scheduler_mtp24__launch_cluster_task_tail_refresh",
+    "_bf16_compact__assign_prefix_kernel",
+    "_bf16_compact__assign_records_kernel",
 ]

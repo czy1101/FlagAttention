@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+
+from dataclasses import dataclass, replace
 
 import torch
 import triton
@@ -53,21 +54,47 @@ class PureTritonMTP1Workspace:
     min_process_len: int
 
 
+@dataclass
+class PureTritonMTPWorkspace:
+    """Collection of MTP=1 Triton workspaces used for MTP>1 fallback."""
+
+    workspaces: tuple[PureTritonMTP1Workspace, ...]
+
+
 @triton.jit
 def _pure_triton_bf16_gqa8_splitk_kernel(
-    Q, K, V, BLOCK_IDS, TASK_MAP, SPLIT_OUT, SPLIT_LSE,
-    H_Q: tl.constexpr, HEADS_PER_GROUP: tl.constexpr,
-    GROUP_M: tl.constexpr, D: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr, MAX_BLOCKS: tl.constexpr,
-    MAX_TASKS: tl.constexpr, BLOCK_N: tl.constexpr,
-    Q_SB: tl.constexpr, Q_SH: tl.constexpr,
-    K_SBLOCK: tl.constexpr, K_STOKEN: tl.constexpr,
-    K_SHEAD: tl.constexpr, K_SD: tl.constexpr,
-    V_SBLOCK: tl.constexpr, V_STOKEN: tl.constexpr,
-    V_SHEAD: tl.constexpr, V_SD: tl.constexpr,
-    SO_SB: tl.constexpr, SO_SC: tl.constexpr, SO_SH: tl.constexpr,
-    SL_SB: tl.constexpr, SL_SC: tl.constexpr,
-    SL_SK: tl.constexpr, SL_SH: tl.constexpr,
+    Q,
+    K,
+    V,
+    BLOCK_IDS,
+    TASK_MAP,
+    SPLIT_OUT,
+    SPLIT_LSE,
+    H_Q: tl.constexpr,
+    HEADS_PER_GROUP: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+    MAX_TASKS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    Q_SB: tl.constexpr,
+    Q_SH: tl.constexpr,
+    K_SBLOCK: tl.constexpr,
+    K_STOKEN: tl.constexpr,
+    K_SHEAD: tl.constexpr,
+    K_SD: tl.constexpr,
+    V_SBLOCK: tl.constexpr,
+    V_STOKEN: tl.constexpr,
+    V_SHEAD: tl.constexpr,
+    V_SD: tl.constexpr,
+    SO_SB: tl.constexpr,
+    SO_SC: tl.constexpr,
+    SO_SH: tl.constexpr,
+    SL_SB: tl.constexpr,
+    SL_SC: tl.constexpr,
+    SL_SK: tl.constexpr,
+    SL_SH: tl.constexpr,
 ):
     """BF16 MTP1 producer: GQA8 reuse, tl.dot, and dynamic split-K."""
     cta = tl.program_id(0)
@@ -89,7 +116,8 @@ def _pure_triton_bf16_gqa8_splitk_kernel(
         hq = hkv * HEADS_PER_GROUP + offs_h
         q = tl.load(
             Q + batch * Q_SB + hq[:, None] * Q_SH + offs_d[None, :],
-            mask=valid_h[:, None], other=0.0,
+            mask=valid_h[:, None],
+            other=0.0,
         )
         m_i = tl.full((GROUP_M,), -float("inf"), tl.float32)
         l_i = tl.zeros((GROUP_M,), tl.float32)
@@ -103,24 +131,24 @@ def _pure_triton_bf16_gqa8_splitk_kernel(
             valid_n = local_n < seq_len
             physical = tl.load(
                 BLOCK_IDS + batch * MAX_BLOCKS + page,
-                mask=valid_n, other=0,
+                mask=valid_n,
+                other=0,
             )
             k = tl.load(
-                K + physical[:, None] * K_SBLOCK
-                + pos[:, None] * K_STOKEN + hkv * K_SHEAD
-                + offs_d[None, :] * K_SD,
-                mask=valid_n[:, None], other=0.0,
+                K + physical[:, None] * K_SBLOCK + pos[:, None] * K_STOKEN + hkv * K_SHEAD + offs_d[None, :] * K_SD,
+                mask=valid_n[:, None],
+                other=0.0,
             )
             v = tl.load(
-                V + physical[:, None] * V_SBLOCK
-                + pos[:, None] * V_STOKEN + hkv * V_SHEAD
-                + offs_d[None, :] * V_SD,
-                mask=valid_n[:, None], other=0.0,
+                V + physical[:, None] * V_SBLOCK + pos[:, None] * V_STOKEN + hkv * V_SHEAD + offs_d[None, :] * V_SD,
+                mask=valid_n[:, None],
+                other=0.0,
             )
             scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
             scores = tl.where(
                 valid_h[:, None] & valid_n[None, :],
-                scores, -float("inf"),
+                scores,
+                -float("inf"),
             )
             tile_max = tl.max(scores, axis=1)
             m_new = tl.maximum(m_i, tile_max)
@@ -131,7 +159,9 @@ def _pure_triton_bf16_gqa8_splitk_kernel(
             alpha = tl.where(active, tl.exp(safe_old - safe_new), 0.0)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             acc = acc * alpha[:, None] + tl.dot(
-                p.to(tl.bfloat16), v, out_dtype=tl.float32,
+                p.to(tl.bfloat16),
+                v,
+                out_dtype=tl.float32,
             )
             m_i = m_new
             start += BLOCK_N
@@ -139,37 +169,61 @@ def _pure_triton_bf16_gqa8_splitk_kernel(
         partial = tl.where(has_value[:, None], acc / l_i[:, None], 0.0)
         lse = tl.where(has_value, tl.log(l_i) + m_i, -float("inf"))
         tl.store(
-            SPLIT_OUT + batch * SO_SB + chunk * SO_SC
-            + hq[:, None] * SO_SH + offs_d[None, :],
-            partial, mask=valid_h[:, None],
+            SPLIT_OUT + batch * SO_SB + chunk * SO_SC + hq[:, None] * SO_SH + offs_d[None, :],
+            partial,
+            mask=valid_h[:, None],
         )
         tl.store(
-            SPLIT_LSE + batch * SL_SB + chunk * SL_SC
-            + hkv * SL_SK + offs_h * SL_SH,
-            lse, mask=valid_h,
+            SPLIT_LSE + batch * SL_SB + chunk * SL_SC + hkv * SL_SK + offs_h * SL_SH,
+            lse,
+            mask=valid_h,
         )
 
 
 @triton.jit
 def _pure_triton_fp8_gqa8_splitk_kernel(
-    Q, K, V, BLOCK_IDS, TASK_MAP, Q_SCALE, K_SCALE, V_SCALE,
-    SPLIT_OUT, SPLIT_LSE,
-    H_Q: tl.constexpr, HEADS_PER_GROUP: tl.constexpr,
-    GROUP_M: tl.constexpr, D: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr, MAX_BLOCKS: tl.constexpr,
-    MAX_TASKS: tl.constexpr, BLOCK_N: tl.constexpr,
+    Q,
+    K,
+    V,
+    BLOCK_IDS,
+    TASK_MAP,
+    Q_SCALE,
+    K_SCALE,
+    V_SCALE,
+    SPLIT_OUT,
+    SPLIT_LSE,
+    H_Q: tl.constexpr,
+    HEADS_PER_GROUP: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+    MAX_TASKS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     QUANT_TYPE: tl.constexpr,
-    Q_SB: tl.constexpr, Q_SH: tl.constexpr,
-    K_SBLOCK: tl.constexpr, K_STOKEN: tl.constexpr,
-    K_SHEAD: tl.constexpr, K_SD: tl.constexpr,
-    V_SBLOCK: tl.constexpr, V_STOKEN: tl.constexpr,
-    V_SHEAD: tl.constexpr, V_SD: tl.constexpr,
-    QS_SB: tl.constexpr, QS_SH: tl.constexpr,
-    KS_SBLOCK: tl.constexpr, KS_STOKEN: tl.constexpr,
-    KS_SHEAD: tl.constexpr, KS_SD: tl.constexpr,
-    SO_SB: tl.constexpr, SO_SC: tl.constexpr, SO_SH: tl.constexpr,
-    SL_SB: tl.constexpr, SL_SC: tl.constexpr,
-    SL_SK: tl.constexpr, SL_SH: tl.constexpr,
+    Q_SB: tl.constexpr,
+    Q_SH: tl.constexpr,
+    K_SBLOCK: tl.constexpr,
+    K_STOKEN: tl.constexpr,
+    K_SHEAD: tl.constexpr,
+    K_SD: tl.constexpr,
+    V_SBLOCK: tl.constexpr,
+    V_STOKEN: tl.constexpr,
+    V_SHEAD: tl.constexpr,
+    V_SD: tl.constexpr,
+    QS_SB: tl.constexpr,
+    QS_SH: tl.constexpr,
+    KS_SBLOCK: tl.constexpr,
+    KS_STOKEN: tl.constexpr,
+    KS_SHEAD: tl.constexpr,
+    KS_SD: tl.constexpr,
+    SO_SB: tl.constexpr,
+    SO_SC: tl.constexpr,
+    SO_SH: tl.constexpr,
+    SL_SB: tl.constexpr,
+    SL_SC: tl.constexpr,
+    SL_SK: tl.constexpr,
+    SL_SH: tl.constexpr,
 ):
     """FP8 MTP1 producer matching the v3 pure-Triton GQA8 structure."""
     cta = tl.program_id(0)
@@ -191,18 +245,16 @@ def _pure_triton_fp8_gqa8_splitk_kernel(
         hq = hkv * HEADS_PER_GROUP + offs_h
         q = tl.load(
             Q + batch * Q_SB + hq[:, None] * Q_SH + offs_d[None, :],
-            mask=valid_h[:, None], other=0.0,
+            mask=valid_h[:, None],
+            other=0.0,
         ).to(tl.float32)
         q_scale = tl.load(
             Q_SCALE + batch * QS_SB + hq * QS_SH,
-            mask=valid_h, other=1.0,
+            mask=valid_h,
+            other=1.0,
         ).to(tl.float32)
-        value_scale = tl.load(
-            V_SCALE + (hkv if QUANT_TYPE == 0 else 0)
-        ).to(tl.float32) / 256.0
-        tensor_k_scale = (
-            tl.load(K_SCALE).to(tl.float32) if QUANT_TYPE == 1 else 1.0
-        )
+        value_scale = tl.load(V_SCALE + (hkv if QUANT_TYPE == 0 else 0)).to(tl.float32) / 256.0
+        tensor_k_scale = tl.load(K_SCALE).to(tl.float32) if QUANT_TYPE == 1 else 1.0
         m_i = tl.full((GROUP_M,), -float("inf"), tl.float32)
         l_i = tl.zeros((GROUP_M,), tl.float32)
         acc = tl.zeros((GROUP_M, D), tl.float32)
@@ -215,38 +267,31 @@ def _pure_triton_fp8_gqa8_splitk_kernel(
             valid_n = local_n < seq_len
             physical = tl.load(
                 BLOCK_IDS + batch * MAX_BLOCKS + page,
-                mask=valid_n, other=0,
+                mask=valid_n,
+                other=0,
             )
             k = tl.load(
-                K + physical[:, None] * K_SBLOCK
-                + pos[:, None] * K_STOKEN + hkv * K_SHEAD
-                + offs_d[None, :] * K_SD,
-                mask=valid_n[:, None], other=0.0,
+                K + physical[:, None] * K_SBLOCK + pos[:, None] * K_STOKEN + hkv * K_SHEAD + offs_d[None, :] * K_SD,
+                mask=valid_n[:, None],
+                other=0.0,
             ).to(tl.float32)
             v = tl.load(
-                V + physical[:, None] * V_SBLOCK
-                + pos[:, None] * V_STOKEN + hkv * V_SHEAD
-                + offs_d[None, :] * V_SD,
-                mask=valid_n[:, None], other=0.0,
+                V + physical[:, None] * V_SBLOCK + pos[:, None] * V_STOKEN + hkv * V_SHEAD + offs_d[None, :] * V_SD,
+                mask=valid_n[:, None],
+                other=0.0,
             ).to(tl.float32)
             scores = tl.dot(q, tl.trans(k))
             if QUANT_TYPE == 0:
-                byte_offset = (
-                    physical * KS_SBLOCK + (pos // 32) * KS_STOKEN
-                    + hkv * KS_SHEAD + (pos % 32) * 4 * KS_SD
-                )
-                scale_ptr = (K_SCALE + byte_offset).to(
-                    tl.pointer_type(tl.float32)
-                )
-                k_scale = tl.load(
-                    scale_ptr, mask=valid_n, other=0.0
-                ).to(tl.float32)
+                byte_offset = physical * KS_SBLOCK + (pos // 32) * KS_STOKEN + hkv * KS_SHEAD + (pos % 32) * 4 * KS_SD
+                scale_ptr = (K_SCALE + byte_offset).to(tl.pointer_type(tl.float32))
+                k_scale = tl.load(scale_ptr, mask=valid_n, other=0.0).to(tl.float32)
                 scores *= q_scale[:, None] * k_scale[None, :] * dot_scale
             else:
                 scores *= q_scale[:, None] * tensor_k_scale * dot_scale
             scores = tl.where(
                 valid_h[:, None] & valid_n[None, :],
-                scores, -float("inf"),
+                scores,
+                -float("inf"),
             )
             tile_max = tl.max(scores, axis=1)
             m_new = tl.maximum(m_i, tile_max)
@@ -262,31 +307,44 @@ def _pure_triton_fp8_gqa8_splitk_kernel(
             start += BLOCK_N
         has_value = l_i > 0.0
         partial = tl.where(
-            has_value[:, None], acc / l_i[:, None] * value_scale, 0.0,
+            has_value[:, None],
+            acc / l_i[:, None] * value_scale,
+            0.0,
         )
         lse = tl.where(has_value, tl.log(l_i) + m_i, -float("inf"))
         tl.store(
-            SPLIT_OUT + batch * SO_SB + chunk * SO_SC
-            + hq[:, None] * SO_SH + offs_d[None, :],
-            partial, mask=valid_h[:, None],
+            SPLIT_OUT + batch * SO_SB + chunk * SO_SC + hq[:, None] * SO_SH + offs_d[None, :],
+            partial,
+            mask=valid_h[:, None],
         )
         tl.store(
-            SPLIT_LSE + batch * SL_SB + chunk * SL_SC
-            + hkv * SL_SK + offs_h * SL_SH,
-            lse, mask=valid_h,
+            SPLIT_LSE + batch * SL_SB + chunk * SL_SC + hkv * SL_SK + offs_h * SL_SH,
+            lse,
+            mask=valid_h,
         )
 
 
 @triton.jit
 def _pure_triton_splitk_combine_kernel(
-    SPLIT_OUT, SPLIT_LSE, TASK_MAP, OUT,
-    H_Q: tl.constexpr, HEADS_PER_GROUP: tl.constexpr,
-    D: tl.constexpr, MAX_SPLIT: tl.constexpr,
-    MAX_TASKS: tl.constexpr, NUM_CTAS: tl.constexpr,
-    SO_SB: tl.constexpr, SO_SC: tl.constexpr, SO_SH: tl.constexpr,
-    SL_SB: tl.constexpr, SL_SC: tl.constexpr,
-    SL_SK: tl.constexpr, SL_SH: tl.constexpr,
-    O_SB: tl.constexpr, O_SH: tl.constexpr,
+    SPLIT_OUT,
+    SPLIT_LSE,
+    TASK_MAP,
+    OUT,
+    H_Q: tl.constexpr,
+    HEADS_PER_GROUP: tl.constexpr,
+    D: tl.constexpr,
+    MAX_SPLIT: tl.constexpr,
+    MAX_TASKS: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+    SO_SB: tl.constexpr,
+    SO_SC: tl.constexpr,
+    SO_SH: tl.constexpr,
+    SL_SB: tl.constexpr,
+    SL_SC: tl.constexpr,
+    SL_SK: tl.constexpr,
+    SL_SH: tl.constexpr,
+    O_SB: tl.constexpr,
+    O_SH: tl.constexpr,
 ):
     batch = tl.program_id(0)
     hq = tl.program_id(1)
@@ -300,8 +358,7 @@ def _pure_triton_splitk_combine_kernel(
     chunk = 0
     while chunk < n_chunks:
         value = tl.load(
-            SPLIT_LSE + batch * SL_SB + chunk * SL_SC
-            + hkv * SL_SK + h_in_group * SL_SH,
+            SPLIT_LSE + batch * SL_SB + chunk * SL_SC + hkv * SL_SK + h_in_group * SL_SH,
         )
         max_lse = tl.maximum(max_lse, value)
         chunk += 1
@@ -311,13 +368,11 @@ def _pure_triton_splitk_combine_kernel(
     chunk = 0
     while chunk < n_chunks:
         value = tl.load(
-            SPLIT_LSE + batch * SL_SB + chunk * SL_SC
-            + hkv * SL_SK + h_in_group * SL_SH,
+            SPLIT_LSE + batch * SL_SB + chunk * SL_SC + hkv * SL_SK + h_in_group * SL_SH,
         )
         weight = tl.exp(value - safe_max)
         partial = tl.load(
-            SPLIT_OUT + batch * SO_SB + chunk * SO_SC
-            + hq * SO_SH + offs_d,
+            SPLIT_OUT + batch * SO_SB + chunk * SO_SC + hq * SO_SH + offs_d,
         )
         out += weight * partial
         denom += weight
@@ -331,9 +386,7 @@ def _pure_triton_splitk_combine_kernel(
 
 def prepare_pure_triton_mtp1_workspace(inputs, quant_type: str) -> PureTritonMTP1Workspace:
     if inputs.mtp != 1:
-        raise NotImplementedError(
-            "the no-TLE fallback intentionally supports MTP=1 only"
-        )
+        raise NotImplementedError("the no-TLE fallback intentionally supports MTP=1 only")
     if inputs.q.ndim != 3 or inputs.q.shape[-1] != 128:
         raise ValueError("q must have shape [batch, Hq, 128] for MTP=1")
     if inputs.k_cache.ndim != 4 or inputs.v_cache.ndim != 4:
@@ -352,7 +405,8 @@ def prepare_pure_triton_mtp1_workspace(inputs, quant_type: str) -> PureTritonMTP
         if any(t.dtype != torch.bfloat16 for t in (inputs.q, inputs.k_cache, inputs.v_cache)):
             raise ValueError("BF16 fallback requires BF16 Q/K/V")
     elif quant_type not in {
-        "qkpertoken_perhead_vperhead", "qpertoken_perhead_kvpertensor",
+        "qkpertoken_perhead_vperhead",
+        "qpertoken_perhead_kvpertensor",
     }:
         raise ValueError(f"unsupported fallback quantization: {quant_type}")
     elif any(t.element_size() != 1 for t in (inputs.q, inputs.k_cache, inputs.v_cache)):
@@ -373,15 +427,20 @@ def prepare_pure_triton_mtp1_workspace(inputs, quant_type: str) -> PureTritonMTP
         min_process_len=min_process_len,
     )
     task_map = torch.full(
-        (workspace_ints,), -1, dtype=torch.int32, device=inputs.q.device,
+        (workspace_ints,),
+        -1,
+        dtype=torch.int32,
+        device=inputs.q.device,
     )
     split_out = torch.empty(
         (inputs.batch, num_ctas, hq, inputs.q.shape[-1]),
-        dtype=torch.float32, device=inputs.q.device,
+        dtype=torch.float32,
+        device=inputs.q.device,
     )
     split_lse = torch.empty(
         (inputs.batch, num_ctas, hkv, padded_heads),
-        dtype=torch.float32, device=inputs.q.device,
+        dtype=torch.float32,
+        device=inputs.q.device,
     )
     return PureTritonMTP1Workspace(
         task_map=task_map,
@@ -398,11 +457,49 @@ def prepare_pure_triton_mtp1_workspace(inputs, quant_type: str) -> PureTritonMTP
     )
 
 
+def _pure_triton_mtp1_inputs(inputs, query_index: int):
+    """View one MTP query as an independent MTP=1 workload."""
+    batch = inputs.batch
+    mtp = inputs.mtp
+    q = inputs.q.reshape(batch, mtp, *inputs.q.shape[1:])[:, query_index]
+    effective_kv_lens = inputs.kv_lens - (mtp - 1 - query_index)
+    fields = {"q": q, "kv_lens": effective_kv_lens}
+    q_scale = getattr(inputs, "q_scale", None)
+    if q_scale is not None:
+        fields["q_scale"] = q_scale.reshape(batch, mtp, -1)[:, query_index]
+    return replace(inputs, **fields)
+
+
+def prepare_pure_triton_mtp_workspace(inputs, quant_type: str) -> PureTritonMTPWorkspace:
+    """Prepare MTP=2/4 by reusing the existing MTP=1 Triton path."""
+    if inputs.mtp < 2:
+        raise ValueError("the MTP workspace requires MTP >= 2")
+    workspaces = tuple(
+        prepare_pure_triton_mtp1_workspace(
+            _pure_triton_mtp1_inputs(inputs, query_index),
+            quant_type,
+        )
+        for query_index in range(inputs.mtp)
+    )
+    return PureTritonMTPWorkspace(workspaces=workspaces)
+
+
+def attention_decode_pure_triton_mtp(
+    inputs,
+    workspace: PureTritonMTPWorkspace,
+):
+    """Run each MTP query through the existing MTP=1 Triton implementation."""
+    outputs = []
+    for query_index, mtp1_workspace in enumerate(workspace.workspaces):
+        mtp1_inputs = _pure_triton_mtp1_inputs(inputs, query_index)
+        output = attention_decode_pure_triton_mtp1(mtp1_inputs, mtp1_workspace)
+        outputs.append(output.unsqueeze(1))
+    return torch.cat(outputs, dim=1).reshape_as(inputs.q).to(torch.bfloat16)
+
+
 def attention_decode_pure_triton_mtp1(inputs, workspace: PureTritonMTP1Workspace):
     if inputs.mtp != 1:
-        raise NotImplementedError(
-            "the no-TLE fallback intentionally supports MTP=1 only"
-        )
+        raise NotImplementedError("the no-TLE fallback intentionally supports MTP=1 only")
     batch = inputs.batch
     hq = int(inputs.q.shape[1])
     hkv = int(inputs.k_cache.shape[2])
@@ -420,15 +517,24 @@ def attention_decode_pure_triton_mtp1(inputs, workspace: PureTritonMTP1Workspace
         sched_ints=workspace.sched_ints,
     )
     common = dict(
-        H_Q=hq, HEADS_PER_GROUP=workspace.heads_per_group,
-        GROUP_M=8, D=inputs.q.shape[-1], BLOCK_SIZE=64,
+        H_Q=hq,
+        HEADS_PER_GROUP=workspace.heads_per_group,
+        GROUP_M=8,
+        D=inputs.q.shape[-1],
+        BLOCK_SIZE=64,
         MAX_BLOCKS=inputs.block_ids.shape[1],
-        MAX_TASKS=workspace.max_tasks, BLOCK_N=64,
-        Q_SB=inputs.q.stride(0), Q_SH=inputs.q.stride(1),
-        K_SBLOCK=inputs.k_cache.stride(0), K_STOKEN=inputs.k_cache.stride(1),
-        K_SHEAD=inputs.k_cache.stride(2), K_SD=inputs.k_cache.stride(3),
-        V_SBLOCK=inputs.v_cache.stride(0), V_STOKEN=inputs.v_cache.stride(1),
-        V_SHEAD=inputs.v_cache.stride(2), V_SD=inputs.v_cache.stride(3),
+        MAX_TASKS=workspace.max_tasks,
+        BLOCK_N=64,
+        Q_SB=inputs.q.stride(0),
+        Q_SH=inputs.q.stride(1),
+        K_SBLOCK=inputs.k_cache.stride(0),
+        K_STOKEN=inputs.k_cache.stride(1),
+        K_SHEAD=inputs.k_cache.stride(2),
+        K_SD=inputs.k_cache.stride(3),
+        V_SBLOCK=inputs.v_cache.stride(0),
+        V_STOKEN=inputs.v_cache.stride(1),
+        V_SHEAD=inputs.v_cache.stride(2),
+        V_SD=inputs.v_cache.stride(3),
         SO_SB=workspace.split_out.stride(0),
         SO_SC=workspace.split_out.stride(1),
         SO_SH=workspace.split_out.stride(2),
@@ -436,7 +542,8 @@ def attention_decode_pure_triton_mtp1(inputs, workspace: PureTritonMTP1Workspace
         SL_SC=workspace.split_lse.stride(1),
         SL_SK=workspace.split_lse.stride(2),
         SL_SH=workspace.split_lse.stride(3),
-        num_warps=4, num_stages=3,
+        num_warps=4,
+        num_stages=3,
     )
     grid = (
         workspace.num_ctas,
@@ -444,19 +551,31 @@ def attention_decode_pure_triton_mtp1(inputs, workspace: PureTritonMTP1Workspace
     )
     if workspace.quant_type == "bf16":
         _pure_triton_bf16_gqa8_splitk_kernel[grid](
-            inputs.q, inputs.k_cache, inputs.v_cache,
-            inputs.block_ids, workspace.task_map,
-            workspace.split_out, workspace.split_lse, **common,
+            inputs.q,
+            inputs.k_cache,
+            inputs.v_cache,
+            inputs.block_ids,
+            workspace.task_map,
+            workspace.split_out,
+            workspace.split_lse,
+            **common,
         )
     else:
         quant_type = 0 if workspace.quant_type == "qkpertoken_perhead_vperhead" else 1
         _pure_triton_fp8_gqa8_splitk_kernel[grid](
-            inputs.q, inputs.k_cache, inputs.v_cache,
-            inputs.block_ids, workspace.task_map,
-            inputs.q_scale, inputs.k_scale, inputs.v_scale,
-            workspace.split_out, workspace.split_lse,
+            inputs.q,
+            inputs.k_cache,
+            inputs.v_cache,
+            inputs.block_ids,
+            workspace.task_map,
+            inputs.q_scale,
+            inputs.k_scale,
+            inputs.v_scale,
+            workspace.split_out,
+            workspace.split_lse,
             QUANT_TYPE=quant_type,
-            QS_SB=inputs.q_scale.stride(0), QS_SH=inputs.q_scale.stride(1),
+            QS_SB=inputs.q_scale.stride(0),
+            QS_SH=inputs.q_scale.stride(1),
             KS_SBLOCK=inputs.k_scale.stride(0),
             KS_STOKEN=inputs.k_scale.stride(1) if inputs.k_scale.ndim > 1 else 0,
             KS_SHEAD=inputs.k_scale.stride(2) if inputs.k_scale.ndim > 2 else 0,
@@ -464,11 +583,16 @@ def attention_decode_pure_triton_mtp1(inputs, workspace: PureTritonMTP1Workspace
             **common,
         )
     _pure_triton_splitk_combine_kernel[(batch, hq)](
-        workspace.split_out, workspace.split_lse,
-        workspace.task_map, workspace.out,
-        H_Q=hq, HEADS_PER_GROUP=workspace.heads_per_group,
-        D=inputs.q.shape[-1], MAX_SPLIT=workspace.num_ctas,
-        MAX_TASKS=workspace.max_tasks, NUM_CTAS=workspace.num_ctas,
+        workspace.split_out,
+        workspace.split_lse,
+        workspace.task_map,
+        workspace.out,
+        H_Q=hq,
+        HEADS_PER_GROUP=workspace.heads_per_group,
+        D=inputs.q.shape[-1],
+        MAX_SPLIT=workspace.num_ctas,
+        MAX_TASKS=workspace.max_tasks,
+        NUM_CTAS=workspace.num_ctas,
         SO_SB=workspace.split_out.stride(0),
         SO_SC=workspace.split_out.stride(1),
         SO_SH=workspace.split_out.stride(2),
@@ -476,8 +600,10 @@ def attention_decode_pure_triton_mtp1(inputs, workspace: PureTritonMTP1Workspace
         SL_SC=workspace.split_lse.stride(1),
         SL_SK=workspace.split_lse.stride(2),
         SL_SH=workspace.split_lse.stride(3),
-        O_SB=workspace.out.stride(0), O_SH=workspace.out.stride(1),
-        num_warps=4, num_stages=1,
+        O_SB=workspace.out.stride(0),
+        O_SH=workspace.out.stride(1),
+        num_warps=4,
+        num_stages=1,
     )
     return workspace.out
 
@@ -558,7 +684,15 @@ class DecodeWorkload:
 
 
 __all__ = [
-    "DecodeWorkload", "HAS_TLE", "USE_TLE", "PureTritonMTP1Workspace",
-    "attention_decode_pure_triton_mtp1", "prepare_pure_triton_mtp1_workspace",
-    "gpu_types", "tle",
+    "DecodeWorkload",
+    "HAS_TLE",
+    "USE_TLE",
+    "PureTritonMTP1Workspace",
+    "PureTritonMTPWorkspace",
+    "attention_decode_pure_triton_mtp",
+    "attention_decode_pure_triton_mtp1",
+    "prepare_pure_triton_mtp_workspace",
+    "prepare_pure_triton_mtp1_workspace",
+    "gpu_types",
+    "tle",
 ]

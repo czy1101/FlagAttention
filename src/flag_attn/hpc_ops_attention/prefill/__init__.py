@@ -15,7 +15,6 @@
 """HPC attention operators for the prefill phase."""
 
 from .attention_blocksparse_prefill_fp8 import (
-    HopperBSAUnavailableError,
     attention_with_kvcache_blocksparse_prefill_fp8,
     attention_with_kvcache_blocksparse_prefill_fp8_hopper,
     attention_with_kvcache_blocksparse_prefill_fp8_tle,
@@ -23,7 +22,6 @@ from .attention_blocksparse_prefill_fp8 import (
 )
 
 __all__ = [
-    "HopperBSAUnavailableError",
     "attention_with_kvcache_blocksparse_prefill_fp8",
     "attention_with_kvcache_blocksparse_prefill_fp8_hopper",
     "attention_with_kvcache_blocksparse_prefill_fp8_tle",

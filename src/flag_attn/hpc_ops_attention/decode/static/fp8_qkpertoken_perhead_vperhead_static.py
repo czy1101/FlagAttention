@@ -13,14 +13,32 @@
 # limitations under the License.
 
 """Self-contained Hopper attention-decode implementation."""
+
 from __future__ import annotations
-from .. import (DecodeWorkload, PureTritonMTP1Workspace, USE_TLE,
-    attention_decode_pure_triton_mtp1, prepare_pure_triton_mtp1_workspace,
-    gpu_types, tle)
+
+from triton.language import core as tl_core
+from triton.language.core import builtin
+from typing import Literal
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+
+from .. import (
+    DecodeWorkload,
+    PureTritonMTPWorkspace,
+    PureTritonMTP1Workspace,
+    USE_TLE,
+    attention_decode_pure_triton_mtp,
+    attention_decode_pure_triton_mtp1,
+    prepare_pure_triton_mtp_workspace,
+    prepare_pure_triton_mtp1_workspace,
+    gpu_types,
+    tle,
+)
 from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
+
 
 @dataclass
 class _scheduler_mtp24__DecodeTaskSchedule:
@@ -44,8 +62,8 @@ class _scheduler_mtp24__DecodeTaskSchedule:
     sched_ints: int = 0
     partial_slots: int = 0
     stats: dict | None = None
-from triton.language import core as tl_core
-from triton.language.core import builtin
+
+
 _compute_mtp1__NUM_SEQ_Q = 1
 _compute_mtp1__ROWS_Q = 8
 _compute_mtp1__DIRECT_MODE = 0
@@ -60,6 +78,7 @@ _compute_mtp1___GROUP_MODE_JIT = tl.constexpr(_compute_mtp1__GROUP_MODE)
 _compute_mtp1___K_FRAGMENT_JIT = tl.constexpr(32)
 _compute_mtp1___EXECUTION_FULL_JIT = tl.constexpr(_compute_mtp1__EXECUTION_FULL)
 _compute_mtp1___EXECUTION_LOCAL_PARTIAL_JIT = tl.constexpr(_compute_mtp1__EXECUTION_LOCAL_PARTIAL)
+
 
 @triton.jit
 def _compute_mtp1___load_packed_k_scale_mtp1(KSCALE, phys, hkv, offs_n, KS_STRIDE_BLOCK: tl.constexpr, KS_STRIDE_TOKEN: tl.constexpr, KS_STRIDE_HEAD: tl.constexpr, KS_STRIDE_D: tl.constexpr):
@@ -239,7 +258,6 @@ def _compute_mtp1__fp8_kvpertensor_decode_mtp1_final_kernel(Q, K_DESC, KS_DESC, 
     p_smem = tle.gpu.alloc([_compute_mtp1___ROWS_Q_JIT, BLOCK_N], dtype=tl.float8e4nv, layout=None, scope=tle.gpu.smem)
     k_raw_smem = tle.gpu.alloc([_compute_mtp1___TMA_STAGES_JIT, BLOCK_N, D], dtype=tl.float8e4nv, layout=None, scope=tle.gpu.smem)
     v_raw_smem = tle.gpu.alloc([_compute_mtp1___TMA_STAGES_JIT, BLOCK_N, DV], dtype=tl.float8e4nv, layout=None, scope=tle.gpu.smem)
-    v_dn_smem = v_raw_smem
     k_full = tle.gpu.alloc_barriers(num_barriers=_compute_mtp1___TMA_STAGES_JIT, arrive_count=1, expect_bytes=BLOCK_N * D)
     vt_full = tle.gpu.alloc_barriers(num_barriers=_compute_mtp1___TMA_STAGES_JIT, arrive_count=1, expect_bytes=DV * BLOCK_N)
     if TMA_K_SCALE:
@@ -288,7 +306,6 @@ def _compute_mtp1__fp8_kvpertensor_decode_mtp1_final_kernel(Q, K_DESC, KS_DESC, 
     seq_m = offs_q // HEADS_PER_GROUP
     h_in_group = offs_q - seq_m * HEADS_PER_GROUP
     inv_sqrt_d = tl.rsqrt(tl.full((), D, tl.float32))
-    kscale = tl.load(KSCALE + 0).to(tl.float32)
     vscale = tl.load(VSCALE + hkv).to(tl.float32) / 256.0
     hq = hkv * HEADS_PER_GROUP + h_in_group
     valid_q = has_work & (seq_m < _compute_mtp1___NUM_SEQ_Q_JIT) & (h_in_group < HEADS_PER_GROUP) & (hq < H_Q)
@@ -957,7 +974,6 @@ def _compute_mtp2__fp8_kvpertensor_decode_mtp2_final_kernel(Q, K_DESC, KS_DESC, 
     seq_m = offs_q // HEADS_PER_GROUP
     h_in_group = offs_q - seq_m * HEADS_PER_GROUP
     inv_sqrt_d = tl.rsqrt(tl.full((), D, tl.float32))
-    kscale = tl.load(KSCALE + 0).to(tl.float32)
     vscale = tl.load(VSCALE + hkv).to(tl.float32) / 256.0
     hq = hkv * HEADS_PER_GROUP + h_in_group
     valid_q = has_work & (seq_m < _compute_mtp2___NUM_SEQ_Q_JIT) & (h_in_group < HEADS_PER_GROUP) & (hq < H_Q)
@@ -1103,9 +1119,6 @@ def _compute_mtp2__fp8_kvpertensor_decode_mtp2_final_kernel(Q, K_DESC, KS_DESC, 
         return
     group_acc = acc
     group_lse = lse
-    group_raw_acc = acc
-    group_raw_m = lse
-    group_raw_l = raw_l
     if MERGE_CLUSTER_SIZE == 2:
         peer_acc_remote = tle.remote(peer_acc_smem, 0, scope=mesh)
         peer_lse_remote = tle.remote(peer_lse_smem, 0, scope=mesh)
@@ -1241,9 +1254,6 @@ def _compute_mtp2__fp8_kvpertensor_decode_mtp2_final_kernel(Q, K_DESC, KS_DESC, 
             else:
                 peer_acc = tl.load(tle.gpu.local_ptr(peer3_acc_smem, (acc_rows, acc_cols))).to(tl.float32)
             weighted_acc += peer_acc * weight3[None, :]
-            group_raw_acc = weighted_acc
-            group_raw_m = safe_max
-            group_raw_l = denom
             group_acc = weighted_acc / safe_denom[None, :]
             if DEFERRED_NORM:
                 group_acc *= vscale
@@ -1860,7 +1870,6 @@ def _compute_mtp4__fp8_kvpertensor_decode_mtp4_direct_kernel(Q, K_DESC, VT_DESC,
     tl.store(q_smem_ptr, q)
     qscale = tl.load(QSCALE + batch * QS_STRIDE_B + seq_m * QS_STRIDE_M + hq * QS_STRIDE_H, mask=valid_q, other=1.0).to(tl.float32)
     inv_sqrt_d = tl.rsqrt(tl.full((), D, tl.float32))
-    kscale = tl.load(KSCALE).to(tl.float32)
     vscale = tl.load(VSCALE + hkv).to(tl.float32) / 256.0
     m_i = tl.full((ROWS_Q,), -float('inf'), tl.float32)
     l_i = tl.zeros((ROWS_Q,), tl.float32)
@@ -1945,9 +1954,7 @@ def _compute_mtp4___fp8_kvpertensor_decode_mtp4_pure_tle_task(Q, K_DESC, VT_DESC
     SHARED_K_SCALE_PIPELINE: tl.constexpr = PREFETCH_K_SCALE == 3 and (not TMA_K_SCALE)
     WGMMA_SHADOW_K_SCALE: tl.constexpr = PREFETCH_K_SCALE == 4 and (not TMA_K_SCALE)
     PAGE_METADATA_K_SCALE: tl.constexpr = PREFETCH_K_SCALE == 5 and (not TMA_K_SCALE)
-    DETERMINISTIC_FIRST_OWNER: tl.constexpr = C4_FINALIZER_TILE == 702
     REGISTER_RAW_WEIGHTS: tl.constexpr = C4_FINALIZER_TILE == 704
-    DISTRIBUTED_READY_FLAGS: tl.constexpr = C4_FINALIZER_TILE == 705
     TAIL_RAW_DSM_REUSE: tl.constexpr = C4_FINALIZER_TILE == 706
     HEAD_MAJOR_RAW_REDUCE: tl.constexpr = C4_FINALIZER_TILE == 707
     C8_BF16_DEFERRED_NORM: tl.constexpr = C4_FINALIZER_TILE >= 800 and C4_FINALIZER_TILE < 900
@@ -2092,7 +2099,6 @@ def _compute_mtp4___fp8_kvpertensor_decode_mtp4_pure_tle_task(Q, K_DESC, VT_DESC
     seq_m = offs_q // HEADS_PER_GROUP
     h_in_group = offs_q - seq_m * HEADS_PER_GROUP
     inv_sqrt_d = tl.rsqrt(tl.full((), D, tl.float32))
-    kscale = tl.load(KSCALE + 0).to(tl.float32)
     vscale = tl.load(VSCALE + hkv).to(tl.float32) / 256.0
     hq = hkv * HEADS_PER_GROUP + h_in_group
     valid_q = has_work & (seq_m < _compute_mtp4___NUM_SEQ_Q_JIT) & (h_in_group < HEADS_PER_GROUP) & (hq < H_Q)
@@ -2606,7 +2612,6 @@ def _compute_mtp4___fp8_kvpertensor_decode_mtp4_pure_tle_task(Q, K_DESC, VT_DESC
     if (EXECUTION_STAGE == _compute_mtp4___EXECUTION_FULL_JIT or EXECUTION_STAGE == _compute_mtp4___EXECUTION_ELECTION_ONLY_JIT) and (C4_REDUCTION_ONLY_RAW or group_count > 1):
         counter_idx = hkv * B + batch
         num_counters = B * (H_Q // HEADS_PER_GROUP)
-        ready_counter_idx = num_counters + counter_idx * MAX_FINAL_CHUNKS
         rank0_is_last = tl.full((), 0, tl.int32)
         if cluster_rank == 0:
             tl.debug_barrier()
@@ -2756,8 +2761,6 @@ def _finalize_mtp4__fp8_kvpertensor_decode_mtp4_detached_raw_finalize_kernel(KV_
         partial = tl.load(SPLIT_OUT + batch * SO_STRIDE_B + chunk * SO_STRIDE_C + seq_m * SO_STRIDE_M + hq[:, None] * SO_STRIDE_H + offs_d[None, :], mask=chunk_valid[:, None], other=0.0).to(tl.float32)
         acc += partial * chunk_weight[:, None]
     tl.store(OUT + batch * O_STRIDE_B + seq_m * O_STRIDE_M + hq[:, None] * O_STRIDE_H + offs_d[None, :], acc, mask=valid_head[:, None] & (denom[:, None] > 0.0))
-from typing import Literal
-from triton.tools.tensor_descriptor import TensorDescriptor
 _runtime__BLOCK_SIZE = 64
 _runtime__TILE_N = 64
 _runtime_mtp1__NUM_SEQ_Q = 1
@@ -2796,30 +2799,36 @@ _runtime__CLUSTER_MESHES = ({2: tle.device_mesh({'block_cluster': [('cluster_x',
 
 def _runtime__validate_inputs(inputs, num_seq_q: int) -> tuple[int, int, int]:
     if not inputs.kv_lens.is_cuda:
-        raise ValueError('kv_lens must be a CUDA tensor for GPU task scheduling')
+        raise ValueError("kv_lens must be a CUDA tensor for GPU task scheduling")
     if inputs.q.ndim != 3 or inputs.q.shape[-1] != _runtime__HEAD_DIM:
-        raise ValueError('q must have flattened shape [batch * MTP, num_head_q, 128]')
+        raise ValueError("q must have flattened shape [batch * MTP, num_head_q, 128]")
     if inputs.q.shape[0] != inputs.num_batch * num_seq_q:
-        raise ValueError(f'MTP={num_seq_q} requires q.shape[0] == batch * {num_seq_q}')
-    for name, cache in (('k_cache', inputs.k_cache), ('v_cache', inputs.v_cache)):
+        raise ValueError(f"MTP={num_seq_q} requires q.shape[0] == batch * {num_seq_q}")
+    for name, cache in (("k_cache", inputs.k_cache), ("v_cache", inputs.v_cache)):
         if cache.ndim != 4 or cache.shape[1] != _runtime__BLOCK_SIZE or cache.shape[3] != _runtime__HEAD_DIM:
-            raise ValueError(f'{name} must be logical [block, 64, head, 128]')
+            raise ValueError(f"{name} must be logical [block, 64, head, 128]")
         if cache.stride(3) != 1:
-            raise ValueError(f'{name} head dimension must be contiguous')
+            raise ValueError(f"{name} head dimension must be contiguous")
     num_head_q = int(inputs.q.shape[1])
     num_head_kv = int(inputs.k_cache.shape[2])
     if num_head_q % num_head_kv:
-        raise ValueError('num_head_q must be divisible by num_head_kv')
+        raise ValueError("num_head_q must be divisible by num_head_kv")
     heads_per_group = num_head_q // num_head_kv
     if heads_per_group > 8:
-        raise ValueError('heads_per_group must be <= 8')
+        raise ValueError("heads_per_group must be <= 8")
     return (num_head_q, num_head_kv, heads_per_group)
+
 
 def _runtime__make_paged_kv_descriptors(inputs, num_seq_q: int) -> tuple[TensorDescriptor, TensorDescriptor]:
     """Project NHD/HND paged descriptors to logical [block, head, token, dim] tiles."""
     _runtime__validate_inputs(inputs, num_seq_q)
     block_shape = [1, 1, _runtime__TILE_N, _runtime__HEAD_DIM]
-    return (TensorDescriptor.from_tensor(inputs.k_cache.permute(0, 2, 1, 3), block_shape=block_shape), TensorDescriptor.from_tensor(inputs.v_cache.permute(0, 2, 1, 3), block_shape=block_shape))
+    return (
+        TensorDescriptor.from_tensor(inputs.k_cache.permute(0, 2, 1, 3), block_shape=block_shape),
+        TensorDescriptor.from_tensor(inputs.v_cache.permute(0, 2, 1, 3), block_shape=block_shape),
+    )
+
+
 _runtime_mtp2__NUM_SEQ_Q = 2
 
 _runtime_mtp2__DecodeConfig = _runtime_mtp1__DecodeConfig
@@ -2828,6 +2837,7 @@ _runtime_mtp2__DecodeInputs = _runtime_mtp1__DecodeInputs
 
 
 _runtime_mtp4__NUM_SEQ_Q = 4
+
 
 @dataclass(frozen=True)
 class _runtime_mtp4__DecodeConfig:
@@ -2838,21 +2848,24 @@ class _runtime_mtp4__DecodeConfig:
 
     def __post_init__(self) -> None:
         if self.cluster_size not in (2, 4, 8):
-            raise ValueError('runtime policy supports cluster_size 2, 4, or 8')
+            raise ValueError("runtime policy supports cluster_size 2, 4, or 8")
         if self.chunk_tokens < _runtime__TILE_N or self.chunk_tokens > 4096 or self.chunk_tokens % _runtime__TILE_N:
-            raise ValueError('MTP=4 chunk_tokens must be a multiple of 64 in [64, 4096]')
+            raise ValueError("MTP=4 chunk_tokens must be a multiple of 64 in [64, 4096]")
         if self.direct_threshold < 0 or self.direct_threshold % _runtime__TILE_N:
-            raise ValueError('direct_threshold must be zero or a multiple of 64')
+            raise ValueError("direct_threshold must be zero or a multiple of 64")
         if self.subgroup2_threshold < 0 or self.subgroup2_threshold % _runtime__TILE_N:
-            raise ValueError('subgroup2_threshold must be zero or a multiple of 64')
+            raise ValueError("subgroup2_threshold must be zero or a multiple of 64")
         if self.subgroup2_threshold and self.cluster_size != 4:
-            raise ValueError('dual-C2 subgroup packing requires cluster_size=4')
+            raise ValueError("dual-C2 subgroup packing requires cluster_size=4")
+
+
 _runtime_mtp4__C2_T256 = _runtime_mtp4__DecodeConfig(2, 256)
 _runtime_mtp4__C2_T1024 = _runtime_mtp4__DecodeConfig(2, 1024)
 _runtime_mtp4__C4_T512 = _runtime_mtp4__DecodeConfig(4, 512)
 _runtime_mtp4__C4_T1024 = _runtime_mtp4__DecodeConfig(4, 1024)
 
 _runtime_mtp4__DecodeInputs = _runtime_mtp1__DecodeInputs
+
 
 @dataclass
 class _runtime_mtp4__DecodeWorkspace:
@@ -2867,7 +2880,7 @@ class _runtime_mtp4__DecodeWorkspace:
     out: torch.Tensor
     heads_per_group: int
     all_chunks_aligned: bool = False
-    final_policy_mode: str = 'winner'
+    final_policy_mode: str = "winner"
     static_sched: bool = False
     static_chunk_tokens: int = 0
     static_max_groups: int = 1
@@ -2877,87 +2890,140 @@ class _runtime_mtp4__DecodeWorkspace:
         return dict(self.schedule.stats)
 
 
-
-def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace | None, *, execution_stage: Literal['full', 'cluster', 'local', 'election'], paired_head_finalize: bool | None, direct_fast_path: bool, quad_head_two_chunk_finalize: bool, fast_finalizer_handoff: bool, rank0_only_finalizer: bool, skip_trailing_finalizer_barrier: bool, maxnreg: int | None, c4_bf16_dsm: bool, c4_deferred_norm: bool, c4_global_deferred_norm: bool, c4_reduction_only_raw: bool, c4_aligned_full_chunk_raw: bool, c2_aligned_full_chunk_winner: bool, full_view_v_rs: bool, pdl_notify: bool, prefetch_k_scale: bool, page_metadata_k_scale: bool, tma_k_scale: bool, precombine_q_scale: bool, flatten_output: bool) -> torch.Tensor:
+def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(
+    inputs: _runtime_mtp4__DecodeInputs,
+    workspace: _runtime_mtp4__DecodeWorkspace | None,
+    *,
+    execution_stage: Literal["full", "cluster", "local", "election"],
+    paired_head_finalize: bool | None,
+    direct_fast_path: bool,
+    quad_head_two_chunk_finalize: bool,
+    fast_finalizer_handoff: bool,
+    rank0_only_finalizer: bool,
+    skip_trailing_finalizer_barrier: bool,
+    maxnreg: int | None,
+    c4_bf16_dsm: bool,
+    c4_deferred_norm: bool,
+    c4_global_deferred_norm: bool,
+    c4_reduction_only_raw: bool,
+    c4_aligned_full_chunk_raw: bool,
+    c2_aligned_full_chunk_winner: bool,
+    full_view_v_rs: bool,
+    pdl_notify: bool,
+    prefetch_k_scale: bool,
+    page_metadata_k_scale: bool,
+    tma_k_scale: bool,
+    precombine_q_scale: bool,
+    flatten_output: bool,
+) -> torch.Tensor:
     """Run the independent public-TLE MTP=4 n32 typed-RS policy."""
     if workspace is None:
-        raise ValueError('MTP=4 requires an explicitly configured workspace')
+        raise ValueError("MTP=4 requires an explicitly configured workspace")
     if inputs.k_scale.ndim != 4 or inputs.v_scale.numel() < inputs.k_cache.shape[2]:
-        raise ValueError('quant_type=0 requires packed rank-4 K scales and one V scale per KV head')
+        raise ValueError("quant_type=0 requires packed rank-4 K scales and one V scale per KV head")
     scalar_k_scale_prefetch = prefetch_k_scale and (not tma_k_scale)
-    if sum((bool(value) for value in (scalar_k_scale_prefetch, False, False, False, page_metadata_k_scale, tma_k_scale))) > 1:
-        raise ValueError('K-scale prefetch, lookahead, shared pipeline, WGMMA shadow load, page-metadata pipeline and TMA are exclusive')
+    if (
+        sum(
+            (
+                bool(value)
+                for value in (scalar_k_scale_prefetch, False, False, False, page_metadata_k_scale, tma_k_scale)
+            )
+        )
+        > 1
+    ):
+        raise ValueError(
+            "K-scale prefetch, lookahead, shared pipeline, WGMMA shadow load, page-metadata pipeline and TMA are exclusive"
+        )
     ks = inputs.k_scale.stride()
-    stage_map = {'full': _compute_mtp4__EXECUTION_FULL, 'cluster': _compute_mtp4__EXECUTION_CLUSTER_PARTIAL, 'local': _compute_mtp4__EXECUTION_LOCAL_PARTIAL, 'election': _compute_mtp4__EXECUTION_ELECTION_ONLY}
+    stage_map = {
+        "full": _compute_mtp4__EXECUTION_FULL,
+        "cluster": _compute_mtp4__EXECUTION_CLUSTER_PARTIAL,
+        "local": _compute_mtp4__EXECUTION_LOCAL_PARTIAL,
+        "election": _compute_mtp4__EXECUTION_ELECTION_ONLY,
+    }
     if execution_stage not in stage_map:
         raise ValueError("execution_stage must be 'full', 'cluster', 'local', or 'election'")
     if maxnreg is not None and (not 32 <= maxnreg <= 255):
-        raise ValueError('maxnreg must be in [32, 255] or None')
+        raise ValueError("maxnreg must be in [32, 255] or None")
     if c4_deferred_norm and (not c4_bf16_dsm):
-        raise ValueError('C4 deferred normalization requires BF16 DSM')
+        raise ValueError("C4 deferred normalization requires BF16 DSM")
     if c4_global_deferred_norm and (not c4_deferred_norm):
-        raise ValueError('C4 global deferred normalization requires DSM deferred normalization')
+        raise ValueError("C4 global deferred normalization requires DSM deferred normalization")
     if c4_reduction_only_raw:
         if workspace.config not in (_runtime_mtp4__C4_T512, _runtime_mtp4__C4_T1024):
-            raise ValueError('reduction-only raw specialization requires C4T512/C4T1024')
-        if any((int(workspace.stats.get(name, 0)) for name in ('direct_tasks', 'dummy_tasks'))) or workspace.config.subgroup2_threshold:
-            raise ValueError('reduction-only raw specialization requires grouped real tasks only')
+            raise ValueError("reduction-only raw specialization requires C4T512/C4T1024")
+        if (
+            any((int(workspace.stats.get(name, 0)) for name in ("direct_tasks", "dummy_tasks")))
+            or workspace.config.subgroup2_threshold
+        ):
+            raise ValueError("reduction-only raw specialization requires grouped real tasks only")
         if c4_bf16_dsm or c4_deferred_norm or c4_global_deferred_norm:
-            raise ValueError('reduction-only raw mode internally selects the complete C4 raw ABI')
+            raise ValueError("reduction-only raw mode internally selects the complete C4 raw ABI")
     if c4_aligned_full_chunk_raw:
         if workspace.config == _runtime_mtp4__C4_T512 and (not c4_reduction_only_raw):
-            raise ValueError('C4T512 aligned full-chunk raw requires reduction-only mode')
+            raise ValueError("C4T512 aligned full-chunk raw requires reduction-only mode")
         if workspace.config == _runtime_mtp4__C4_T1024 and c4_reduction_only_raw:
-            raise ValueError('C4T1024 aligned full-chunk raw must retain single-group finalization')
+            raise ValueError("C4T1024 aligned full-chunk raw must retain single-group finalization")
         if workspace.config not in (_runtime_mtp4__C4_T512, _runtime_mtp4__C4_T1024):
-            raise ValueError('aligned full-chunk raw requires C4T512/C4T1024')
+            raise ValueError("aligned full-chunk raw requires C4T512/C4T1024")
         if not workspace.all_chunks_aligned:
-            raise ValueError('aligned full-chunk raw requires aligned KV lengths')
+            raise ValueError("aligned full-chunk raw requires aligned KV lengths")
     if c2_aligned_full_chunk_winner:
         if workspace.config not in (_runtime_mtp4__C2_T256, _runtime_mtp4__C2_T1024):
-            raise ValueError('aligned winner specialization requires C2T256/C2T1024')
+            raise ValueError("aligned winner specialization requires C2T256/C2T1024")
         if not workspace.all_chunks_aligned:
-            raise ValueError('aligned winner requires chunk-aligned KV lengths')
-        incompatible = {name: int(workspace.stats.get(name, 0)) for name in ('direct_tasks', 'dummy_tasks', 'subgroup2_tasks') if int(workspace.stats.get(name, 0))}
+            raise ValueError("aligned winner requires chunk-aligned KV lengths")
+        incompatible = {
+            name: int(workspace.stats.get(name, 0))
+            for name in ("direct_tasks", "dummy_tasks", "subgroup2_tasks")
+            if int(workspace.stats.get(name, 0))
+        }
         if incompatible:
-            raise ValueError(f'aligned winner requires grouped real tasks only: {incompatible}')
+            raise ValueError(f"aligned winner requires grouped real tasks only: {incompatible}")
         aligned_c2_raw = c4_bf16_dsm and c4_deferred_norm and (not c4_global_deferred_norm)
         if any((c4_reduction_only_raw, c4_aligned_full_chunk_raw, False)):
-            raise ValueError('aligned C2 compute cannot combine with C4/C8 raw modes')
+            raise ValueError("aligned C2 compute cannot combine with C4/C8 raw modes")
         if any((c4_bf16_dsm, c4_deferred_norm, c4_global_deferred_norm)) and (not aligned_c2_raw):
-            raise ValueError('aligned C2 raw compute requires BF16 DSM plus deferred norm')
+            raise ValueError("aligned C2 raw compute requires BF16 DSM plus deferred norm")
     if paired_head_finalize is None:
         paired_head_finalize = workspace.config.cluster_size == 4
     if paired_head_finalize and workspace.config.cluster_size not in (2, 4):
-        raise ValueError('paired_head_finalize requires cluster_size=2 or 4')
+        raise ValueError("paired_head_finalize requires cluster_size=2 or 4")
     if paired_head_finalize and workspace.heads_per_group != 8:
-        raise ValueError('paired_head_finalize requires heads_per_group=8')
+        raise ValueError("paired_head_finalize requires heads_per_group=8")
     if pdl_notify and direct_fast_path:
-        raise ValueError('PDL notification cannot be combined with direct_fast_path')
-    effective_chunks_max = int(workspace.stats.get('effective_chunks_max', 1))
+        raise ValueError("PDL notification cannot be combined with direct_fast_path")
+    effective_chunks_max = int(workspace.stats.get("effective_chunks_max", 1))
     if quad_head_two_chunk_finalize and effective_chunks_max != 2:
-        raise ValueError(f'quad_head_two_chunk_finalize requires effective_chunks_max == 2, got {effective_chunks_max}')
+        raise ValueError(f"quad_head_two_chunk_finalize requires effective_chunks_max == 2, got {effective_chunks_max}")
     if quad_head_two_chunk_finalize and workspace.config.cluster_size != 2:
-        raise ValueError('quad_head_two_chunk_finalize requires cluster_size=2')
+        raise ValueError("quad_head_two_chunk_finalize requires cluster_size=2")
     if quad_head_two_chunk_finalize and workspace.heads_per_group != 8:
-        raise ValueError('quad_head_two_chunk_finalize requires heads_per_group=8')
+        raise ValueError("quad_head_two_chunk_finalize requires heads_per_group=8")
     if quad_head_two_chunk_finalize and paired_head_finalize:
-        raise ValueError('select either exact-two or arbitrary-chunk c2 quad finalization')
+        raise ValueError("select either exact-two or arbitrary-chunk c2 quad finalization")
     c2_quad_finalizer = (quad_head_two_chunk_finalize or paired_head_finalize) and workspace.config.cluster_size == 2
     c4_paired_finalizer = paired_head_finalize and workspace.config.cluster_size == 4
     if c4_bf16_dsm and (not (c4_paired_finalizer or c2_quad_finalizer)):
-        raise ValueError('BF16 DSM requires either the C4 paired path or a C2 quad-head path')
+        raise ValueError("BF16 DSM requires either the C4 paired path or a C2 quad-head path")
     c8_rank_sharded_finalizer = not paired_head_finalize and workspace.config.cluster_size == 8
     if fast_finalizer_handoff and (not (c2_quad_finalizer or c4_paired_finalizer or c8_rank_sharded_finalizer)):
-        raise ValueError('fast_finalizer_handoff requires either the c2 quad-head path, the c4 paired-head path, or the c8 rank-sharded path')
+        raise ValueError(
+            "fast_finalizer_handoff requires either the c2 quad-head path, the c4 paired-head path, or the c8 rank-sharded path"
+        )
     if rank0_only_finalizer and (not c2_quad_finalizer):
-        raise ValueError('rank0_only_finalizer requires a c2 quad-head finalizer')
+        raise ValueError("rank0_only_finalizer requires a c2 quad-head finalizer")
     if rank0_only_finalizer and fast_finalizer_handoff:
-        raise ValueError('rank0_only_finalizer replaces rather than combines with fast_finalizer_handoff')
-    if skip_trailing_finalizer_barrier and (not (rank0_only_finalizer or (fast_finalizer_handoff and (c2_quad_finalizer or c4_paired_finalizer or c8_rank_sharded_finalizer)))):
-        raise ValueError('skip_trailing_finalizer_barrier requires either the c2 rank0-only path or a rank-sharded fast handoff path')
-    c2_winner_local_reuse = rank0_only_finalizer and skip_trailing_finalizer_barrier and quad_head_two_chunk_finalize
-    c4_raw_winner_local_reuse = c4_paired_finalizer and c4_global_deferred_norm and c4_bf16_dsm and fast_finalizer_handoff and skip_trailing_finalizer_barrier
+        raise ValueError("rank0_only_finalizer replaces rather than combines with fast_finalizer_handoff")
+    if skip_trailing_finalizer_barrier and (
+        not (
+            rank0_only_finalizer
+            or (fast_finalizer_handoff and (c2_quad_finalizer or c4_paired_finalizer or c8_rank_sharded_finalizer))
+        )
+    ):
+        raise ValueError(
+            "skip_trailing_finalizer_barrier requires either the c2 rank0-only path or a rank-sharded fast handoff path"
+        )
     k_desc, v_desc = _runtime__make_paged_kv_descriptors(inputs, _runtime_mtp4__NUM_SEQ_Q)
     if tma_k_scale:
         k_scale_f32 = inputs.k_scale.view(torch.float32)
@@ -2966,8 +3032,8 @@ def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(inputs: _runtime_mtp4__D
         ks_desc = k_desc
     ws = workspace
     num_head_q = int(inputs.q.shape[1])
-    reduction_clusters = int(ws.stats.get('reduction_clusters', ws.schedule.num_clusters))
-    direct_tasks = int(ws.stats.get('direct_tasks', 0))
+    reduction_clusters = int(ws.stats.get("reduction_clusters", ws.schedule.num_clusters))
+    direct_tasks = int(ws.stats.get("direct_tasks", 0))
     use_direct_fast = direct_fast_path and reduction_clusters == 0
     logical_clusters = 0 if use_direct_fast else ws.schedule.num_clusters
     launch_clusters = min(logical_clusters, logical_clusters)
@@ -2975,26 +3041,164 @@ def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(inputs: _runtime_mtp4__D
     def launch_direct() -> None:
         if not use_direct_fast or direct_tasks == 0:
             return
-        _compute_mtp4__fp8_kvpertensor_decode_mtp4_direct_kernel[direct_tasks,](ws.q_4d, k_desc, v_desc, inputs.block_ids, ws.schedule.task_map, ws.q_scale_3d, inputs.k_scale, inputs.v_scale, ws.out, H_Q=num_head_q, HEADS_PER_GROUP=ws.heads_per_group, NUM_SEQ_Q=_runtime_mtp4__NUM_SEQ_Q, ROWS_Q=_runtime_mtp4__NUM_SEQ_Q * ws.heads_per_group, D=_runtime__HEAD_DIM, DV=_runtime__HEAD_DIM, BLOCK_SIZE=_runtime__BLOCK_SIZE, MAX_BLOCKS=inputs.block_ids.shape[1], BLOCK_N=_runtime__TILE_N, DIRECT_CLUSTER_BASE=reduction_clusters, DIRECT_CLUSTER_SIZE=ws.config.cluster_size, Q_STRIDE_B=ws.q_4d.stride(0), Q_STRIDE_M=ws.q_4d.stride(1), Q_STRIDE_H=ws.q_4d.stride(2), QS_STRIDE_B=ws.q_scale_3d.stride(0), QS_STRIDE_M=ws.q_scale_3d.stride(1), QS_STRIDE_H=ws.q_scale_3d.stride(2), O_STRIDE_B=ws.out.stride(0), O_STRIDE_M=ws.out.stride(1), O_STRIDE_H=ws.out.stride(2), TMA_STAGES=2, KS_STRIDE_BLOCK=ks[0], KS_STRIDE_TOKEN=ks[1], KS_STRIDE_HEAD=ks[2], KS_STRIDE_D=ks[3], num_ctas=1, num_warps=4, num_stages=3, maxnreg=maxnreg, launch_pdl=False)
+        _compute_mtp4__fp8_kvpertensor_decode_mtp4_direct_kernel[direct_tasks,](
+            ws.q_4d,
+            k_desc,
+            v_desc,
+            inputs.block_ids,
+            ws.schedule.task_map,
+            ws.q_scale_3d,
+            inputs.k_scale,
+            inputs.v_scale,
+            ws.out,
+            H_Q=num_head_q,
+            HEADS_PER_GROUP=ws.heads_per_group,
+            NUM_SEQ_Q=_runtime_mtp4__NUM_SEQ_Q,
+            ROWS_Q=_runtime_mtp4__NUM_SEQ_Q * ws.heads_per_group,
+            D=_runtime__HEAD_DIM,
+            DV=_runtime__HEAD_DIM,
+            BLOCK_SIZE=_runtime__BLOCK_SIZE,
+            MAX_BLOCKS=inputs.block_ids.shape[1],
+            BLOCK_N=_runtime__TILE_N,
+            DIRECT_CLUSTER_BASE=reduction_clusters,
+            DIRECT_CLUSTER_SIZE=ws.config.cluster_size,
+            Q_STRIDE_B=ws.q_4d.stride(0),
+            Q_STRIDE_M=ws.q_4d.stride(1),
+            Q_STRIDE_H=ws.q_4d.stride(2),
+            QS_STRIDE_B=ws.q_scale_3d.stride(0),
+            QS_STRIDE_M=ws.q_scale_3d.stride(1),
+            QS_STRIDE_H=ws.q_scale_3d.stride(2),
+            O_STRIDE_B=ws.out.stride(0),
+            O_STRIDE_M=ws.out.stride(1),
+            O_STRIDE_H=ws.out.stride(2),
+            TMA_STAGES=2,
+            KS_STRIDE_BLOCK=ks[0],
+            KS_STRIDE_TOKEN=ks[1],
+            KS_STRIDE_HEAD=ks[2],
+            KS_STRIDE_D=ks[3],
+            num_ctas=1,
+            num_warps=4,
+            num_stages=3,
+            maxnreg=maxnreg,
+            launch_pdl=False,
+        )
+
     if logical_clusters == 0:
         launch_direct()
         if flatten_output:
             return ws.out.reshape(inputs.num_batch * _runtime_mtp4__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM)
         return ws.out
     compute_kernel = _compute_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle_kernel
-    compute_kernel[launch_clusters,](ws.q_4d, k_desc, v_desc, ks_desc, inputs.block_ids, ws.schedule.task_map, inputs.kv_lens, ws.q_scale_3d, inputs.k_scale, inputs.v_scale, ws.split_out, ws.lse, ws.completion, ws.last_flags, ws.out, mesh=_runtime__CLUSTER_MESHES[ws.config.cluster_size], B=inputs.num_batch, H_Q=num_head_q, HEADS_PER_GROUP=ws.heads_per_group, D=_runtime__HEAD_DIM, DV=_runtime__HEAD_DIM, BLOCK_SIZE=_runtime__BLOCK_SIZE, MAX_BLOCKS=inputs.block_ids.shape[1], BLOCK_N=_runtime__TILE_N, Q_STRIDE_B=ws.q_4d.stride(0), Q_STRIDE_M=ws.q_4d.stride(1), Q_STRIDE_H=ws.q_4d.stride(2), QS_STRIDE_B=ws.q_scale_3d.stride(0), QS_STRIDE_M=ws.q_scale_3d.stride(1), QS_STRIDE_H=ws.q_scale_3d.stride(2), SO_STRIDE_B=ws.split_out.stride(0), SO_STRIDE_C=ws.split_out.stride(1), SO_STRIDE_M=ws.split_out.stride(2), SO_STRIDE_H=ws.split_out.stride(3), LSE_STRIDE_B=ws.lse.stride(0), LSE_STRIDE_C=ws.lse.stride(1), LSE_STRIDE_HKV=ws.lse.stride(2), LSE_STRIDE_M=ws.lse.stride(3), LSE_STRIDE_HG=ws.lse.stride(4), O_STRIDE_B=ws.out.stride(0), O_STRIDE_M=ws.out.stride(1), O_STRIDE_H=ws.out.stride(2), LDSM_REGISTER_SHARED=not full_view_v_rs, WIDE_VIEW_V_RS=full_view_v_rs, MERGE_CLUSTER_SIZE=ws.config.cluster_size, EXECUTION_STAGE=stage_map[execution_stage], MAX_FINAL_CHUNKS=triton.next_power_of_2(ws.schedule.partial_slots), PAIRED_HEAD_FINALIZE=paired_head_finalize, QUAD_HEAD_TWO_CHUNK_FINALIZE=quad_head_two_chunk_finalize, FAST_FINALIZER_HANDOFF=fast_finalizer_handoff, RANK0_ONLY_FINALIZER=rank0_only_finalizer, SKIP_TRAILING_FINALIZER_BARRIER=skip_trailing_finalizer_barrier, PDL_NOTIFY=pdl_notify, C4_FINALIZER_TILE=(1200 + 1 if c4_bf16_dsm and c4_deferred_norm else 1400 + 1 if workspace.config == _runtime_mtp4__C2_T256 else 1100 + 1) if c2_aligned_full_chunk_winner else (1300 + 1 if workspace.config == _runtime_mtp4__C4_T1024 else 1000 + 1) if c4_aligned_full_chunk_raw else 900 + 1 if c4_reduction_only_raw else 700 + 1 if c4_global_deferred_norm else 600 + 1 if c4_deferred_norm else 500 + 1 if c4_bf16_dsm else 1, KS_STRIDE_BLOCK=ks[0], KS_STRIDE_TOKEN=ks[1], KS_STRIDE_HEAD=ks[2], KS_STRIDE_D=ks[3], PREFETCH_K_SCALE=5 if page_metadata_k_scale else prefetch_k_scale, TMA_K_SCALE=tma_k_scale, PRECOMBINE_Q_SCALE=precombine_q_scale, STATIC_SCHED=ws.static_sched, STATIC_CHUNK_TOKENS=ws.static_chunk_tokens, STATIC_MAX_GROUPS=ws.static_max_groups, num_ctas=1, num_warps=4, num_stages=3, maxnreg=maxnreg, launch_pdl=pdl_notify)
+    compute_kernel[launch_clusters,](
+        ws.q_4d,
+        k_desc,
+        v_desc,
+        ks_desc,
+        inputs.block_ids,
+        ws.schedule.task_map,
+        inputs.kv_lens,
+        ws.q_scale_3d,
+        inputs.k_scale,
+        inputs.v_scale,
+        ws.split_out,
+        ws.lse,
+        ws.completion,
+        ws.last_flags,
+        ws.out,
+        mesh=_runtime__CLUSTER_MESHES[ws.config.cluster_size],
+        B=inputs.num_batch,
+        H_Q=num_head_q,
+        HEADS_PER_GROUP=ws.heads_per_group,
+        D=_runtime__HEAD_DIM,
+        DV=_runtime__HEAD_DIM,
+        BLOCK_SIZE=_runtime__BLOCK_SIZE,
+        MAX_BLOCKS=inputs.block_ids.shape[1],
+        BLOCK_N=_runtime__TILE_N,
+        Q_STRIDE_B=ws.q_4d.stride(0),
+        Q_STRIDE_M=ws.q_4d.stride(1),
+        Q_STRIDE_H=ws.q_4d.stride(2),
+        QS_STRIDE_B=ws.q_scale_3d.stride(0),
+        QS_STRIDE_M=ws.q_scale_3d.stride(1),
+        QS_STRIDE_H=ws.q_scale_3d.stride(2),
+        SO_STRIDE_B=ws.split_out.stride(0),
+        SO_STRIDE_C=ws.split_out.stride(1),
+        SO_STRIDE_M=ws.split_out.stride(2),
+        SO_STRIDE_H=ws.split_out.stride(3),
+        LSE_STRIDE_B=ws.lse.stride(0),
+        LSE_STRIDE_C=ws.lse.stride(1),
+        LSE_STRIDE_HKV=ws.lse.stride(2),
+        LSE_STRIDE_M=ws.lse.stride(3),
+        LSE_STRIDE_HG=ws.lse.stride(4),
+        O_STRIDE_B=ws.out.stride(0),
+        O_STRIDE_M=ws.out.stride(1),
+        O_STRIDE_H=ws.out.stride(2),
+        LDSM_REGISTER_SHARED=not full_view_v_rs,
+        WIDE_VIEW_V_RS=full_view_v_rs,
+        MERGE_CLUSTER_SIZE=ws.config.cluster_size,
+        EXECUTION_STAGE=stage_map[execution_stage],
+        MAX_FINAL_CHUNKS=triton.next_power_of_2(ws.schedule.partial_slots),
+        PAIRED_HEAD_FINALIZE=paired_head_finalize,
+        QUAD_HEAD_TWO_CHUNK_FINALIZE=quad_head_two_chunk_finalize,
+        FAST_FINALIZER_HANDOFF=fast_finalizer_handoff,
+        RANK0_ONLY_FINALIZER=rank0_only_finalizer,
+        SKIP_TRAILING_FINALIZER_BARRIER=skip_trailing_finalizer_barrier,
+        PDL_NOTIFY=pdl_notify,
+        C4_FINALIZER_TILE=(
+            1200 + 1
+            if c4_bf16_dsm and c4_deferred_norm
+            else 1400 + 1
+            if workspace.config == _runtime_mtp4__C2_T256
+            else 1100 + 1
+        )
+        if c2_aligned_full_chunk_winner
+        else (1300 + 1 if workspace.config == _runtime_mtp4__C4_T1024 else 1000 + 1)
+        if c4_aligned_full_chunk_raw
+        else 900 + 1
+        if c4_reduction_only_raw
+        else 700 + 1
+        if c4_global_deferred_norm
+        else 600 + 1
+        if c4_deferred_norm
+        else 500 + 1
+        if c4_bf16_dsm
+        else 1,
+        KS_STRIDE_BLOCK=ks[0],
+        KS_STRIDE_TOKEN=ks[1],
+        KS_STRIDE_HEAD=ks[2],
+        KS_STRIDE_D=ks[3],
+        PREFETCH_K_SCALE=5 if page_metadata_k_scale else prefetch_k_scale,
+        TMA_K_SCALE=tma_k_scale,
+        PRECOMBINE_Q_SCALE=precombine_q_scale,
+        STATIC_SCHED=ws.static_sched,
+        STATIC_CHUNK_TOKENS=ws.static_chunk_tokens,
+        STATIC_MAX_GROUPS=ws.static_max_groups,
+        num_ctas=1,
+        num_warps=4,
+        num_stages=3,
+        maxnreg=maxnreg,
+        launch_pdl=pdl_notify,
+    )
     launch_direct()
     if flatten_output:
         return ws.out.reshape(inputs.num_batch * _runtime_mtp4__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM)
     return ws.out
 
-def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_winner(inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace, *, prefetch_k_scale: bool, tma_k_scale: bool, precombine_q_scale: bool, aligned_full_chunk_winner: bool) -> torch.Tensor:
+
+def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_winner(
+    inputs: _runtime_mtp4__DecodeInputs,
+    workspace: _runtime_mtp4__DecodeWorkspace,
+    *,
+    prefetch_k_scale: bool,
+    tma_k_scale: bool,
+    precombine_q_scale: bool,
+    aligned_full_chunk_winner: bool,
+) -> torch.Tensor:
     """Run the currently validated MTP=4 policy specializations.
 
     Policy selection remains outside the low-level launch implementation.
     """
     config = workspace.config
-    effective_chunks_max = int(workspace.stats.get('effective_chunks_max', 1))
+    effective_chunks_max = int(workspace.stats.get("effective_chunks_max", 1))
     use_c4_paired_fast = config.cluster_size == 4
     use_c2_exact_two = config.cluster_size == 2 and effective_chunks_max == 2
     use_c2_rank0_quad = config.cluster_size == 2 and effective_chunks_max == 4
@@ -3003,52 +3207,181 @@ def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_winner(inputs: _runtime_mtp4__Dec
     use_fast_handoff = use_c4_paired_fast or use_c2_sharded_quad
     use_rank0 = use_c2_exact_two or use_c2_rank0_quad
     selected_maxnreg = 240 if use_c4_paired_fast else None
-    return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(inputs, workspace, paired_head_finalize=use_c4_paired_fast or use_general_c2_quad, direct_fast_path=True, quad_head_two_chunk_finalize=use_c2_exact_two, fast_finalizer_handoff=use_fast_handoff, rank0_only_finalizer=use_rank0, skip_trailing_finalizer_barrier=use_c4_paired_fast or use_c2_exact_two or use_general_c2_quad, maxnreg=selected_maxnreg, prefetch_k_scale=prefetch_k_scale, tma_k_scale=tma_k_scale, page_metadata_k_scale=False, precombine_q_scale=precombine_q_scale, c2_aligned_full_chunk_winner=aligned_full_chunk_winner, flatten_output=True, execution_stage='full', c4_bf16_dsm=False, c4_deferred_norm=False, c4_global_deferred_norm=False, c4_reduction_only_raw=False, c4_aligned_full_chunk_raw=False, full_view_v_rs=False, pdl_notify=False)
+    return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(
+        inputs,
+        workspace,
+        paired_head_finalize=use_c4_paired_fast or use_general_c2_quad,
+        direct_fast_path=True,
+        quad_head_two_chunk_finalize=use_c2_exact_two,
+        fast_finalizer_handoff=use_fast_handoff,
+        rank0_only_finalizer=use_rank0,
+        skip_trailing_finalizer_barrier=use_c4_paired_fast or use_c2_exact_two or use_general_c2_quad,
+        maxnreg=selected_maxnreg,
+        prefetch_k_scale=prefetch_k_scale,
+        tma_k_scale=tma_k_scale,
+        page_metadata_k_scale=False,
+        precombine_q_scale=precombine_q_scale,
+        c2_aligned_full_chunk_winner=aligned_full_chunk_winner,
+        flatten_output=True,
+        execution_stage="full",
+        c4_bf16_dsm=False,
+        c4_deferred_norm=False,
+        c4_global_deferred_norm=False,
+        c4_reduction_only_raw=False,
+        c4_aligned_full_chunk_raw=False,
+        full_view_v_rs=False,
+        pdl_notify=False,
+    )
 
-def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_c2_bf16_dsm_specialized(inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace, *, prefetch_k_scale: bool, page_metadata_k_scale: bool, precombine_q_scale: bool, aligned_full_chunk_winner: bool) -> torch.Tensor:
+
+def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_c2_bf16_dsm_specialized(
+    inputs: _runtime_mtp4__DecodeInputs,
+    workspace: _runtime_mtp4__DecodeWorkspace,
+    *,
+    prefetch_k_scale: bool,
+    page_metadata_k_scale: bool,
+    precombine_q_scale: bool,
+    aligned_full_chunk_winner: bool,
+) -> torch.Tensor:
     """Migrate the C4 BF16/raw DSM producer path to exact-two C2."""
-    if workspace.config.cluster_size != 2 or int(workspace.stats.get('effective_chunks_max', 1)) != 2:
-        raise ValueError('C2 BF16 DSM requires an exact-two-group schedule')
-    return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(inputs, workspace, paired_head_finalize=False, direct_fast_path=True, quad_head_two_chunk_finalize=True, rank0_only_finalizer=True, skip_trailing_finalizer_barrier=True, c4_bf16_dsm=True, c4_deferred_norm=True, full_view_v_rs=True, maxnreg=None, prefetch_k_scale=prefetch_k_scale, tma_k_scale=True, page_metadata_k_scale=page_metadata_k_scale, precombine_q_scale=precombine_q_scale, c2_aligned_full_chunk_winner=aligned_full_chunk_winner, flatten_output=True, execution_stage='full', fast_finalizer_handoff=False, c4_global_deferred_norm=False, c4_reduction_only_raw=False, c4_aligned_full_chunk_raw=False, pdl_notify=False)
+    if workspace.config.cluster_size != 2 or int(workspace.stats.get("effective_chunks_max", 1)) != 2:
+        raise ValueError("C2 BF16 DSM requires an exact-two-group schedule")
+    return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(
+        inputs,
+        workspace,
+        paired_head_finalize=False,
+        direct_fast_path=True,
+        quad_head_two_chunk_finalize=True,
+        rank0_only_finalizer=True,
+        skip_trailing_finalizer_barrier=True,
+        c4_bf16_dsm=True,
+        c4_deferred_norm=True,
+        full_view_v_rs=True,
+        maxnreg=None,
+        prefetch_k_scale=prefetch_k_scale,
+        tma_k_scale=True,
+        page_metadata_k_scale=page_metadata_k_scale,
+        precombine_q_scale=precombine_q_scale,
+        c2_aligned_full_chunk_winner=aligned_full_chunk_winner,
+        flatten_output=True,
+        execution_stage="full",
+        fast_finalizer_handoff=False,
+        c4_global_deferred_norm=False,
+        c4_reduction_only_raw=False,
+        c4_aligned_full_chunk_raw=False,
+        pdl_notify=False,
+    )
 
-def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_detached_raw_finalize(inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace, *, maxnreg: int | None, page_metadata_k_scale: bool, precombine_q_scale: bool, reduction_only_raw: bool, aligned_full_chunk_raw: bool) -> torch.Tensor:
+
+def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_detached_raw_finalize(
+    inputs: _runtime_mtp4__DecodeInputs,
+    workspace: _runtime_mtp4__DecodeWorkspace,
+    *,
+    maxnreg: int | None,
+    page_metadata_k_scale: bool,
+    precombine_q_scale: bool,
+    reduction_only_raw: bool,
+    aligned_full_chunk_raw: bool,
+) -> torch.Tensor:
     """C2/C4 BF16-DSM raw producer plus a CUDA-shaped PDL finalizer."""
     ws = workspace
     if ws.config.cluster_size not in (2, 4):
-        raise ValueError('detached raw finalizer requires C2 or C4')
+        raise ValueError("detached raw finalizer requires C2 or C4")
     if reduction_only_raw and ws.config not in (_runtime_mtp4__C4_T512, _runtime_mtp4__C4_T1024):
-        raise ValueError('detached reduction-only raw producer requires C4T512/C4T1024')
+        raise ValueError("detached reduction-only raw producer requires C4T512/C4T1024")
     if aligned_full_chunk_raw:
         if ws.config == _runtime_mtp4__C4_T512 and (not reduction_only_raw):
-            raise ValueError('C4T512 aligned producer requires reduction-only raw')
+            raise ValueError("C4T512 aligned producer requires reduction-only raw")
         if ws.config == _runtime_mtp4__C4_T1024 and reduction_only_raw:
-            raise ValueError('C4T1024 aligned producer must retain single-group finalization')
-    _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(inputs, ws, execution_stage='cluster', paired_head_finalize=True, c4_bf16_dsm=not reduction_only_raw, c4_deferred_norm=not reduction_only_raw, c4_global_deferred_norm=not reduction_only_raw, c4_reduction_only_raw=reduction_only_raw, c4_aligned_full_chunk_raw=aligned_full_chunk_raw, full_view_v_rs=True, pdl_notify=True, maxnreg=240 if maxnreg is None else maxnreg, tma_k_scale=False, page_metadata_k_scale=page_metadata_k_scale, precombine_q_scale=precombine_q_scale, flatten_output=False, direct_fast_path=False, quad_head_two_chunk_finalize=False, fast_finalizer_handoff=False, rank0_only_finalizer=False, skip_trailing_finalizer_barrier=False, c2_aligned_full_chunk_winner=False, prefetch_k_scale=False)
+            raise ValueError("C4T1024 aligned producer must retain single-group finalization")
+    _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(
+        inputs,
+        ws,
+        execution_stage="cluster",
+        paired_head_finalize=True,
+        c4_bf16_dsm=not reduction_only_raw,
+        c4_deferred_norm=not reduction_only_raw,
+        c4_global_deferred_norm=not reduction_only_raw,
+        c4_reduction_only_raw=reduction_only_raw,
+        c4_aligned_full_chunk_raw=aligned_full_chunk_raw,
+        full_view_v_rs=True,
+        pdl_notify=True,
+        maxnreg=240 if maxnreg is None else maxnreg,
+        tma_k_scale=False,
+        page_metadata_k_scale=page_metadata_k_scale,
+        precombine_q_scale=precombine_q_scale,
+        flatten_output=False,
+        direct_fast_path=False,
+        quad_head_two_chunk_finalize=False,
+        fast_finalizer_handoff=False,
+        rank0_only_finalizer=False,
+        skip_trailing_finalizer_barrier=False,
+        c2_aligned_full_chunk_winner=False,
+        prefetch_k_scale=False,
+    )
     num_head_q = int(inputs.q.shape[1])
     num_head_kv = int(inputs.k_cache.shape[2])
     head_passes = (ws.heads_per_group + 3) // 4
     grid = inputs.num_batch * num_head_kv * _runtime_mtp4__NUM_SEQ_Q * head_passes
     reducer_kernel = _finalize_mtp4__fp8_kvpertensor_decode_mtp4_detached_raw_finalize_kernel
-    reducer_kwargs = dict(B=inputs.num_batch, H_Q=num_head_q, HEADS_PER_GROUP=ws.heads_per_group, D=_runtime__HEAD_DIM, CHUNK_TOKENS=ws.config.chunk_tokens, MAX_FINAL_CHUNKS=triton.next_power_of_2(ws.schedule.partial_slots), HEAD_PASSES=head_passes, SO_STRIDE_B=ws.split_out.stride(0), SO_STRIDE_C=ws.split_out.stride(1), SO_STRIDE_M=ws.split_out.stride(2), SO_STRIDE_H=ws.split_out.stride(3), LSE_STRIDE_B=ws.lse.stride(0), LSE_STRIDE_C=ws.lse.stride(1), LSE_STRIDE_HKV=ws.lse.stride(2), LSE_STRIDE_M=ws.lse.stride(3), LSE_STRIDE_HG=ws.lse.stride(4), O_STRIDE_B=ws.out.stride(0), O_STRIDE_M=ws.out.stride(1), O_STRIDE_H=ws.out.stride(2), V_PER_HEAD=True, PDL_WAIT=True, num_warps=4, num_stages=1, launch_pdl=True)
-    reducer_kernel[grid,](inputs.kv_lens, ws.split_out, ws.lse, inputs.v_scale, ws.out, CLUSTER_SIZE=ws.config.cluster_size, EXACT_TWO_SPECIALIZATION=False, **reducer_kwargs)
+    reducer_kwargs = dict(
+        B=inputs.num_batch,
+        H_Q=num_head_q,
+        HEADS_PER_GROUP=ws.heads_per_group,
+        D=_runtime__HEAD_DIM,
+        CHUNK_TOKENS=ws.config.chunk_tokens,
+        MAX_FINAL_CHUNKS=triton.next_power_of_2(ws.schedule.partial_slots),
+        HEAD_PASSES=head_passes,
+        SO_STRIDE_B=ws.split_out.stride(0),
+        SO_STRIDE_C=ws.split_out.stride(1),
+        SO_STRIDE_M=ws.split_out.stride(2),
+        SO_STRIDE_H=ws.split_out.stride(3),
+        LSE_STRIDE_B=ws.lse.stride(0),
+        LSE_STRIDE_C=ws.lse.stride(1),
+        LSE_STRIDE_HKV=ws.lse.stride(2),
+        LSE_STRIDE_M=ws.lse.stride(3),
+        LSE_STRIDE_HG=ws.lse.stride(4),
+        O_STRIDE_B=ws.out.stride(0),
+        O_STRIDE_M=ws.out.stride(1),
+        O_STRIDE_H=ws.out.stride(2),
+        V_PER_HEAD=True,
+        PDL_WAIT=True,
+        num_warps=4,
+        num_stages=1,
+        launch_pdl=True,
+    )
+    reducer_kernel[grid,](
+        inputs.kv_lens,
+        ws.split_out,
+        ws.lse,
+        inputs.v_scale,
+        ws.out,
+        CLUSTER_SIZE=ws.config.cluster_size,
+        EXACT_TWO_SPECIALIZATION=False,
+        **reducer_kwargs,
+    )
     return ws.out.reshape(inputs.num_batch * _runtime_mtp4__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM)
+
 
 def _runtime_mtp4___resolve_mtp4_final_policy(workspace: _runtime_mtp4__DecodeWorkspace) -> str:
     """Resolve the validated backend from config and scheduler metadata."""
     config = workspace.config
-    chunks = int(workspace.stats.get('effective_chunks_max', 1))
+    chunks = int(workspace.stats.get("effective_chunks_max", 1))
     if config.cluster_size == 2 and config.chunk_tokens == 1024 and (chunks == 2):
-        return 'c2-raw'
+        return "c2-raw"
     if config.cluster_size == 4 and config.chunk_tokens == 512 and (chunks >= 32):
-        return 'pdl'
+        return "pdl"
     if config.cluster_size == 4 and config.chunk_tokens == 1024:
         if chunks >= 16:
-            return 'pdl-s'
+            return "pdl-s"
         if chunks >= 8:
-            return 'pdl'
-    return 'winner'
+            return "pdl"
+    return "winner"
 
-def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_final(inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace) -> torch.Tensor:
+
+def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_final(
+    inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace
+) -> torch.Tensor:
     """Run the unified final MTP=4 interface.
 
     ``winner`` and ``c2-raw`` select compiled specializations of the fused TLE
@@ -3056,26 +3389,74 @@ def _runtime_mtp4__fp8_kvpertensor_decode_mtp4_final(inputs: _runtime_mtp4__Deco
     plus detached PDL reducer design behind this single runtime API.
     """
     resolved = workspace.final_policy_mode
-    page_metadata_k_scale = workspace.config.cluster_size == 2 and workspace.config.chunk_tokens in (256, 512) or (resolved == 'pdl' and workspace.config == _runtime_mtp4__C4_T512 and (int(workspace.q_4d.shape[0]) == 8))
-    precombine_static_scale = False
-    if resolved == 'winner':
-        winner_chunks = int(workspace.stats.get('effective_chunks_max', 1))
-        aligned_c2 = workspace.config in (_runtime_mtp4__C2_T256, _runtime_mtp4__C2_T1024) and workspace.all_chunks_aligned and (not int(workspace.stats.get('direct_tasks', 0))) and (not int(workspace.stats.get('dummy_tasks', 0))) and (not int(workspace.stats.get('subgroup2_tasks', 0)))
-        winner_tma_k_scale = workspace.config.cluster_size == 2 and workspace.config.chunk_tokens == 1024 and (winner_chunks >= 32)
-        return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_winner(inputs, workspace, prefetch_k_scale=winner_tma_k_scale, tma_k_scale=winner_tma_k_scale, precombine_q_scale=winner_tma_k_scale, aligned_full_chunk_winner=aligned_c2)
-    if resolved == 'c2-raw':
-        aligned_c2 = workspace.config == _runtime_mtp4__C2_T1024 and workspace.all_chunks_aligned and (not int(workspace.stats.get('direct_tasks', 0))) and (not int(workspace.stats.get('dummy_tasks', 0))) and (not int(workspace.stats.get('subgroup2_tasks', 0)))
-        return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_c2_bf16_dsm_specialized(inputs, workspace, page_metadata_k_scale=None, precombine_q_scale=None, aligned_full_chunk_winner=aligned_c2, prefetch_k_scale=False)
-    if resolved in ('pdl', 'pdl-s'):
-        producer_maxnreg = 192 if resolved == 'pdl' else 240
-        aligned_c4 = workspace.config in (_runtime_mtp4__C4_T512, _runtime_mtp4__C4_T1024) and workspace.all_chunks_aligned and (not int(workspace.stats.get('direct_tasks', 0))) and (not int(workspace.stats.get('dummy_tasks', 0))) and (not workspace.config.subgroup2_threshold) and (workspace.config == _runtime_mtp4__C4_T512 and resolved == 'pdl' and (int(workspace.q_4d.shape[0]) in (8, 16)) or (workspace.config == _runtime_mtp4__C4_T1024 and resolved in ('pdl', 'pdl-s')))
+    if resolved == "winner":
+        winner_chunks = int(workspace.stats.get("effective_chunks_max", 1))
+        aligned_c2 = (
+            workspace.config in (_runtime_mtp4__C2_T256, _runtime_mtp4__C2_T1024)
+            and workspace.all_chunks_aligned
+            and (not int(workspace.stats.get("direct_tasks", 0)))
+            and (not int(workspace.stats.get("dummy_tasks", 0)))
+            and (not int(workspace.stats.get("subgroup2_tasks", 0)))
+        )
+        winner_tma_k_scale = (
+            workspace.config.cluster_size == 2 and workspace.config.chunk_tokens == 1024 and (winner_chunks >= 32)
+        )
+        return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_winner(
+            inputs,
+            workspace,
+            prefetch_k_scale=winner_tma_k_scale,
+            tma_k_scale=winner_tma_k_scale,
+            precombine_q_scale=winner_tma_k_scale,
+            aligned_full_chunk_winner=aligned_c2,
+        )
+    if resolved == "c2-raw":
+        aligned_c2 = (
+            workspace.config == _runtime_mtp4__C2_T1024
+            and workspace.all_chunks_aligned
+            and (not int(workspace.stats.get("direct_tasks", 0)))
+            and (not int(workspace.stats.get("dummy_tasks", 0)))
+            and (not int(workspace.stats.get("subgroup2_tasks", 0)))
+        )
+        return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_c2_bf16_dsm_specialized(
+            inputs,
+            workspace,
+            page_metadata_k_scale=None,
+            precombine_q_scale=None,
+            aligned_full_chunk_winner=aligned_c2,
+            prefetch_k_scale=False,
+        )
+    if resolved in ("pdl", "pdl-s"):
+        producer_maxnreg = 192 if resolved == "pdl" else 240
+        aligned_c4 = (
+            workspace.config in (_runtime_mtp4__C4_T512, _runtime_mtp4__C4_T1024)
+            and workspace.all_chunks_aligned
+            and (not int(workspace.stats.get("direct_tasks", 0)))
+            and (not int(workspace.stats.get("dummy_tasks", 0)))
+            and (not workspace.config.subgroup2_threshold)
+            and (
+                workspace.config == _runtime_mtp4__C4_T512
+                and resolved == "pdl"
+                and (int(workspace.q_4d.shape[0]) in (8, 16))
+                or (workspace.config == _runtime_mtp4__C4_T1024 and resolved in ("pdl", "pdl-s"))
+            )
+        )
         aligned_reduction_only = aligned_c4 and workspace.config == _runtime_mtp4__C4_T512
-        return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_detached_raw_finalize(inputs, workspace, maxnreg=producer_maxnreg, reduction_only_raw=aligned_reduction_only, aligned_full_chunk_raw=aligned_c4, page_metadata_k_scale=None, precombine_q_scale=aligned_c4)
-    raise ValueError(f'unsupported MTP=4 final policy: {resolved}')
+        return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_detached_raw_finalize(
+            inputs,
+            workspace,
+            maxnreg=producer_maxnreg,
+            reduction_only_raw=aligned_reduction_only,
+            aligned_full_chunk_raw=aligned_c4,
+            page_metadata_k_scale=None,
+            precombine_q_scale=aligned_c4,
+        )
+    raise ValueError(f"unsupported MTP=4 final policy: {resolved}")
+
 
 @dataclass
 class _static_mtp1__StaticDecodeWorkspace:
     """Buffers for static scheduling; no task map is allocated or refreshed."""
+
     config: _runtime_mtp1__DecodeConfig
     q_4d: torch.Tensor
     q_scale_3d: torch.Tensor
@@ -3090,11 +3471,14 @@ class _static_mtp1__StaticDecodeWorkspace:
     aligned_chunk_tokens: int
     reduction_only: bool
 
-def _static_mtp1__prepare_static_decode_workspace(inputs: _runtime_mtp1__DecodeInputs, config: _runtime_mtp1__DecodeConfig) -> _static_mtp1__StaticDecodeWorkspace:
+
+def _static_mtp1__prepare_static_decode_workspace(
+    inputs: _runtime_mtp1__DecodeInputs, config: _runtime_mtp1__DecodeConfig
+) -> _static_mtp1__StaticDecodeWorkspace:
     """Allocate static buffers while retaining the dynamic winner's config."""
     num_head_q, num_head_kv, heads_per_group = _runtime__validate_inputs(inputs, _runtime_mtp1__NUM_SEQ_Q)
     if heads_per_group != 8:
-        raise ValueError('the MTP=1 static reference requires GQA8')
+        raise ValueError("the MTP=1 static reference requires GQA8")
     batch = inputs.num_batch
     cluster_size = config.cluster_size
     chunk_tokens = config.chunk_tokens
@@ -3103,26 +3487,71 @@ def _static_mtp1__prepare_static_decode_workspace(inputs: _runtime_mtp1__DecodeI
     num_chunks_gpu = (inputs.kv_lens + chunk_tokens - 1) // chunk_tokens
     split_only = bool(torch.all((num_chunks_gpu > 1) & (num_chunks_gpu % cluster_size == 0)).item())
     dynamic_aligned_configs = {(2, 256), (2, 1024), (4, 256), (4, 512), (4, 1024), (8, 512)}
-    aligned_full_chunk = split_only and (cluster_size, chunk_tokens) in dynamic_aligned_configs and bool(torch.all(inputs.kv_lens % chunk_tokens == 0).item())
+    aligned_full_chunk = (
+        split_only
+        and (cluster_size, chunk_tokens) in dynamic_aligned_configs
+        and bool(torch.all(inputs.kv_lens % chunk_tokens == 0).item())
+    )
     aligned_chunk_tokens = chunk_tokens if aligned_full_chunk else 0
-    reduction_only = aligned_full_chunk or (split_only and (cluster_size, chunk_tokens) in ((2, 1024), (8, 512), (4, 512)))
+    reduction_only = aligned_full_chunk or (
+        split_only and (cluster_size, chunk_tokens) in ((2, 1024), (8, 512), (4, 512))
+    )
     physical_ctas = batch * num_head_kv * max_groups * cluster_size
     pad_heads = (heads_per_group + 7) // 8 * 8
     device = inputs.q.device
-    return _static_mtp1__StaticDecodeWorkspace(config=config, q_4d=inputs.q.reshape(batch, _runtime_mtp1__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM), q_scale_3d=inputs.q_scale.reshape(batch, _runtime_mtp1__NUM_SEQ_Q, num_head_q), split_out=torch.empty((batch, max_groups, _runtime_mtp1__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM), dtype=torch.float32, device=device), lse=torch.empty((batch, max_groups, num_head_kv, _runtime_mtp1__NUM_SEQ_Q, pad_heads), dtype=torch.float32, device=device), completion=torch.zeros((num_head_kv * batch,), dtype=torch.int32, device=device), last_flags=torch.zeros((physical_ctas,), dtype=torch.int32, device=device), out=torch.empty((batch, _runtime_mtp1__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM), dtype=torch.bfloat16, device=device), heads_per_group=heads_per_group, num_head_kv=num_head_kv, max_groups=max_groups, aligned_chunk_tokens=aligned_chunk_tokens, reduction_only=reduction_only)
+    return _static_mtp1__StaticDecodeWorkspace(
+        config=config,
+        q_4d=inputs.q.reshape(batch, _runtime_mtp1__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM),
+        q_scale_3d=inputs.q_scale.reshape(batch, _runtime_mtp1__NUM_SEQ_Q, num_head_q),
+        split_out=torch.empty(
+            (batch, max_groups, _runtime_mtp1__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM),
+            dtype=torch.float32,
+            device=device,
+        ),
+        lse=torch.empty(
+            (batch, max_groups, num_head_kv, _runtime_mtp1__NUM_SEQ_Q, pad_heads), dtype=torch.float32, device=device
+        ),
+        completion=torch.zeros((num_head_kv * batch,), dtype=torch.int32, device=device),
+        last_flags=torch.zeros((physical_ctas,), dtype=torch.int32, device=device),
+        out=torch.empty(
+            (batch, _runtime_mtp1__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM), dtype=torch.bfloat16, device=device
+        ),
+        heads_per_group=heads_per_group,
+        num_head_kv=num_head_kv,
+        max_groups=max_groups,
+        aligned_chunk_tokens=aligned_chunk_tokens,
+        reduction_only=reduction_only,
+    )
 
-def _static_mtp1__fp8_kvpertensor_decode_mtp1_static(inputs: _runtime_mtp1__DecodeInputs, workspace: _static_mtp1__StaticDecodeWorkspace, *, no_causal_mask: bool, block_ids_prefetch: bool, paired_head_finalize: bool | None, bf16_dsm: bool | None, deferred_norm: bool | None, election_mode: str | None, precombine_q_scale: bool | None, skip_trailing_finalizer_barrier: bool | None, c2_raw: bool | None, tma_k_scale: bool | None, page_metadata_k_scale: bool, flatten_output: bool) -> torch.Tensor:
+
+def _static_mtp1__fp8_kvpertensor_decode_mtp1_static(
+    inputs: _runtime_mtp1__DecodeInputs,
+    workspace: _static_mtp1__StaticDecodeWorkspace,
+    *,
+    no_causal_mask: bool,
+    block_ids_prefetch: bool,
+    paired_head_finalize: bool | None,
+    bf16_dsm: bool | None,
+    deferred_norm: bool | None,
+    election_mode: str | None,
+    precombine_q_scale: bool | None,
+    skip_trailing_finalizer_barrier: bool | None,
+    c2_raw: bool | None,
+    tma_k_scale: bool | None,
+    page_metadata_k_scale: bool,
+    flatten_output: bool,
+) -> torch.Tensor:
     """Run static scheduling through the unchanged optimized dynamic kernel."""
     num_head_q, num_head_kv, heads_per_group = _runtime__validate_inputs(inputs, _runtime_mtp1__NUM_SEQ_Q)
     ws = workspace
     if num_head_kv != ws.num_head_kv or heads_per_group != ws.heads_per_group:
-        raise ValueError('inputs do not match the prepared static workspace')
+        raise ValueError("inputs do not match the prepared static workspace")
     if inputs.k_scale.ndim != 4 or inputs.v_scale.numel() < inputs.k_cache.shape[2]:
-        raise ValueError('quant_type=0 requires packed rank-4 K scales and one V scale per KV head')
+        raise ValueError("quant_type=0 requires packed rank-4 K scales and one V scale per KV head")
     if tma_k_scale is None:
         tma_k_scale = not page_metadata_k_scale
     if page_metadata_k_scale and tma_k_scale:
-        raise ValueError('page-metadata K-scale and TMA are exclusive')
+        raise ValueError("page-metadata K-scale and TMA are exclusive")
     config = ws.config
     cluster_size = config.cluster_size
     k_desc, v_desc = _runtime__make_paged_kv_descriptors(inputs, _runtime_mtp1__NUM_SEQ_Q)
@@ -3132,17 +3561,16 @@ def _static_mtp1__fp8_kvpertensor_decode_mtp1_static(inputs: _runtime_mtp1__Deco
     else:
         ks_desc = k_desc
     ks = inputs.k_scale.stride()
-    unused_task_map = ws.completion
     paired_finalize = cluster_size == 4 if paired_head_finalize is None else paired_head_finalize
     if paired_finalize and cluster_size != 4:
-        raise ValueError('paired-head finalization requires cluster_size=4')
+        raise ValueError("paired-head finalization requires cluster_size=4")
     deterministic_tail = cluster_size == 8 or (cluster_size == 4 and config.chunk_tokens in (128, 1024))
     if election_mode is None:
         dsm_handoff = not deterministic_tail
-    elif election_mode == 'tail':
+    elif election_mode == "tail":
         deterministic_tail = True
         dsm_handoff = False
-    elif election_mode == 'handoff':
+    elif election_mode == "handoff":
         deterministic_tail = False
         dsm_handoff = True
     else:
@@ -3152,26 +3580,98 @@ def _static_mtp1__fp8_kvpertensor_decode_mtp1_static(inputs: _runtime_mtp1__Deco
     eligible_c2_raw = cluster_size == 2 and config.chunk_tokens == 1024 and (ws.max_groups == 2) and ws.reduction_only
     use_c2_raw = eligible_c2_raw if c2_raw is None else c2_raw
     if use_c2_raw and (not eligible_c2_raw):
-        raise ValueError('c2_raw requires exact-two C2/T1024 reduction')
+        raise ValueError("c2_raw requires exact-two C2/T1024 reduction")
     if bf16_dsm is None:
         bf16_dsm = cluster_size == 8 or use_c2_raw
     if deferred_norm is None:
         deferred_norm = use_c2_raw
     if deferred_norm and (not bf16_dsm):
-        raise ValueError('deferred_norm requires bf16_dsm')
+        raise ValueError("deferred_norm requires bf16_dsm")
     if deferred_norm and cluster_size == 2 and (not eligible_c2_raw):
-        raise ValueError('C2 deferred_norm requires exact-two C2/T1024')
+        raise ValueError("C2 deferred_norm requires exact-two C2/T1024")
     if deferred_norm and cluster_size not in (2, 8):
-        raise ValueError('deferred_norm is supported only for C2/C8')
+        raise ValueError("deferred_norm is supported only for C2/C8")
     if use_c2_raw and (not bf16_dsm or not deferred_norm):
-        raise ValueError('c2_raw requires bf16_dsm and deferred_norm')
+        raise ValueError("c2_raw requires bf16_dsm and deferred_norm")
     if skip_trailing_finalizer_barrier is None:
         skip_trailing_finalizer_barrier = use_c2_raw or (cluster_size == 4 and config.chunk_tokens in (128, 512, 1024))
     logical_clusters = inputs.num_batch * num_head_kv * ws.max_groups
-    _compute_mtp1__fp8_kvpertensor_decode_mtp1_final_kernel[logical_clusters,](ws.q_4d, k_desc, ks_desc, v_desc, inputs.block_ids, inputs.kv_lens, ws.q_scale_3d, inputs.k_scale, inputs.v_scale, ws.split_out, ws.lse, ws.completion, ws.last_flags, ws.out, mesh=_runtime__CLUSTER_MESHES[cluster_size], B=inputs.num_batch, H_Q=num_head_q, HEADS_PER_GROUP=heads_per_group, D=_runtime__HEAD_DIM, DV=_runtime__HEAD_DIM, BLOCK_SIZE=_runtime__BLOCK_SIZE, MAX_BLOCKS=inputs.block_ids.shape[1], BLOCK_N=_runtime__TILE_N, Q_STRIDE_B=ws.q_4d.stride(0), Q_STRIDE_M=ws.q_4d.stride(1), Q_STRIDE_H=ws.q_4d.stride(2), QS_STRIDE_B=ws.q_scale_3d.stride(0), QS_STRIDE_M=ws.q_scale_3d.stride(1), QS_STRIDE_H=ws.q_scale_3d.stride(2), SO_STRIDE_B=ws.split_out.stride(0), SO_STRIDE_C=ws.split_out.stride(1), SO_STRIDE_M=ws.split_out.stride(2), SO_STRIDE_H=ws.split_out.stride(3), LSE_STRIDE_B=ws.lse.stride(0), LSE_STRIDE_C=ws.lse.stride(1), LSE_STRIDE_HKV=ws.lse.stride(2), LSE_STRIDE_M=ws.lse.stride(3), LSE_STRIDE_HG=ws.lse.stride(4), O_STRIDE_B=ws.out.stride(0), O_STRIDE_M=ws.out.stride(1), O_STRIDE_H=ws.out.stride(2), TMA_K_SCALE=tma_k_scale, PAGE_METADATA_K_SCALE=page_metadata_k_scale, PRECOMBINE_Q_SCALE=precombine_q_scale, KS_STRIDE_BLOCK=ks[0], KS_STRIDE_TOKEN=ks[1], KS_STRIDE_HEAD=ks[2], KS_STRIDE_D=ks[3], LDSM_REGISTER_SHARED=not use_c2_raw, FULL_VIEW_V_RS=use_c2_raw, MERGE_CLUSTER_SIZE=cluster_size, EXECUTION_STAGE=_compute_mtp1__EXECUTION_FULL, MAX_FINAL_CHUNKS=triton.next_power_of_2(ws.max_groups), PAIRED_HEAD_FINALIZE=paired_finalize, BF16_DSM=bf16_dsm, DEFERRED_NORM=deferred_norm, DSM_ELECTION_HANDOFF=dsm_handoff and (not use_c2_raw), DETERMINISTIC_TAIL_ELECTION=deterministic_tail and (not use_c2_raw), RANK0_ONLY_FINALIZER=use_c2_raw, REDUCTION_ONLY=ws.reduction_only, SKIP_TRAILING_FINALIZER_BARRIER=skip_trailing_finalizer_barrier, STATIC_CHUNK_TOKENS=config.chunk_tokens, STATIC_MAX_GROUPS=ws.max_groups, STATIC_MTP1_NO_CAUSAL_MASK=no_causal_mask, STATIC_BLOCK_IDS_PREFETCH=block_ids_prefetch, ALIGNED_FULL_CHUNK_TOKENS=ws.aligned_chunk_tokens, num_ctas=1, num_warps=4, num_stages=3, launch_pdl=False)
+    _compute_mtp1__fp8_kvpertensor_decode_mtp1_final_kernel[logical_clusters,](
+        ws.q_4d,
+        k_desc,
+        ks_desc,
+        v_desc,
+        inputs.block_ids,
+        inputs.kv_lens,
+        ws.q_scale_3d,
+        inputs.k_scale,
+        inputs.v_scale,
+        ws.split_out,
+        ws.lse,
+        ws.completion,
+        ws.last_flags,
+        ws.out,
+        mesh=_runtime__CLUSTER_MESHES[cluster_size],
+        B=inputs.num_batch,
+        H_Q=num_head_q,
+        HEADS_PER_GROUP=heads_per_group,
+        D=_runtime__HEAD_DIM,
+        DV=_runtime__HEAD_DIM,
+        BLOCK_SIZE=_runtime__BLOCK_SIZE,
+        MAX_BLOCKS=inputs.block_ids.shape[1],
+        BLOCK_N=_runtime__TILE_N,
+        Q_STRIDE_B=ws.q_4d.stride(0),
+        Q_STRIDE_M=ws.q_4d.stride(1),
+        Q_STRIDE_H=ws.q_4d.stride(2),
+        QS_STRIDE_B=ws.q_scale_3d.stride(0),
+        QS_STRIDE_M=ws.q_scale_3d.stride(1),
+        QS_STRIDE_H=ws.q_scale_3d.stride(2),
+        SO_STRIDE_B=ws.split_out.stride(0),
+        SO_STRIDE_C=ws.split_out.stride(1),
+        SO_STRIDE_M=ws.split_out.stride(2),
+        SO_STRIDE_H=ws.split_out.stride(3),
+        LSE_STRIDE_B=ws.lse.stride(0),
+        LSE_STRIDE_C=ws.lse.stride(1),
+        LSE_STRIDE_HKV=ws.lse.stride(2),
+        LSE_STRIDE_M=ws.lse.stride(3),
+        LSE_STRIDE_HG=ws.lse.stride(4),
+        O_STRIDE_B=ws.out.stride(0),
+        O_STRIDE_M=ws.out.stride(1),
+        O_STRIDE_H=ws.out.stride(2),
+        TMA_K_SCALE=tma_k_scale,
+        PAGE_METADATA_K_SCALE=page_metadata_k_scale,
+        PRECOMBINE_Q_SCALE=precombine_q_scale,
+        KS_STRIDE_BLOCK=ks[0],
+        KS_STRIDE_TOKEN=ks[1],
+        KS_STRIDE_HEAD=ks[2],
+        KS_STRIDE_D=ks[3],
+        LDSM_REGISTER_SHARED=not use_c2_raw,
+        FULL_VIEW_V_RS=use_c2_raw,
+        MERGE_CLUSTER_SIZE=cluster_size,
+        EXECUTION_STAGE=_compute_mtp1__EXECUTION_FULL,
+        MAX_FINAL_CHUNKS=triton.next_power_of_2(ws.max_groups),
+        PAIRED_HEAD_FINALIZE=paired_finalize,
+        BF16_DSM=bf16_dsm,
+        DEFERRED_NORM=deferred_norm,
+        DSM_ELECTION_HANDOFF=dsm_handoff and (not use_c2_raw),
+        DETERMINISTIC_TAIL_ELECTION=deterministic_tail and (not use_c2_raw),
+        RANK0_ONLY_FINALIZER=use_c2_raw,
+        REDUCTION_ONLY=ws.reduction_only,
+        SKIP_TRAILING_FINALIZER_BARRIER=skip_trailing_finalizer_barrier,
+        STATIC_CHUNK_TOKENS=config.chunk_tokens,
+        STATIC_MAX_GROUPS=ws.max_groups,
+        STATIC_MTP1_NO_CAUSAL_MASK=no_causal_mask,
+        STATIC_BLOCK_IDS_PREFETCH=block_ids_prefetch,
+        ALIGNED_FULL_CHUNK_TOKENS=ws.aligned_chunk_tokens,
+        num_ctas=1,
+        num_warps=4,
+        num_stages=3,
+        launch_pdl=False,
+    )
     if flatten_output:
         return ws.out.reshape(inputs.num_batch, num_head_q, _runtime__HEAD_DIM)
     return ws.out
+
 
 @dataclass
 class _static_mtp2__StaticDecodeWorkspace:
@@ -3189,10 +3689,13 @@ class _static_mtp2__StaticDecodeWorkspace:
     aligned_chunk_tokens: int
     reduction_only: bool
 
-def _static_mtp2__prepare_static_decode_workspace(inputs: _runtime_mtp2__DecodeInputs, config: _runtime_mtp2__DecodeConfig) -> _static_mtp2__StaticDecodeWorkspace:
+
+def _static_mtp2__prepare_static_decode_workspace(
+    inputs: _runtime_mtp2__DecodeInputs, config: _runtime_mtp2__DecodeConfig
+) -> _static_mtp2__StaticDecodeWorkspace:
     num_head_q, num_head_kv, heads_per_group = _runtime__validate_inputs(inputs, _runtime_mtp2__NUM_SEQ_Q)
     if heads_per_group != 8:
-        raise ValueError('the MTP=2 static reference requires GQA8')
+        raise ValueError("the MTP=2 static reference requires GQA8")
     batch = inputs.num_batch
     cluster_size = config.cluster_size
     chunk_tokens = config.chunk_tokens
@@ -3204,22 +3707,62 @@ def _static_mtp2__prepare_static_decode_workspace(inputs: _runtime_mtp2__DecodeI
     pad_heads = (heads_per_group + 7) // 8 * 8
     physical_ctas = batch * num_head_kv * max_groups * cluster_size
     device = inputs.q.device
-    return _static_mtp2__StaticDecodeWorkspace(config=config, q_4d=inputs.q.reshape(batch, _runtime_mtp2__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM), q_scale_3d=inputs.q_scale.reshape(batch, _runtime_mtp2__NUM_SEQ_Q, num_head_q), split_out=torch.empty((batch, max_groups, _runtime_mtp2__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM), dtype=torch.float32, device=device), lse=torch.empty((batch, max_groups, num_head_kv, _runtime_mtp2__NUM_SEQ_Q, pad_heads), dtype=torch.float32, device=device), completion=torch.zeros((num_head_kv * batch,), dtype=torch.int32, device=device), last_flags=torch.zeros((physical_ctas,), dtype=torch.int32, device=device), out=torch.empty((batch, _runtime_mtp2__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM), dtype=torch.bfloat16, device=device), heads_per_group=heads_per_group, num_head_kv=num_head_kv, max_groups=max_groups, aligned_chunk_tokens=aligned_chunk_tokens, reduction_only=reduction_only)
+    return _static_mtp2__StaticDecodeWorkspace(
+        config=config,
+        q_4d=inputs.q.reshape(batch, _runtime_mtp2__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM),
+        q_scale_3d=inputs.q_scale.reshape(batch, _runtime_mtp2__NUM_SEQ_Q, num_head_q),
+        split_out=torch.empty(
+            (batch, max_groups, _runtime_mtp2__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM),
+            dtype=torch.float32,
+            device=device,
+        ),
+        lse=torch.empty(
+            (batch, max_groups, num_head_kv, _runtime_mtp2__NUM_SEQ_Q, pad_heads), dtype=torch.float32, device=device
+        ),
+        completion=torch.zeros((num_head_kv * batch,), dtype=torch.int32, device=device),
+        last_flags=torch.zeros((physical_ctas,), dtype=torch.int32, device=device),
+        out=torch.empty(
+            (batch, _runtime_mtp2__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM), dtype=torch.bfloat16, device=device
+        ),
+        heads_per_group=heads_per_group,
+        num_head_kv=num_head_kv,
+        max_groups=max_groups,
+        aligned_chunk_tokens=aligned_chunk_tokens,
+        reduction_only=reduction_only,
+    )
 
-def _static_mtp2__fp8_kvpertensor_decode_mtp2_static(inputs: _runtime_mtp2__DecodeInputs, workspace: _static_mtp2__StaticDecodeWorkspace, *, paired_head_finalize: bool | None, bf16_dsm: bool | None, deferred_norm: bool | None, election_mode: str | None, tail_only_election_barrier: bool, precombine_q_scale: bool | None, skip_trailing_finalizer_barrier: bool | None, full_view_dsm: bool, full_view_v_rs: bool | None, c2_raw: bool | None, tma_k_scale: bool | None, page_metadata_k_scale: bool, flatten_output: bool) -> torch.Tensor:
+
+def _static_mtp2__fp8_kvpertensor_decode_mtp2_static(
+    inputs: _runtime_mtp2__DecodeInputs,
+    workspace: _static_mtp2__StaticDecodeWorkspace,
+    *,
+    paired_head_finalize: bool | None,
+    bf16_dsm: bool | None,
+    deferred_norm: bool | None,
+    election_mode: str | None,
+    tail_only_election_barrier: bool,
+    precombine_q_scale: bool | None,
+    skip_trailing_finalizer_barrier: bool | None,
+    full_view_dsm: bool,
+    full_view_v_rs: bool | None,
+    c2_raw: bool | None,
+    tma_k_scale: bool | None,
+    page_metadata_k_scale: bool,
+    flatten_output: bool,
+) -> torch.Tensor:
     num_head_q, num_head_kv, heads_per_group = _runtime__validate_inputs(inputs, _runtime_mtp2__NUM_SEQ_Q)
     ws = workspace
     if num_head_kv != ws.num_head_kv or heads_per_group != ws.heads_per_group:
-        raise ValueError('inputs do not match the MTP=2 static workspace')
+        raise ValueError("inputs do not match the MTP=2 static workspace")
     if inputs.k_scale.ndim != 4 or inputs.v_scale.numel() < inputs.k_cache.shape[2]:
-        raise ValueError('quant_type=0 requires packed rank-4 K scales and one V scale per KV head')
+        raise ValueError("quant_type=0 requires packed rank-4 K scales and one V scale per KV head")
     config = ws.config
     cluster_size = config.cluster_size
     chunk_tokens = config.chunk_tokens
     if tma_k_scale is None:
         tma_k_scale = not page_metadata_k_scale and (not (cluster_size == 4 and chunk_tokens == 128))
     if page_metadata_k_scale and tma_k_scale:
-        raise ValueError('page-metadata K-scale and TMA are exclusive')
+        raise ValueError("page-metadata K-scale and TMA are exclusive")
     k_desc, v_desc = _runtime__make_paged_kv_descriptors(inputs, _runtime_mtp2__NUM_SEQ_Q)
     if tma_k_scale:
         k_scale_f32 = inputs.k_scale.view(torch.float32)
@@ -3228,26 +3771,30 @@ def _static_mtp2__fp8_kvpertensor_decode_mtp2_static(inputs: _runtime_mtp2__Deco
         ks_desc = k_desc
     ks = inputs.k_scale.stride()
     eligible_c2_raw = cluster_size == 2 and chunk_tokens == 1024 and (ws.max_groups == 2) and ws.reduction_only
-    auto_aligned = ws.aligned_chunk_tokens != 0 and ws.reduction_only and ((cluster_size, chunk_tokens) in ((2, 256), (2, 512), (2, 1024), (4, 256), (4, 512), (4, 1024)))
+    auto_aligned = (
+        ws.aligned_chunk_tokens != 0
+        and ws.reduction_only
+        and ((cluster_size, chunk_tokens) in ((2, 256), (2, 512), (2, 1024), (4, 256), (4, 512), (4, 1024)))
+    )
     reduction_only = ws.reduction_only and (cluster_size == 2 or auto_aligned)
     if precombine_q_scale is None:
         precombine_q_scale = True
     use_c2_raw = eligible_c2_raw if c2_raw is None else c2_raw
     if use_c2_raw and (not eligible_c2_raw):
-        raise ValueError('c2_raw requires exact-two C2/T1024 reduction')
+        raise ValueError("c2_raw requires exact-two C2/T1024 reduction")
     paired_finalize = cluster_size == 4 and (not use_c2_raw) if paired_head_finalize is None else paired_head_finalize
     if paired_finalize and cluster_size != 4:
-        raise ValueError('paired-head finalization requires cluster_size=4')
+        raise ValueError("paired-head finalization requires cluster_size=4")
     if bf16_dsm is None:
         bf16_dsm = chunk_tokens <= 512 or use_c2_raw
     if deferred_norm is None:
         deferred_norm = use_c2_raw
     if deferred_norm and (not bf16_dsm):
-        raise ValueError('deferred_norm requires bf16_dsm')
+        raise ValueError("deferred_norm requires bf16_dsm")
     if deferred_norm and cluster_size not in (2, 4):
-        raise ValueError('MTP2 deferred_norm requires C2 or C4')
+        raise ValueError("MTP2 deferred_norm requires C2 or C4")
     if full_view_dsm and cluster_size not in (2, 4):
-        raise ValueError('full_view_dsm requires C2 or C4')
+        raise ValueError("full_view_dsm requires C2 or C4")
     if full_view_v_rs is None:
         full_view_v_rs = use_c2_raw
     if skip_trailing_finalizer_barrier is None:
@@ -3255,33 +3802,115 @@ def _static_mtp2__fp8_kvpertensor_decode_mtp2_static(inputs: _runtime_mtp2__Deco
     if election_mode is None:
         deterministic_tail = not use_c2_raw
         dsm_handoff = False
-    elif election_mode == 'tail':
+    elif election_mode == "tail":
         deterministic_tail = True
         dsm_handoff = False
-    elif election_mode == 'handoff':
+    elif election_mode == "handoff":
         if cluster_size not in (2, 4):
-            raise ValueError('DSM handoff requires C2 or C4')
+            raise ValueError("DSM handoff requires C2 or C4")
         deterministic_tail = False
         dsm_handoff = True
     else:
         raise ValueError("election_mode must be None, 'tail', or 'handoff'")
-    if use_c2_raw and (paired_finalize or not bf16_dsm or (not deferred_norm) or deterministic_tail or dsm_handoff or (not full_view_v_rs)):
-        raise ValueError('c2_raw prerequisites were overridden')
+    if use_c2_raw and (
+        paired_finalize
+        or not bf16_dsm
+        or (not deferred_norm)
+        or deterministic_tail
+        or dsm_handoff
+        or (not full_view_v_rs)
+    ):
+        raise ValueError("c2_raw prerequisites were overridden")
     if tail_only_election_barrier and (not deterministic_tail):
-        raise ValueError('tail-only barrier requires deterministic election')
+        raise ValueError("tail-only barrier requires deterministic election")
     logical_clusters = inputs.num_batch * num_head_kv * ws.max_groups
-    _compute_mtp2__fp8_kvpertensor_decode_mtp2_final_kernel[logical_clusters,](ws.q_4d, k_desc, ks_desc, v_desc, inputs.block_ids, inputs.kv_lens, ws.q_scale_3d, inputs.k_scale, inputs.v_scale, ws.split_out, ws.lse, ws.completion, ws.last_flags, ws.out, mesh=_runtime__CLUSTER_MESHES[cluster_size], B=inputs.num_batch, H_Q=num_head_q, HEADS_PER_GROUP=heads_per_group, D=_runtime__HEAD_DIM, DV=_runtime__HEAD_DIM, BLOCK_SIZE=_runtime__BLOCK_SIZE, MAX_BLOCKS=inputs.block_ids.shape[1], BLOCK_N=_runtime__TILE_N, Q_STRIDE_B=ws.q_4d.stride(0), Q_STRIDE_M=ws.q_4d.stride(1), Q_STRIDE_H=ws.q_4d.stride(2), QS_STRIDE_B=ws.q_scale_3d.stride(0), QS_STRIDE_M=ws.q_scale_3d.stride(1), QS_STRIDE_H=ws.q_scale_3d.stride(2), SO_STRIDE_B=ws.split_out.stride(0), SO_STRIDE_C=ws.split_out.stride(1), SO_STRIDE_M=ws.split_out.stride(2), SO_STRIDE_H=ws.split_out.stride(3), LSE_STRIDE_B=ws.lse.stride(0), LSE_STRIDE_C=ws.lse.stride(1), LSE_STRIDE_HKV=ws.lse.stride(2), LSE_STRIDE_M=ws.lse.stride(3), LSE_STRIDE_HG=ws.lse.stride(4), O_STRIDE_B=ws.out.stride(0), O_STRIDE_M=ws.out.stride(1), O_STRIDE_H=ws.out.stride(2), TMA_K_SCALE=tma_k_scale, PAGE_METADATA_K_SCALE=page_metadata_k_scale, PRECOMBINE_Q_SCALE=precombine_q_scale, KS_STRIDE_BLOCK=ks[0], KS_STRIDE_TOKEN=ks[1], KS_STRIDE_HEAD=ks[2], KS_STRIDE_D=ks[3], LDSM_REGISTER_SHARED=not full_view_v_rs, FULL_VIEW_V_RS=full_view_v_rs, MERGE_CLUSTER_SIZE=cluster_size, EXECUTION_STAGE=_compute_mtp2__EXECUTION_FULL, MAX_FINAL_CHUNKS=triton.next_power_of_2(ws.max_groups), REUSE_FINAL_WEIGHTS=not use_c2_raw, PAIRED_HEAD_FINALIZE=paired_finalize, BF16_DSM=bf16_dsm, DEFERRED_NORM=deferred_norm, DSM_ELECTION_HANDOFF=dsm_handoff, DETERMINISTIC_TAIL_ELECTION=deterministic_tail, TAIL_ONLY_ELECTION_BARRIER=tail_only_election_barrier, REDUCTION_ONLY=reduction_only, ALIGNED_FULL_CHUNK_TOKENS=chunk_tokens if auto_aligned else 0, FULL_VIEW_DSM=full_view_dsm, RANK0_ONLY_FINALIZER=use_c2_raw, SKIP_TRAILING_FINALIZER_BARRIER=skip_trailing_finalizer_barrier, STATIC_CHUNK_TOKENS=chunk_tokens, STATIC_MAX_GROUPS=ws.max_groups, num_ctas=1, num_warps=4, num_stages=3, launch_pdl=False)
+    _compute_mtp2__fp8_kvpertensor_decode_mtp2_final_kernel[logical_clusters,](
+        ws.q_4d,
+        k_desc,
+        ks_desc,
+        v_desc,
+        inputs.block_ids,
+        inputs.kv_lens,
+        ws.q_scale_3d,
+        inputs.k_scale,
+        inputs.v_scale,
+        ws.split_out,
+        ws.lse,
+        ws.completion,
+        ws.last_flags,
+        ws.out,
+        mesh=_runtime__CLUSTER_MESHES[cluster_size],
+        B=inputs.num_batch,
+        H_Q=num_head_q,
+        HEADS_PER_GROUP=heads_per_group,
+        D=_runtime__HEAD_DIM,
+        DV=_runtime__HEAD_DIM,
+        BLOCK_SIZE=_runtime__BLOCK_SIZE,
+        MAX_BLOCKS=inputs.block_ids.shape[1],
+        BLOCK_N=_runtime__TILE_N,
+        Q_STRIDE_B=ws.q_4d.stride(0),
+        Q_STRIDE_M=ws.q_4d.stride(1),
+        Q_STRIDE_H=ws.q_4d.stride(2),
+        QS_STRIDE_B=ws.q_scale_3d.stride(0),
+        QS_STRIDE_M=ws.q_scale_3d.stride(1),
+        QS_STRIDE_H=ws.q_scale_3d.stride(2),
+        SO_STRIDE_B=ws.split_out.stride(0),
+        SO_STRIDE_C=ws.split_out.stride(1),
+        SO_STRIDE_M=ws.split_out.stride(2),
+        SO_STRIDE_H=ws.split_out.stride(3),
+        LSE_STRIDE_B=ws.lse.stride(0),
+        LSE_STRIDE_C=ws.lse.stride(1),
+        LSE_STRIDE_HKV=ws.lse.stride(2),
+        LSE_STRIDE_M=ws.lse.stride(3),
+        LSE_STRIDE_HG=ws.lse.stride(4),
+        O_STRIDE_B=ws.out.stride(0),
+        O_STRIDE_M=ws.out.stride(1),
+        O_STRIDE_H=ws.out.stride(2),
+        TMA_K_SCALE=tma_k_scale,
+        PAGE_METADATA_K_SCALE=page_metadata_k_scale,
+        PRECOMBINE_Q_SCALE=precombine_q_scale,
+        KS_STRIDE_BLOCK=ks[0],
+        KS_STRIDE_TOKEN=ks[1],
+        KS_STRIDE_HEAD=ks[2],
+        KS_STRIDE_D=ks[3],
+        LDSM_REGISTER_SHARED=not full_view_v_rs,
+        FULL_VIEW_V_RS=full_view_v_rs,
+        MERGE_CLUSTER_SIZE=cluster_size,
+        EXECUTION_STAGE=_compute_mtp2__EXECUTION_FULL,
+        MAX_FINAL_CHUNKS=triton.next_power_of_2(ws.max_groups),
+        REUSE_FINAL_WEIGHTS=not use_c2_raw,
+        PAIRED_HEAD_FINALIZE=paired_finalize,
+        BF16_DSM=bf16_dsm,
+        DEFERRED_NORM=deferred_norm,
+        DSM_ELECTION_HANDOFF=dsm_handoff,
+        DETERMINISTIC_TAIL_ELECTION=deterministic_tail,
+        TAIL_ONLY_ELECTION_BARRIER=tail_only_election_barrier,
+        REDUCTION_ONLY=reduction_only,
+        ALIGNED_FULL_CHUNK_TOKENS=chunk_tokens if auto_aligned else 0,
+        FULL_VIEW_DSM=full_view_dsm,
+        RANK0_ONLY_FINALIZER=use_c2_raw,
+        SKIP_TRAILING_FINALIZER_BARRIER=skip_trailing_finalizer_barrier,
+        STATIC_CHUNK_TOKENS=chunk_tokens,
+        STATIC_MAX_GROUPS=ws.max_groups,
+        num_ctas=1,
+        num_warps=4,
+        num_stages=3,
+        launch_pdl=False,
+    )
     if flatten_output:
         return ws.out.reshape(inputs.num_batch * _runtime_mtp2__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM)
     return ws.out
 
-def _static_mtp4__prepare_static_decode_workspace(inputs: _runtime_mtp4__DecodeInputs, config: _runtime_mtp4__DecodeConfig, *, policy_mode: str) -> _runtime_mtp4__DecodeWorkspace:
+
+def _static_mtp4__prepare_static_decode_workspace(
+    inputs: _runtime_mtp4__DecodeInputs, config: _runtime_mtp4__DecodeConfig, *, policy_mode: str
+) -> _runtime_mtp4__DecodeWorkspace:
     """Allocate strict-static buffers without constructing a task map."""
     num_head_q, num_head_kv, heads_per_group = _runtime__validate_inputs(inputs, _runtime_mtp4__NUM_SEQ_Q)
     if heads_per_group != 8:
-        raise ValueError('the MTP=4 static specialization requires GQA8')
+        raise ValueError("the MTP=4 static specialization requires GQA8")
     if config.direct_threshold or config.subgroup2_threshold:
-        raise ValueError('strict-static MTP=4 requires plain C/T configs')
+        raise ValueError("strict-static MTP=4 requires plain C/T configs")
     batch = inputs.num_batch
     max_chunks = (inputs.max_seq_kv + config.chunk_tokens - 1) // config.chunk_tokens
     max_groups = max(1, (max_chunks + config.cluster_size - 1) // config.cluster_size)
@@ -3291,35 +3920,98 @@ def _static_mtp4__prepare_static_decode_workspace(inputs: _runtime_mtp4__DecodeI
     partial_storage_slots = 2 * max_final_chunks
     device = inputs.q.device
     placeholder = torch.empty((1,), dtype=torch.int32, device=device)
-    stats = {'cluster_size': config.cluster_size, 'num_clusters': logical_clusters, 'physical_ctas': physical_ctas, 'reduction_clusters': logical_clusters, 'compute_tasks': logical_clusters * config.cluster_size, 'fine_chunks_max': max_chunks, 'effective_chunks_max': max_groups, 'direct_tasks': 0, 'dummy_tasks': 0, 'subgroup2_tasks': 0}
-    schedule = _scheduler_mtp24__DecodeTaskSchedule(task_workspace=placeholder.view(torch.int8), task_map=placeholder, offsets=placeholder, meta=placeholder, cluster_size=config.cluster_size, chunk_tokens=config.chunk_tokens, block_seq=1, block_chunks=triton.next_power_of_2(max_chunks), capacity_clusters=logical_clusters, capacity_ints=1, num_seq_q=_runtime_mtp4__NUM_SEQ_Q, num_clusters=logical_clusters, physical_ctas=physical_ctas, sched_ints=0, partial_slots=max_groups, stats=stats)
+    stats = {
+        "cluster_size": config.cluster_size,
+        "num_clusters": logical_clusters,
+        "physical_ctas": physical_ctas,
+        "reduction_clusters": logical_clusters,
+        "compute_tasks": logical_clusters * config.cluster_size,
+        "fine_chunks_max": max_chunks,
+        "effective_chunks_max": max_groups,
+        "direct_tasks": 0,
+        "dummy_tasks": 0,
+        "subgroup2_tasks": 0,
+    }
+    schedule = _scheduler_mtp24__DecodeTaskSchedule(
+        task_workspace=placeholder.view(torch.int8),
+        task_map=placeholder,
+        offsets=placeholder,
+        meta=placeholder,
+        cluster_size=config.cluster_size,
+        chunk_tokens=config.chunk_tokens,
+        block_seq=1,
+        block_chunks=triton.next_power_of_2(max_chunks),
+        capacity_clusters=logical_clusters,
+        capacity_ints=1,
+        num_seq_q=_runtime_mtp4__NUM_SEQ_Q,
+        num_clusters=logical_clusters,
+        physical_ctas=physical_ctas,
+        sched_ints=0,
+        partial_slots=max_groups,
+        stats=stats,
+    )
     q_4d = inputs.q.reshape(batch, _runtime_mtp4__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM)
     q_scale_3d = inputs.q_scale.reshape(batch, _runtime_mtp4__NUM_SEQ_Q, num_head_q)
     pad_heads = (heads_per_group + 7) // 8 * 8
-    provisional = _runtime_mtp4__DecodeWorkspace(config=config, schedule=schedule, q_4d=q_4d, q_scale_3d=q_scale_3d, split_out=torch.empty((1,), dtype=torch.float32, device=device), lse=torch.empty((1,), dtype=torch.float32, device=device), completion=torch.empty((1,), dtype=torch.int32, device=device), last_flags=torch.empty((1,), dtype=torch.int32, device=device), out=torch.empty((1,), dtype=torch.bfloat16, device=device), heads_per_group=heads_per_group, all_chunks_aligned=bool(torch.all(inputs.kv_lens % config.chunk_tokens == 0).item()), static_sched=True, static_chunk_tokens=config.chunk_tokens, static_max_groups=max_groups)
-    resolved = _runtime_mtp4___resolve_mtp4_final_policy(provisional) if policy_mode == 'auto' else policy_mode
-    if resolved not in ('winner', 'c2-raw', 'pdl', 'pdl-s'):
-        raise ValueError(f'unsupported MTP=4 static policy: {resolved}')
-    split_out = torch.empty((batch, partial_storage_slots, _runtime_mtp4__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM), dtype=torch.float32, device=device)
-    if resolved == 'pdl-s':
-        lse = torch.empty((batch, num_head_kv, _runtime_mtp4__NUM_SEQ_Q, pad_heads, partial_storage_slots), dtype=torch.float32, device=device).permute(0, 4, 1, 2, 3)
+    provisional = _runtime_mtp4__DecodeWorkspace(
+        config=config,
+        schedule=schedule,
+        q_4d=q_4d,
+        q_scale_3d=q_scale_3d,
+        split_out=torch.empty((1,), dtype=torch.float32, device=device),
+        lse=torch.empty((1,), dtype=torch.float32, device=device),
+        completion=torch.empty((1,), dtype=torch.int32, device=device),
+        last_flags=torch.empty((1,), dtype=torch.int32, device=device),
+        out=torch.empty((1,), dtype=torch.bfloat16, device=device),
+        heads_per_group=heads_per_group,
+        all_chunks_aligned=bool(torch.all(inputs.kv_lens % config.chunk_tokens == 0).item()),
+        static_sched=True,
+        static_chunk_tokens=config.chunk_tokens,
+        static_max_groups=max_groups,
+    )
+    resolved = _runtime_mtp4___resolve_mtp4_final_policy(provisional) if policy_mode == "auto" else policy_mode
+    if resolved not in ("winner", "c2-raw", "pdl", "pdl-s"):
+        raise ValueError(f"unsupported MTP=4 static policy: {resolved}")
+    split_out = torch.empty(
+        (batch, partial_storage_slots, _runtime_mtp4__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM),
+        dtype=torch.float32,
+        device=device,
+    )
+    if resolved == "pdl-s":
+        lse = torch.empty(
+            (batch, num_head_kv, _runtime_mtp4__NUM_SEQ_Q, pad_heads, partial_storage_slots),
+            dtype=torch.float32,
+            device=device,
+        ).permute(0, 4, 1, 2, 3)
     else:
-        lse = torch.empty((batch, partial_storage_slots, num_head_kv, _runtime_mtp4__NUM_SEQ_Q, pad_heads), dtype=torch.float32, device=device)
+        lse = torch.empty(
+            (batch, partial_storage_slots, num_head_kv, _runtime_mtp4__NUM_SEQ_Q, pad_heads),
+            dtype=torch.float32,
+            device=device,
+        )
     provisional.split_out = split_out
     provisional.lse = lse
-    provisional.completion = torch.zeros((batch * num_head_kv * (1 + max_final_chunks),), dtype=torch.int32, device=device)
+    provisional.completion = torch.zeros(
+        (batch * num_head_kv * (1 + max_final_chunks),), dtype=torch.int32, device=device
+    )
     provisional.last_flags = torch.zeros((physical_ctas,), dtype=torch.int32, device=device)
-    provisional.out = torch.empty((batch, _runtime_mtp4__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM), dtype=torch.bfloat16, device=device)
+    provisional.out = torch.empty(
+        (batch, _runtime_mtp4__NUM_SEQ_Q, num_head_q, _runtime__HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
     provisional.final_policy_mode = resolved
     return provisional
 
-def _static_mtp4__fp8_kvpertensor_decode_mtp4_static(inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace) -> torch.Tensor:
+
+def _static_mtp4__fp8_kvpertensor_decode_mtp4_static(
+    inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace
+) -> torch.Tensor:
     """Run the dynamic winner stack with analytic strict-static scheduling."""
     if not workspace.static_sched:
-        raise ValueError('workspace was not prepared for strict-static MTP=4')
+        raise ValueError("workspace was not prepared for strict-static MTP=4")
     if inputs.k_scale.ndim != 4 or inputs.v_scale.numel() < inputs.k_cache.shape[2]:
-        raise ValueError('quant_type=0 requires packed rank-4 K scales and one V scale per KV head')
+        raise ValueError("quant_type=0 requires packed rank-4 K scales and one V scale per KV head")
     return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_final(inputs, workspace)
+
 
 def _static_mtp4___quant0_winner_defaults(workspace: _runtime_mtp4__DecodeWorkspace) -> tuple[bool, bool, bool, bool]:
     config = workspace.config
@@ -3330,7 +4022,17 @@ def _static_mtp4___quant0_winner_defaults(workspace: _runtime_mtp4__DecodeWorksp
     aligned = config.cluster_size == 2 and config.chunk_tokens in (256, 1024) and workspace.all_chunks_aligned
     return (tma, page, precombine, aligned)
 
-def _static_mtp4___run_static_quant0_winner_route(inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace, *, tma: bool, page: bool, precombine: bool, aligned: bool, full_view_v: bool) -> torch.Tensor:
+
+def _static_mtp4___run_static_quant0_winner_route(
+    inputs: _runtime_mtp4__DecodeInputs,
+    workspace: _runtime_mtp4__DecodeWorkspace,
+    *,
+    tma: bool,
+    page: bool,
+    precombine: bool,
+    aligned: bool,
+    full_view_v: bool,
+) -> torch.Tensor:
     config = workspace.config
     groups = workspace.static_max_groups
     use_c4 = config.cluster_size == 4
@@ -3338,64 +4040,208 @@ def _static_mtp4___run_static_quant0_winner_route(inputs: _runtime_mtp4__DecodeI
     rank0_quad = config.cluster_size == 2 and groups == 4
     sharded_quad = config.cluster_size == 2 and groups >= 32
     general_quad = rank0_quad or sharded_quad
-    return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(inputs, workspace, paired_head_finalize=use_c4 or general_quad, direct_fast_path=True, quad_head_two_chunk_finalize=exact_two, fast_finalizer_handoff=use_c4 or sharded_quad, rank0_only_finalizer=exact_two or rank0_quad, skip_trailing_finalizer_barrier=use_c4 or exact_two or general_quad, maxnreg=240 if use_c4 else None, prefetch_k_scale=tma, tma_k_scale=tma, page_metadata_k_scale=page, precombine_q_scale=precombine, c2_aligned_full_chunk_winner=aligned, full_view_v_rs=full_view_v, execution_stage='full', c4_bf16_dsm=False, c4_deferred_norm=False, c4_global_deferred_norm=False, c4_reduction_only_raw=False, c4_aligned_full_chunk_raw=False, pdl_notify=False, flatten_output=True)
+    return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_pure_tle(
+        inputs,
+        workspace,
+        paired_head_finalize=use_c4 or general_quad,
+        direct_fast_path=True,
+        quad_head_two_chunk_finalize=exact_two,
+        fast_finalizer_handoff=use_c4 or sharded_quad,
+        rank0_only_finalizer=exact_two or rank0_quad,
+        skip_trailing_finalizer_barrier=use_c4 or exact_two or general_quad,
+        maxnreg=240 if use_c4 else None,
+        prefetch_k_scale=tma,
+        tma_k_scale=tma,
+        page_metadata_k_scale=page,
+        precombine_q_scale=precombine,
+        c2_aligned_full_chunk_winner=aligned,
+        full_view_v_rs=full_view_v,
+        execution_stage="full",
+        c4_bf16_dsm=False,
+        c4_deferred_norm=False,
+        c4_global_deferred_norm=False,
+        c4_reduction_only_raw=False,
+        c4_aligned_full_chunk_raw=False,
+        pdl_notify=False,
+        flatten_output=True,
+    )
+
 
 def _static_mtp4___quant0_pdl_defaults(workspace: _runtime_mtp4__DecodeWorkspace) -> tuple[bool, bool, bool, int]:
     config = workspace.config
     mode = workspace.final_policy_mode
     batch = int(workspace.q_4d.shape[0])
-    page = mode == 'pdl' and config.cluster_size == 4 and (config.chunk_tokens == 512) and (batch == 8)
-    aligned = config.cluster_size == 4 and (config.chunk_tokens == 512 and mode == 'pdl' and (batch in (8, 16)) or (config.chunk_tokens == 1024 and mode in ('pdl', 'pdl-s'))) and workspace.all_chunks_aligned
-    return (page, aligned, aligned, 192 if mode == 'pdl' else 240)
+    page = mode == "pdl" and config.cluster_size == 4 and (config.chunk_tokens == 512) and (batch == 8)
+    aligned = (
+        config.cluster_size == 4
+        and (
+            config.chunk_tokens == 512
+            and mode == "pdl"
+            and (batch in (8, 16))
+            or (config.chunk_tokens == 1024 and mode in ("pdl", "pdl-s"))
+        )
+        and workspace.all_chunks_aligned
+    )
+    return (page, aligned, aligned, 192 if mode == "pdl" else 240)
 
-def _static_mtp4___run_static_quant0_pdl_route(inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace, *, page: bool, precombine: bool, aligned: bool, maxnreg: int) -> torch.Tensor:
+
+def _static_mtp4___run_static_quant0_pdl_route(
+    inputs: _runtime_mtp4__DecodeInputs,
+    workspace: _runtime_mtp4__DecodeWorkspace,
+    *,
+    page: bool,
+    precombine: bool,
+    aligned: bool,
+    maxnreg: int,
+) -> torch.Tensor:
     reduction_only = aligned and workspace.config.cluster_size == 4 and (workspace.config.chunk_tokens == 512)
-    return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_detached_raw_finalize(inputs, workspace, maxnreg=maxnreg, page_metadata_k_scale=page, precombine_q_scale=precombine, reduction_only_raw=reduction_only, aligned_full_chunk_raw=aligned)
+    return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_detached_raw_finalize(
+        inputs,
+        workspace,
+        maxnreg=maxnreg,
+        page_metadata_k_scale=page,
+        precombine_q_scale=precombine,
+        reduction_only_raw=reduction_only,
+        aligned_full_chunk_raw=aligned,
+    )
 
-def _static_mtp4__fp8_kvpertensor_decode_mtp4_static_quant0_tuned(inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace, *, route: str) -> torch.Tensor:
+
+def _static_mtp4__fp8_kvpertensor_decode_mtp4_static_quant0_tuned(
+    inputs: _runtime_mtp4__DecodeInputs, workspace: _runtime_mtp4__DecodeWorkspace, *, route: str
+) -> torch.Tensor:
     """Run one finalized quant0 strict-static winner with fixed policy."""
     mode = workspace.final_policy_mode
-    if route == 'dynamic':
+    if route == "dynamic":
         return _static_mtp4__fp8_kvpertensor_decode_mtp4_static(inputs, workspace)
-    if mode == 'winner':
+    if mode == "winner":
         tma, page, precombine, aligned = _static_mtp4___quant0_winner_defaults(workspace)
-        if route == 'scale_flip':
+        if route == "scale_flip":
             precombine = not precombine
-        elif route == 'scale_on':
+        elif route == "scale_on":
             precombine = True
-        elif route == 'tma':
+        elif route == "tma":
             tma, page = (True, False)
-        elif route == 'full_v':
-            return _static_mtp4___run_static_quant0_winner_route(inputs, workspace, tma=tma, page=page, precombine=precombine, aligned=aligned, full_view_v=True)
+        elif route == "full_v":
+            return _static_mtp4___run_static_quant0_winner_route(
+                inputs, workspace, tma=tma, page=page, precombine=precombine, aligned=aligned, full_view_v=True
+            )
         else:
-            raise ValueError(f'unsupported quant0 winner route: {route}')
-        return _static_mtp4___run_static_quant0_winner_route(inputs, workspace, tma=tma, page=page, precombine=precombine, aligned=aligned, full_view_v=False)
-    if mode == 'c2-raw':
-        if route != 'scale_on':
-            raise ValueError(f'unsupported quant0 C2 raw route: {route}')
-        aligned = workspace.config.cluster_size == 2 and workspace.config.chunk_tokens == 1024 and workspace.all_chunks_aligned
-        return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_c2_bf16_dsm_specialized(inputs, workspace, prefetch_k_scale=True, precombine_q_scale=True, aligned_full_chunk_winner=aligned, page_metadata_k_scale=False)
-    if mode not in ('pdl', 'pdl-s'):
-        raise ValueError(f'unsupported quant0 static mode: {mode}')
+            raise ValueError(f"unsupported quant0 winner route: {route}")
+        return _static_mtp4___run_static_quant0_winner_route(
+            inputs, workspace, tma=tma, page=page, precombine=precombine, aligned=aligned, full_view_v=False
+        )
+    if mode == "c2-raw":
+        if route != "scale_on":
+            raise ValueError(f"unsupported quant0 C2 raw route: {route}")
+        aligned = (
+            workspace.config.cluster_size == 2
+            and workspace.config.chunk_tokens == 1024
+            and workspace.all_chunks_aligned
+        )
+        return _runtime_mtp4__fp8_kvpertensor_decode_mtp4_c2_bf16_dsm_specialized(
+            inputs,
+            workspace,
+            prefetch_k_scale=True,
+            precombine_q_scale=True,
+            aligned_full_chunk_winner=aligned,
+            page_metadata_k_scale=False,
+        )
+    if mode not in ("pdl", "pdl-s"):
+        raise ValueError(f"unsupported quant0 static mode: {mode}")
     page, precombine, aligned, maxnreg = _static_mtp4___quant0_pdl_defaults(workspace)
-    if route == 'scale_flip':
+    if route == "scale_flip":
         precombine = not precombine
-    elif route == 'noalign':
+    elif route == "noalign":
         aligned = False
-    elif route == 'page':
+    elif route == "page":
         page = True
-    elif route == 'scalar_major':
-        if mode != 'pdl':
-            raise ValueError('scalar_major requires a forced PDL workspace')
+    elif route == "scalar_major":
+        if mode != "pdl":
+            raise ValueError("scalar_major requires a forced PDL workspace")
     else:
-        raise ValueError(f'unsupported quant0 PDL route: {route}')
-    return _static_mtp4___run_static_quant0_pdl_route(inputs, workspace, page=page, precombine=precombine, aligned=aligned, maxnreg=maxnreg)
+        raise ValueError(f"unsupported quant0 PDL route: {route}")
+    return _static_mtp4___run_static_quant0_pdl_route(
+        inputs, workspace, page=page, precombine=precombine, aligned=aligned, maxnreg=maxnreg
+    )
+
+
 _fp8_entry__HEAD_DIM = 128
 _fp8_entry__BLOCK_SIZE = 64
 _fp8_entry__SUPPORTED_MTP = (1, 2, 4)
-_fp8_entry__Schedule = Literal['static', 'dynamic']
-_fp8_entry__OFFICIAL_CASES = {'uniform_512': (512,) * 64, 'uniform_4096': (4096,) * 64, 'skewed_mix': (128,) * 32 + (4096,) * 32, 'skewed_extreme': (64,) * 15 + (16 * 1024,), 'one_64k_7x4k': (64 * 1024,) + (4096,) * 7, 'one_64k_15x4k': (64 * 1024,) + (4096,) * 15, 'one_64k_31x4k': (64 * 1024,) + (4096,) * 31, 'one_128k_31x4k': (128 * 1024,) + (4096,) * 31, 'two_32k_30x4k': (32 * 1024,) * 2 + (4096,) * 30}
-_fp8_entry___STATIC_Q0_CT = {1: {'NHD': {'uniform_512': (4, 128), 'uniform_4096': (2, 1024), 'skewed_mix': (8, 512), 'skewed_extreme': (4, 128), 'one_64k_7x4k': (4, 256), 'one_64k_15x4k': (8, 512), 'one_64k_31x4k': (8, 512), 'one_128k_31x4k': (4, 1024), 'two_32k_30x4k': (8, 512)}, 'HND': {'uniform_512': (4, 128), 'uniform_4096': (2, 1024), 'skewed_mix': (8, 512), 'skewed_extreme': (4, 128), 'one_64k_7x4k': (4, 256), 'one_64k_15x4k': (4, 256), 'one_64k_31x4k': (8, 512), 'one_128k_31x4k': (4, 1024), 'two_32k_30x4k': (8, 512)}}, 2: {'uniform_512': (2, 256), 'uniform_4096': (2, 1024), 'skewed_mix': (2, 256), 'skewed_extreme': (4, 128), 'one_64k_7x4k': (4, 512), 'one_64k_15x4k': (4, 512), 'one_64k_31x4k': (2, 512), 'one_128k_31x4k': (4, 1024), 'two_32k_30x4k': (4, 512)}, 4: {'NHD': {'uniform_512': (2, 256), 'uniform_4096': (2, 1024), 'skewed_mix': (2, 512), 'skewed_extreme': (4, 128), 'one_64k_7x4k': (4, 512), 'one_64k_15x4k': (2, 512), 'one_64k_31x4k': (4, 1024), 'one_128k_31x4k': (4, 1024), 'two_32k_30x4k': (4, 1024)}, 'HND': {'uniform_512': (2, 256), 'uniform_4096': (2, 1024), 'skewed_mix': (2, 512), 'skewed_extreme': (4, 128), 'one_64k_7x4k': (4, 512), 'one_64k_15x4k': (4, 512), 'one_64k_31x4k': (2, 1024), 'one_128k_31x4k': (4, 1024), 'two_32k_30x4k': (4, 1024)}}}
+_fp8_entry__Schedule = Literal["static", "dynamic"]
+_fp8_entry__OFFICIAL_CASES = {
+    "uniform_512": (512,) * 64,
+    "uniform_4096": (4096,) * 64,
+    "skewed_mix": (128,) * 32 + (4096,) * 32,
+    "skewed_extreme": (64,) * 15 + (16 * 1024,),
+    "one_64k_7x4k": (64 * 1024,) + (4096,) * 7,
+    "one_64k_15x4k": (64 * 1024,) + (4096,) * 15,
+    "one_64k_31x4k": (64 * 1024,) + (4096,) * 31,
+    "one_128k_31x4k": (128 * 1024,) + (4096,) * 31,
+    "two_32k_30x4k": (32 * 1024,) * 2 + (4096,) * 30,
+}
+_fp8_entry___STATIC_Q0_CT = {
+    1: {
+        "NHD": {
+            "uniform_512": (4, 128),
+            "uniform_4096": (2, 1024),
+            "skewed_mix": (8, 512),
+            "skewed_extreme": (4, 128),
+            "one_64k_7x4k": (4, 256),
+            "one_64k_15x4k": (8, 512),
+            "one_64k_31x4k": (8, 512),
+            "one_128k_31x4k": (4, 1024),
+            "two_32k_30x4k": (8, 512),
+        },
+        "HND": {
+            "uniform_512": (4, 128),
+            "uniform_4096": (2, 1024),
+            "skewed_mix": (8, 512),
+            "skewed_extreme": (4, 128),
+            "one_64k_7x4k": (4, 256),
+            "one_64k_15x4k": (4, 256),
+            "one_64k_31x4k": (8, 512),
+            "one_128k_31x4k": (4, 1024),
+            "two_32k_30x4k": (8, 512),
+        },
+    },
+    2: {
+        "uniform_512": (2, 256),
+        "uniform_4096": (2, 1024),
+        "skewed_mix": (2, 256),
+        "skewed_extreme": (4, 128),
+        "one_64k_7x4k": (4, 512),
+        "one_64k_15x4k": (4, 512),
+        "one_64k_31x4k": (2, 512),
+        "one_128k_31x4k": (4, 1024),
+        "two_32k_30x4k": (4, 512),
+    },
+    4: {
+        "NHD": {
+            "uniform_512": (2, 256),
+            "uniform_4096": (2, 1024),
+            "skewed_mix": (2, 512),
+            "skewed_extreme": (4, 128),
+            "one_64k_7x4k": (4, 512),
+            "one_64k_15x4k": (2, 512),
+            "one_64k_31x4k": (4, 1024),
+            "one_128k_31x4k": (4, 1024),
+            "two_32k_30x4k": (4, 1024),
+        },
+        "HND": {
+            "uniform_512": (2, 256),
+            "uniform_4096": (2, 1024),
+            "skewed_mix": (2, 512),
+            "skewed_extreme": (4, 128),
+            "one_64k_7x4k": (4, 512),
+            "one_64k_15x4k": (4, 512),
+            "one_64k_31x4k": (2, 1024),
+            "one_128k_31x4k": (4, 1024),
+            "two_32k_30x4k": (4, 1024),
+        },
+    },
+}
+
 
 @dataclass
 class _fp8_entry__FP8DecodeInputs:
@@ -3415,8 +4261,9 @@ class _fp8_entry__FP8DecodeInputs:
     @property
     def mtp(self) -> int:
         if self.batch == 0 or self.q.shape[0] % self.batch:
-            raise ValueError('q leading dimension must equal batch * MTP')
+            raise ValueError("q leading dimension must equal batch * MTP")
         return int(self.q.shape[0] // self.batch)
+
 
 @dataclass(frozen=True)
 class _fp8_entry__FP8DecodePolicy:
@@ -3430,7 +4277,8 @@ class _fp8_entry__FP8DecodePolicy:
 
     @property
     def label(self) -> str:
-        return f'c{self.cluster_size}t{self.chunk_tokens}/{self.route}'
+        return f"c{self.cluster_size}t{self.chunk_tokens}/{self.route}"
+
 
 @dataclass
 class _fp8_entry__FP8DecodeWorkspace:
@@ -3438,57 +4286,60 @@ class _fp8_entry__FP8DecodeWorkspace:
     runtime_inputs: object
     runtime_workspace: object
 
+
 def _fp8_entry___layout(cache: torch.Tensor) -> str:
-    return 'HND' if cache.stride(2) > cache.stride(1) else 'NHD'
+    return "HND" if cache.stride(2) > cache.stride(1) else "NHD"
+
 
 def _fp8_entry___validate(inputs: _fp8_entry__FP8DecodeInputs) -> None:
     if inputs.mtp not in _fp8_entry__SUPPORTED_MTP:
-        raise ValueError('final FP8 decode supports MTP 1, 2, or 4')
+        raise ValueError("final FP8 decode supports MTP 1, 2, or 4")
     if inputs.q.ndim != 3 or inputs.q.shape[-1] != _fp8_entry__HEAD_DIM:
-        raise ValueError('q must have shape [batch * MTP,Hq,128]')
+        raise ValueError("q must have shape [batch * MTP,Hq,128]")
     if inputs.q.dtype != torch.float8_e4m3fn:
-        raise ValueError('q must be float8_e4m3fn')
-    for name, cache in (('k_cache', inputs.k_cache), ('v_cache', inputs.v_cache)):
+        raise ValueError("q must be float8_e4m3fn")
+    for name, cache in (("k_cache", inputs.k_cache), ("v_cache", inputs.v_cache)):
         if cache.element_size() != 1:
-            raise ValueError(f'{name} must use a 1-byte FP8 storage dtype')
+            raise ValueError(f"{name} must use a 1-byte FP8 storage dtype")
         if cache.ndim != 4 or cache.shape[1] != _fp8_entry__BLOCK_SIZE:
-            raise ValueError(f'{name} must have logical shape [block,64,Hkv,128]')
+            raise ValueError(f"{name} must have logical shape [block,64,Hkv,128]")
         if cache.shape[-1] != _fp8_entry__HEAD_DIM or cache.stride(-1) != 1:
-            raise ValueError(f'{name} head dimension must be contiguous 128')
+            raise ValueError(f"{name} head dimension must be contiguous 128")
     num_head_q = int(inputs.q.shape[1])
     num_head_kv = int(inputs.k_cache.shape[2])
     if (num_head_kv, num_head_q) not in ((1, 8), (4, 32)):
-        raise ValueError('final FP8 decode requires official GQA8 heads (Hkv,Hq)=(1,8) or (4,32)')
+        raise ValueError("final FP8 decode requires official GQA8 heads (Hkv,Hq)=(1,8) or (4,32)")
     if inputs.block_ids.dtype != torch.int32 or inputs.kv_lens.dtype != torch.int32:
-        raise ValueError('block_ids and kv_lens must be int32')
+        raise ValueError("block_ids and kv_lens must be int32")
+
 
 def _fp8_entry___classify_workload(lengths: tuple[int, ...]) -> str | None:
     count = len(lengths)
     if count == 64 and all((length == 512 for length in lengths)):
-        return 'uniform_512'
+        return "uniform_512"
     if count == 64 and all((length == 4096 for length in lengths)):
-        return 'uniform_4096'
+        return "uniform_4096"
     if count == 64 and lengths.count(128) == 32 and (lengths.count(4096) == 32):
-        return 'skewed_mix'
+        return "skewed_mix"
     if count == 16 and lengths.count(64) == 15 and (lengths.count(16384) == 1):
-        return 'skewed_extreme'
+        return "skewed_extreme"
     if lengths.count(65536) == 1 and lengths.count(4096) == count - 1:
         if count == 8:
-            return 'one_64k_7x4k'
+            return "one_64k_7x4k"
         if count == 16:
-            return 'one_64k_15x4k'
+            return "one_64k_15x4k"
         if count == 32:
-            return 'one_64k_31x4k'
+            return "one_64k_31x4k"
     if count == 32 and lengths.count(131072) == 1 and (lengths.count(4096) == 31):
-        return 'one_128k_31x4k'
+        return "one_128k_31x4k"
     if count == 32 and lengths.count(32768) == 2 and (lengths.count(4096) == 30):
-        return 'two_32k_30x4k'
+        return "two_32k_30x4k"
     return None
 
+
 def _fp8_entry___classify_workload_from_features(workload: DecodeWorkload) -> str | None:
-    return _fp8_entry___classify_workload(
-        tuple(value for value, count in workload.histogram for _ in range(count))
-    )
+    return _fp8_entry___classify_workload(tuple(value for value, count in workload.histogram for _ in range(count)))
+
 
 def _fp8_entry___case(inputs: _fp8_entry__FP8DecodeInputs) -> str:
     lengths = tuple(inputs.kv_lens.detach().cpu().to(torch.int64).tolist())
@@ -3496,28 +4347,62 @@ def _fp8_entry___case(inputs: _fp8_entry__FP8DecodeInputs) -> str:
     if workload is not None:
         return workload
     if not lengths or min(lengths) < inputs.mtp:
-        raise ValueError('each final KV length must be at least MTP')
-    return 'uniform_512' if max(lengths) <= 1024 else 'uniform_4096'
+        raise ValueError("each final KV length must be at least MTP")
+    return "uniform_512" if max(lengths) <= 1024 else "uniform_4096"
+
 
 def _fp8_entry___static_ct(mtp: int, case: str, layout: str) -> tuple[int, int]:
     panel = _fp8_entry___STATIC_Q0_CT[mtp]
     return panel[layout][case] if mtp in (1, 4) else panel[case]
 
+
 def _fp8_entry___route(mtp: int, case: str, layout: str) -> str:
     if mtp == 1:
-        return {('uniform_512', 'NHD'): 'causal-free', ('uniform_512', 'HND'): 'causal-free', ('uniform_4096', 'NHD'): 'metadata-prefetch', ('uniform_4096', 'HND'): 'metadata-prefetch', ('skewed_mix', 'NHD'): 'default', ('skewed_mix', 'HND'): 'metadata-prefetch', ('skewed_extreme', 'NHD'): 'qscale-fused', ('skewed_extreme', 'HND'): 'dsm-handoff', ('one_64k_7x4k', 'NHD'): 'barrier-sink', ('one_64k_7x4k', 'HND'): 'barrier-sink', ('one_64k_15x4k', 'NHD'): 'metadata-prefetch', ('one_64k_15x4k', 'HND'): 'barrier-sink', ('one_64k_31x4k', 'NHD'): 'metadata-prefetch', ('one_64k_31x4k', 'HND'): 'metadata-prefetch', ('one_128k_31x4k', 'NHD'): 'single-head-finalize', ('one_128k_31x4k', 'HND'): 'metadata-prefetch', ('two_32k_30x4k', 'NHD'): 'metadata-prefetch', ('two_32k_30x4k', 'HND'): 'default'}[case, layout]
+        return {
+            ("uniform_512", "NHD"): "causal-free",
+            ("uniform_512", "HND"): "causal-free",
+            ("uniform_4096", "NHD"): "metadata-prefetch",
+            ("uniform_4096", "HND"): "metadata-prefetch",
+            ("skewed_mix", "NHD"): "default",
+            ("skewed_mix", "HND"): "metadata-prefetch",
+            ("skewed_extreme", "NHD"): "qscale-fused",
+            ("skewed_extreme", "HND"): "dsm-handoff",
+            ("one_64k_7x4k", "NHD"): "barrier-sink",
+            ("one_64k_7x4k", "HND"): "barrier-sink",
+            ("one_64k_15x4k", "NHD"): "metadata-prefetch",
+            ("one_64k_15x4k", "HND"): "barrier-sink",
+            ("one_64k_31x4k", "NHD"): "metadata-prefetch",
+            ("one_64k_31x4k", "HND"): "metadata-prefetch",
+            ("one_128k_31x4k", "NHD"): "single-head-finalize",
+            ("one_128k_31x4k", "HND"): "metadata-prefetch",
+            ("two_32k_30x4k", "NHD"): "metadata-prefetch",
+            ("two_32k_30x4k", "HND"): "default",
+        }[case, layout]
     if mtp == 2:
-        if case == 'uniform_512':
-            return 'tma-k-scale' if layout == 'NHD' else 'packed-k-scale'
-        if case == 'uniform_4096':
-            return 'default'
-        if case == 'one_64k_15x4k':
-            return 'deferred-normalization'
-        if case == 'one_64k_31x4k':
-            return 'tail-election' if layout == 'NHD' else 'deferred-normalization'
-        return 'full-v-reduction'
+        if case == "uniform_512":
+            return "tma-k-scale" if layout == "NHD" else "packed-k-scale"
+        if case == "uniform_4096":
+            return "default"
+        if case == "one_64k_15x4k":
+            return "deferred-normalization"
+        if case == "one_64k_31x4k":
+            return "tail-election" if layout == "NHD" else "deferred-normalization"
+        return "full-v-reduction"
     backend = _fp8_entry___MTP4_Q0_ROUTES[case, layout]
-    return {'default': 'fused-default', 'full_v': 'full-v-reduction', 'noalign': 'tail-masked', 'nopdl': 'synchronous-finalize', 'r192': 'reduced-register-finalize', 'scalar_major': 'scalar-major-finalize', 'scale_flip': 'separated-q-scale', 'scale_on': 'precombined-q-scale', 'tma': 'tma-k-scale', 'dynamic': 'dynamic-core', 'page': 'page-k-scale'}[backend]
+    return {
+        "default": "fused-default",
+        "full_v": "full-v-reduction",
+        "noalign": "tail-masked",
+        "nopdl": "synchronous-finalize",
+        "r192": "reduced-register-finalize",
+        "scalar_major": "scalar-major-finalize",
+        "scale_flip": "separated-q-scale",
+        "scale_on": "precombined-q-scale",
+        "tma": "tma-k-scale",
+        "dynamic": "dynamic-core",
+        "page": "page-k-scale",
+    }[backend]
+
 
 def _fp8_entry__select_fp8_decode_policy(inputs: _fp8_entry__FP8DecodeInputs) -> _fp8_entry__FP8DecodePolicy:
     _fp8_entry___validate(inputs)
@@ -3525,77 +4410,180 @@ def _fp8_entry__select_fp8_decode_policy(inputs: _fp8_entry__FP8DecodeInputs) ->
     layout = _fp8_entry___layout(inputs.k_cache)
     cluster, tokens = _fp8_entry___static_ct(inputs.mtp, case, layout)
     route = _fp8_entry___route(inputs.mtp, case, layout)
-    workload = DecodeWorkload.from_lengths(
-        inputs.kv_lens.detach().cpu().to(torch.int64).tolist()
-    )
-    return _fp8_entry__FP8DecodePolicy('static', inputs.mtp, workload, layout, cluster, tokens, route)
+    workload = DecodeWorkload.from_lengths(inputs.kv_lens.detach().cpu().to(torch.int64).tolist())
+    return _fp8_entry__FP8DecodePolicy("static", inputs.mtp, workload, layout, cluster, tokens, route)
+
 
 def _fp8_entry___runtime_inputs(inputs: _fp8_entry__FP8DecodeInputs, mtp: int):
     input_type = {1: _runtime_mtp1__DecodeInputs, 2: _runtime_mtp2__DecodeInputs, 4: _runtime_mtp4__DecodeInputs}[mtp]
-    return input_type(inputs.q, inputs.k_cache, inputs.v_cache, inputs.block_ids, inputs.kv_lens, inputs.q_scale, inputs.k_scale, inputs.v_scale)
+    return input_type(
+        inputs.q,
+        inputs.k_cache,
+        inputs.v_cache,
+        inputs.block_ids,
+        inputs.kv_lens,
+        inputs.q_scale,
+        inputs.k_scale,
+        inputs.v_scale,
+    )
+
 
 def _fp8_entry__prepare_fp8_decode_workspace(inputs: _fp8_entry__FP8DecodeInputs) -> _fp8_entry__FP8DecodeWorkspace:
     policy = _fp8_entry__select_fp8_decode_policy(inputs)
     runtime_inputs = _fp8_entry___runtime_inputs(inputs, policy.mtp)
-    config_type = {1: _runtime_mtp1__DecodeConfig, 2: _runtime_mtp2__DecodeConfig, 4: _runtime_mtp4__DecodeConfig}[policy.mtp]
+    config_type = {1: _runtime_mtp1__DecodeConfig, 2: _runtime_mtp2__DecodeConfig, 4: _runtime_mtp4__DecodeConfig}[
+        policy.mtp
+    ]
     config = config_type(policy.cluster_size, policy.chunk_tokens)
     if policy.mtp == 1:
         runtime_workspace = _static_mtp1__prepare_static_decode_workspace(runtime_inputs, config)
     elif policy.mtp == 2:
         runtime_workspace = _static_mtp2__prepare_static_decode_workspace(runtime_inputs, config)
     else:
-        mode = 'pdl' if _fp8_entry___mtp4_static_route(policy) == 'scalar_major' else 'auto'
+        mode = "pdl" if _fp8_entry___mtp4_static_route(policy) == "scalar_major" else "auto"
         runtime_workspace = _static_mtp4__prepare_static_decode_workspace(runtime_inputs, config, policy_mode=mode)
     return _fp8_entry__FP8DecodeWorkspace(policy, runtime_inputs, runtime_workspace)
 
+
 def _fp8_entry___mtp1_options(policy: _fp8_entry__FP8DecodePolicy) -> dict[str, object]:
-    case = _fp8_entry___classify_workload_from_features(policy.workload) or ('uniform_512' if policy.workload.max_length <= 1024 else 'uniform_4096')
+    case = _fp8_entry___classify_workload_from_features(policy.workload) or (
+        "uniform_512" if policy.workload.max_length <= 1024 else "uniform_4096"
+    )
     layout = policy.layout
-    options = {('uniform_512', 'NHD'): dict(no_causal_mask=True, block_ids_prefetch=False), ('uniform_512', 'HND'): dict(no_causal_mask=True, block_ids_prefetch=False), ('uniform_4096', 'NHD'): dict(no_causal_mask=True, block_ids_prefetch=True), ('uniform_4096', 'HND'): dict(no_causal_mask=False, block_ids_prefetch=True), ('skewed_mix', 'NHD'): dict(no_causal_mask=False, block_ids_prefetch=False), ('skewed_mix', 'HND'): dict(no_causal_mask=False, block_ids_prefetch=True), ('skewed_extreme', 'NHD'): dict(no_causal_mask=True, precombine_q_scale=True), ('skewed_extreme', 'HND'): dict(no_causal_mask=True, election_mode='handoff'), ('one_64k_7x4k', 'NHD'): dict(no_causal_mask=True, skip_trailing_finalizer_barrier=True), ('one_64k_7x4k', 'HND'): dict(no_causal_mask=True, skip_trailing_finalizer_barrier=True), ('one_64k_15x4k', 'NHD'): dict(no_causal_mask=False, block_ids_prefetch=True), ('one_64k_15x4k', 'HND'): dict(no_causal_mask=True, skip_trailing_finalizer_barrier=True), ('one_64k_31x4k', 'NHD'): dict(no_causal_mask=False, block_ids_prefetch=True), ('one_64k_31x4k', 'HND'): dict(no_causal_mask=False, block_ids_prefetch=True), ('one_128k_31x4k', 'NHD'): dict(no_causal_mask=True, block_ids_prefetch=True, paired_head_finalize=False), ('one_128k_31x4k', 'HND'): dict(no_causal_mask=False, block_ids_prefetch=True), ('two_32k_30x4k', 'NHD'): dict(no_causal_mask=False, block_ids_prefetch=True), ('two_32k_30x4k', 'HND'): dict(no_causal_mask=False, block_ids_prefetch=False)}[case, layout]
+    options = {
+        ("uniform_512", "NHD"): dict(no_causal_mask=True, block_ids_prefetch=False),
+        ("uniform_512", "HND"): dict(no_causal_mask=True, block_ids_prefetch=False),
+        ("uniform_4096", "NHD"): dict(no_causal_mask=True, block_ids_prefetch=True),
+        ("uniform_4096", "HND"): dict(no_causal_mask=False, block_ids_prefetch=True),
+        ("skewed_mix", "NHD"): dict(no_causal_mask=False, block_ids_prefetch=False),
+        ("skewed_mix", "HND"): dict(no_causal_mask=False, block_ids_prefetch=True),
+        ("skewed_extreme", "NHD"): dict(no_causal_mask=True, precombine_q_scale=True),
+        ("skewed_extreme", "HND"): dict(no_causal_mask=True, election_mode="handoff"),
+        ("one_64k_7x4k", "NHD"): dict(no_causal_mask=True, skip_trailing_finalizer_barrier=True),
+        ("one_64k_7x4k", "HND"): dict(no_causal_mask=True, skip_trailing_finalizer_barrier=True),
+        ("one_64k_15x4k", "NHD"): dict(no_causal_mask=False, block_ids_prefetch=True),
+        ("one_64k_15x4k", "HND"): dict(no_causal_mask=True, skip_trailing_finalizer_barrier=True),
+        ("one_64k_31x4k", "NHD"): dict(no_causal_mask=False, block_ids_prefetch=True),
+        ("one_64k_31x4k", "HND"): dict(no_causal_mask=False, block_ids_prefetch=True),
+        ("one_128k_31x4k", "NHD"): dict(no_causal_mask=True, block_ids_prefetch=True, paired_head_finalize=False),
+        ("one_128k_31x4k", "HND"): dict(no_causal_mask=False, block_ids_prefetch=True),
+        ("two_32k_30x4k", "NHD"): dict(no_causal_mask=False, block_ids_prefetch=True),
+        ("two_32k_30x4k", "HND"): dict(no_causal_mask=False, block_ids_prefetch=False),
+    }[case, layout]
     return dict(options)
 
+
 def _fp8_entry___mtp2_options(policy: _fp8_entry__FP8DecodePolicy) -> dict[str, object]:
-    case = _fp8_entry___classify_workload_from_features(policy.workload) or ('uniform_512' if policy.workload.max_length <= 1024 else 'uniform_4096')
+    case = _fp8_entry___classify_workload_from_features(policy.workload) or (
+        "uniform_512" if policy.workload.max_length <= 1024 else "uniform_4096"
+    )
     layout = policy.layout
-    if case == 'uniform_512':
-        return dict(tma_k_scale=layout == 'NHD', precombine_q_scale=False)
-    if case == 'uniform_4096':
+    if case == "uniform_512":
+        return dict(tma_k_scale=layout == "NHD", precombine_q_scale=False)
+    if case == "uniform_4096":
         return dict()
-    if case == 'one_64k_15x4k':
+    if case == "one_64k_15x4k":
         return dict(bf16_dsm=True, deferred_norm=True)
-    if case == 'one_64k_31x4k':
-        return dict(tail_only_election_barrier=True) if layout == 'NHD' else dict(bf16_dsm=True, deferred_norm=True)
+    if case == "one_64k_31x4k":
+        return dict(tail_only_election_barrier=True) if layout == "NHD" else dict(bf16_dsm=True, deferred_norm=True)
     return dict(full_view_v_rs=True)
-_fp8_entry___MTP4_Q0_ROUTES = {('uniform_512', 'NHD'): 'scale_flip', ('uniform_512', 'HND'): 'scale_flip', ('uniform_4096', 'NHD'): 'scale_on', ('uniform_4096', 'HND'): 'scale_on', ('skewed_mix', 'NHD'): 'tma', ('skewed_mix', 'HND'): 'tma', ('skewed_extreme', 'NHD'): 'full_v', ('skewed_extreme', 'HND'): 'full_v', ('one_64k_7x4k', 'NHD'): 'dynamic', ('one_64k_7x4k', 'HND'): 'scale_flip', ('one_64k_15x4k', 'NHD'): 'tma', ('one_64k_15x4k', 'HND'): 'noalign', ('one_64k_31x4k', 'NHD'): 'page', ('one_64k_31x4k', 'HND'): 'full_v', ('one_128k_31x4k', 'NHD'): 'scalar_major', ('one_128k_31x4k', 'HND'): 'scalar_major', ('two_32k_30x4k', 'NHD'): 'page', ('two_32k_30x4k', 'HND'): 'page'}
+
+
+_fp8_entry___MTP4_Q0_ROUTES = {
+    ("uniform_512", "NHD"): "scale_flip",
+    ("uniform_512", "HND"): "scale_flip",
+    ("uniform_4096", "NHD"): "scale_on",
+    ("uniform_4096", "HND"): "scale_on",
+    ("skewed_mix", "NHD"): "tma",
+    ("skewed_mix", "HND"): "tma",
+    ("skewed_extreme", "NHD"): "full_v",
+    ("skewed_extreme", "HND"): "full_v",
+    ("one_64k_7x4k", "NHD"): "dynamic",
+    ("one_64k_7x4k", "HND"): "scale_flip",
+    ("one_64k_15x4k", "NHD"): "tma",
+    ("one_64k_15x4k", "HND"): "noalign",
+    ("one_64k_31x4k", "NHD"): "page",
+    ("one_64k_31x4k", "HND"): "full_v",
+    ("one_128k_31x4k", "NHD"): "scalar_major",
+    ("one_128k_31x4k", "HND"): "scalar_major",
+    ("two_32k_30x4k", "NHD"): "page",
+    ("two_32k_30x4k", "HND"): "page",
+}
+
 
 def _fp8_entry___mtp4_static_route(policy: _fp8_entry__FP8DecodePolicy) -> str:
     table = _fp8_entry___MTP4_Q0_ROUTES
-    case = _fp8_entry___classify_workload_from_features(policy.workload) or ('uniform_512' if policy.workload.max_length <= 1024 else 'uniform_4096')
+    case = _fp8_entry___classify_workload_from_features(policy.workload) or (
+        "uniform_512" if policy.workload.max_length <= 1024 else "uniform_4096"
+    )
     return table[case, policy.layout]
 
-def _fp8_entry__attention_decode_fp8_tle(inputs: _fp8_entry__FP8DecodeInputs, workspace: _fp8_entry__FP8DecodeWorkspace) -> torch.Tensor:
+
+def _fp8_entry__attention_decode_fp8_tle(
+    inputs: _fp8_entry__FP8DecodeInputs, workspace: _fp8_entry__FP8DecodeWorkspace
+) -> torch.Tensor:
     policy = workspace.policy
     _fp8_entry___validate(inputs)
     if policy.mtp != inputs.mtp or policy.layout != _fp8_entry___layout(inputs.k_cache):
-        raise ValueError('workspace policy does not match inputs')
+        raise ValueError("workspace policy does not match inputs")
     runtime_inputs = workspace.runtime_inputs
     runtime_workspace = workspace.runtime_workspace
     if policy.mtp == 1:
-        return _static_mtp1__fp8_kvpertensor_decode_mtp1_static(runtime_inputs, runtime_workspace, **{'no_causal_mask': True, 'block_ids_prefetch': False, 'paired_head_finalize': None, 'bf16_dsm': None, 'deferred_norm': None, 'election_mode': None, 'precombine_q_scale': None, 'skip_trailing_finalizer_barrier': None, 'c2_raw': None, 'tma_k_scale': None, 'page_metadata_k_scale': False, 'flatten_output': True, **_fp8_entry___mtp1_options(policy)})
+        return _static_mtp1__fp8_kvpertensor_decode_mtp1_static(
+            runtime_inputs,
+            runtime_workspace,
+            **{
+                "no_causal_mask": True,
+                "block_ids_prefetch": False,
+                "paired_head_finalize": None,
+                "bf16_dsm": None,
+                "deferred_norm": None,
+                "election_mode": None,
+                "precombine_q_scale": None,
+                "skip_trailing_finalizer_barrier": None,
+                "c2_raw": None,
+                "tma_k_scale": None,
+                "page_metadata_k_scale": False,
+                "flatten_output": True,
+                **_fp8_entry___mtp1_options(policy),
+            },
+        )
     if policy.mtp == 2:
-        return _static_mtp2__fp8_kvpertensor_decode_mtp2_static(runtime_inputs, runtime_workspace, **{'paired_head_finalize': None, 'bf16_dsm': None, 'deferred_norm': None, 'election_mode': None, 'tail_only_election_barrier': False, 'precombine_q_scale': None, 'skip_trailing_finalizer_barrier': None, 'full_view_dsm': False, 'full_view_v_rs': None, 'c2_raw': None, 'tma_k_scale': None, 'page_metadata_k_scale': False, 'flatten_output': True, **_fp8_entry___mtp2_options(policy)})
+        return _static_mtp2__fp8_kvpertensor_decode_mtp2_static(
+            runtime_inputs,
+            runtime_workspace,
+            **{
+                "paired_head_finalize": None,
+                "bf16_dsm": None,
+                "deferred_norm": None,
+                "election_mode": None,
+                "tail_only_election_barrier": False,
+                "precombine_q_scale": None,
+                "skip_trailing_finalizer_barrier": None,
+                "full_view_dsm": False,
+                "full_view_v_rs": None,
+                "c2_raw": None,
+                "tma_k_scale": None,
+                "page_metadata_k_scale": False,
+                "flatten_output": True,
+                **_fp8_entry___mtp2_options(policy),
+            },
+        )
     route = _fp8_entry___mtp4_static_route(policy)
     return _static_mtp4__fp8_kvpertensor_decode_mtp4_static_quant0_tuned(runtime_inputs, runtime_workspace, route=route)
 
+
 def _fp8_entry__fp8_workspace_is_reset(workspace: _fp8_entry__FP8DecodeWorkspace) -> bool:
-    completion = getattr(workspace.runtime_workspace, 'completion', None)
+    completion = getattr(workspace.runtime_workspace, "completion", None)
     return completion is None or not bool(torch.count_nonzero(completion).item())
-QUANT_TYPE = 'qkpertoken_perhead_vperhead'
+
+
+QUANT_TYPE = "qkpertoken_perhead_vperhead"
 QUANT_TYPE_ID = 0
 BLOCK_SIZE = _fp8_entry__BLOCK_SIZE
 HEAD_DIM = _fp8_entry__HEAD_DIM
 SUPPORTED_MTP = _fp8_entry__SUPPORTED_MTP
-QUANT_TYPES = ('qkpertoken_perhead_vperhead',)
+QUANT_TYPES = ("qkpertoken_perhead_vperhead",)
 OFFICIAL_CASES = _fp8_entry__OFFICIAL_CASES
 FP8DecodeInputs = _fp8_entry__FP8DecodeInputs
 FP8DecodePolicy = _fp8_entry__FP8DecodePolicy
@@ -3603,15 +4591,22 @@ FP8DecodeWorkspace = _fp8_entry__FP8DecodeWorkspace
 
 select_decode_policy = _fp8_entry__select_fp8_decode_policy
 
+
 def prepare_decode_workspace(inputs):
     if not USE_TLE:
-        return prepare_pure_triton_mtp1_workspace(inputs, QUANT_TYPE)
+        if inputs.mtp == 1:
+            return prepare_pure_triton_mtp1_workspace(inputs, QUANT_TYPE)
+        return prepare_pure_triton_mtp_workspace(inputs, QUANT_TYPE)
     return _fp8_entry__prepare_fp8_decode_workspace(inputs)
+
 
 def attention_decode_fp8(inputs, workspace):
     if isinstance(workspace, PureTritonMTP1Workspace):
         return attention_decode_pure_triton_mtp1(inputs, workspace)
+    if isinstance(workspace, PureTritonMTPWorkspace):
+        return attention_decode_pure_triton_mtp(inputs, workspace)
     return _fp8_entry__attention_decode_fp8_tle(inputs, workspace)
+
 
 def workspace_is_reset(workspace):
     if isinstance(workspace, PureTritonMTP1Workspace):

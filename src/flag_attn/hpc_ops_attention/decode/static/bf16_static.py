@@ -24,17 +24,30 @@ restage with a zero-copy ``tle.memdesc_wgmma_view`` while the validated wide,
 pipeline, full-tail, deferred-DSM and specialized-finalizer policies remain
 fixed for their selected panels.
 """
+
 from __future__ import annotations
+
+from dataclasses import dataclass
+import torch
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+
 import triton
 import triton.language as tl
 from .. import (
+    DecodeWorkload,
+    PureTritonMTPWorkspace,
     PureTritonMTP1Workspace,
     USE_TLE,
+    attention_decode_pure_triton_mtp,
     attention_decode_pure_triton_mtp1,
+    prepare_pure_triton_mtp_workspace,
     prepare_pure_triton_mtp1_workspace,
     tle,
 )
+
 _base__TILE_N = tl.constexpr(64)
+
 
 @triton.jit
 def _base__bf16_decode_static_kernel(Q, K_DESC, V_DESC, BLOCK_IDS, KV_LENS, SPLIT_OUT, SPLIT_LSE, OUT, mesh: tl.constexpr, B: tl.constexpr, NUM_SEQ_Q: tl.constexpr, Q_ROWS: tl.constexpr, NUM_SEQ_Q_PAD: tl.constexpr, H_Q: tl.constexpr, HEADS_PER_GROUP: tl.constexpr, D: tl.constexpr, BLOCK_SIZE: tl.constexpr, MAX_BLOCKS: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CHUNK_TOKENS: tl.constexpr, MAX_GROUPS: tl.constexpr, Q_SB: tl.constexpr, Q_SM: tl.constexpr, Q_SH: tl.constexpr, SO_SB: tl.constexpr, SO_SG: tl.constexpr, SO_SM: tl.constexpr, SO_SH: tl.constexpr, SL_SB: tl.constexpr, SL_SG: tl.constexpr, SL_SM: tl.constexpr, SL_SH: tl.constexpr, O_SB: tl.constexpr, O_SM: tl.constexpr, O_SH: tl.constexpr):
@@ -55,7 +68,6 @@ def _base__bf16_decode_static_kernel(Q, K_DESC, V_DESC, BLOCK_IDS, KV_LENS, SPLI
     has_work = chunk < num_chunks
     chunk_len = tl.where(has_work, tl.minimum(CHUNK_TOKENS, total_len - chunk_start), 0)
     num_pages = (chunk_len + _base__TILE_N - 1) // _base__TILE_N
-    is_last_chunk = has_work & (chunk_start + chunk_len >= total_len)
     q_smem = tle.gpu.alloc([Q_ROWS, D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
     p_smem = tle.gpu.alloc([_base__TILE_N, Q_ROWS], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
     k_raw = tle.gpu.alloc([_base__TILE_N, D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
@@ -76,10 +88,7 @@ def _base__bf16_decode_static_kernel(Q, K_DESC, V_DESC, BLOCK_IDS, KV_LENS, SPLI
     valid_row = has_work & (seq_m < NUM_SEQ_Q) & (h_in_group < HEADS_PER_GROUP) & (hq < H_Q)
     q_rows = tl.broadcast_to(offs_r[:, None], (Q_ROWS, D))
     q_cols = tl.broadcast_to(offs_d[None, :], (Q_ROWS, D))
-    p_rows = tl.broadcast_to(offs_n[:, None], (_base__TILE_N, Q_ROWS))
-    p_cols = tl.broadcast_to(offs_r[None, :], (_base__TILE_N, Q_ROWS))
     q_ptr = tle.gpu.local_ptr(q_smem, (q_rows, q_cols))
-    p_ptr = tle.gpu.local_ptr(p_smem, (p_rows, p_cols))
     q = tl.load(Q + batch * Q_SB + seq_m[:, None] * Q_SM + hq[:, None] * Q_SH + offs_d[None, :], mask=valid_row[:, None], other=0.0)
     tl.store(q_ptr, q)
     bid_offs = tl.arange(0, CHUNK_TOKENS // BLOCK_SIZE)
@@ -219,7 +228,6 @@ def _cluster_deferred__bf16_decode_static_dsm_deferred_kernel(Q, K_DESC, V_DESC,
     has_work = chunk < num_chunks
     chunk_len = tl.where(has_work, tl.minimum(CHUNK_TOKENS, total_len - chunk_start), 0)
     num_pages = (chunk_len + _cluster_deferred__TILE_N - 1) // _cluster_deferred__TILE_N
-    is_last_chunk = has_work & (chunk_start + chunk_len >= total_len)
     q_smem = tle.gpu.alloc([Q_ROWS, D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
     p_smem = tle.gpu.alloc([_cluster_deferred__TILE_N, Q_ROWS], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
     k_raw = tle.gpu.alloc([_cluster_deferred__TILE_N, D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
@@ -240,10 +248,7 @@ def _cluster_deferred__bf16_decode_static_dsm_deferred_kernel(Q, K_DESC, V_DESC,
     valid_row = has_work & (seq_m < NUM_SEQ_Q) & (h_in_group < HEADS_PER_GROUP) & (hq < H_Q)
     q_rows = tl.broadcast_to(offs_r[:, None], (Q_ROWS, D))
     q_cols = tl.broadcast_to(offs_d[None, :], (Q_ROWS, D))
-    p_rows = tl.broadcast_to(offs_n[:, None], (_cluster_deferred__TILE_N, Q_ROWS))
-    p_cols = tl.broadcast_to(offs_r[None, :], (_cluster_deferred__TILE_N, Q_ROWS))
     q_ptr = tle.gpu.local_ptr(q_smem, (q_rows, q_cols))
-    p_ptr = tle.gpu.local_ptr(p_smem, (p_rows, p_cols))
     q = tl.load(Q + batch * Q_SB + seq_m[:, None] * Q_SM + hq[:, None] * Q_SH + offs_d[None, :], mask=valid_row[:, None], other=0.0)
     tl.store(q_ptr, q)
     bid_offs = tl.arange(0, CHUNK_TOKENS // BLOCK_SIZE)
@@ -388,10 +393,7 @@ def _cluster_fulltail__bf16_decode_static_fulltail_kernel(Q, K_DESC, V_DESC, BLO
     valid_row = has_work & (seq_m < NUM_SEQ_Q) & (h_in_group < HEADS_PER_GROUP) & (hq < H_Q)
     q_rows = tl.broadcast_to(offs_r[:, None], (Q_ROWS, D))
     q_cols = tl.broadcast_to(offs_d[None, :], (Q_ROWS, D))
-    p_rows = tl.broadcast_to(offs_n[:, None], (_cluster_fulltail__TILE_N, Q_ROWS))
-    p_cols = tl.broadcast_to(offs_r[None, :], (_cluster_fulltail__TILE_N, Q_ROWS))
     q_ptr = tle.gpu.local_ptr(q_smem, (q_rows, q_cols))
-    p_ptr = tle.gpu.local_ptr(p_smem, (p_rows, p_cols))
     q = tl.load(Q + batch * Q_SB + seq_m[:, None] * Q_SM + hq[:, None] * Q_SH + offs_d[None, :], mask=valid_row[:, None], other=0.0)
     tl.store(q_ptr, q)
     bid_offs = tl.arange(0, CHUNK_TOKENS // BLOCK_SIZE)
@@ -539,7 +541,6 @@ def _cluster_pipeline__bf16_decode_cluster_wide_pipeline_kernel(Q, K_DESC, V_DES
     chunk_len = tl.where(has_work, tl.minimum(CHUNK_TOKENS, total_len - chunk_start), 0)
     num_pages = (chunk_len + _cluster_pipeline__TILE_N - 1) // _cluster_pipeline__TILE_N
     pipeline_pages = tl.maximum(num_pages, 1)
-    is_last_chunk = has_work & (chunk_start + chunk_len >= total_len)
     q_smem = tle.gpu.alloc([Q_ROWS, D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
     k_smem = tle.gpu.alloc([_cluster_pipeline__TMA_STAGES, _cluster_pipeline__TILE_N, D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
     v_smem = tle.gpu.alloc([_cluster_pipeline__TMA_STAGES, _cluster_pipeline__TILE_N, D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
@@ -713,7 +714,6 @@ def _cluster_pipeline_deferred__bf16_decode_cluster_wide_pipeline_dsm_deferred_k
     chunk_len = tl.where(has_work, tl.minimum(CHUNK_TOKENS, total_len - chunk_start), 0)
     num_pages = (chunk_len + _cluster_pipeline_deferred__TILE_N - 1) // _cluster_pipeline_deferred__TILE_N
     pipeline_pages = tl.maximum(num_pages, 1)
-    is_last_chunk = has_work & (chunk_start + chunk_len >= total_len)
     q_smem = tle.gpu.alloc([Q_ROWS, D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
     k_smem = tle.gpu.alloc([_cluster_pipeline_deferred__TMA_STAGES, _cluster_pipeline_deferred__TILE_N, D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
     v_smem = tle.gpu.alloc([_cluster_pipeline_deferred__TMA_STAGES, _cluster_pipeline_deferred__TILE_N, D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem)
@@ -1136,10 +1136,7 @@ def _direct_fulltail__bf16_decode_direct_fulltail_kernel(Q, K_DESC, V_DESC, BLOC
     valid_row = (seq_m < NUM_SEQ_Q) & (h_in_group < HEADS_PER_GROUP) & (hq < H_Q)
     q_rows = tl.broadcast_to(offs_r[:, None], (Q_ROWS, D))
     q_cols = tl.broadcast_to(offs_d[None, :], (Q_ROWS, D))
-    p_rows = tl.broadcast_to(offs_n[:, None], (_direct_fulltail__TILE_N, Q_ROWS))
-    p_cols = tl.broadcast_to(offs_r[None, :], (_direct_fulltail__TILE_N, Q_ROWS))
     q_ptr = tle.gpu.local_ptr(q_smem, (q_rows, q_cols))
-    p_ptr = tle.gpu.local_ptr(p_smem, (p_rows, p_cols))
     q = tl.load(Q + batch * Q_SB + seq_m[:, None] * Q_SM + hq[:, None] * Q_SH + offs_d[None, :], mask=valid_row[:, None], other=0.0)
     tl.store(q_ptr, q)
     bid_offs = tl.arange(0, CHUNK_TOKENS // BLOCK_SIZE)
@@ -1433,10 +1430,7 @@ def _uniform512__bf16_decode_uniform512_delayed_v_kernel(Q, K_DESC, V_DESC, BLOC
     valid_row = (seq_m < NUM_SEQ_Q) & (h_in_group < HEADS_PER_GROUP) & (hq < H_Q)
     q_rows = tl.broadcast_to(offs_r[:, None], (Q_ROWS, D))
     q_cols = tl.broadcast_to(offs_d[None, :], (Q_ROWS, D))
-    p_rows = tl.broadcast_to(offs_n[:, None], (_uniform512__TILE_N, Q_ROWS))
-    p_cols = tl.broadcast_to(offs_r[None, :], (_uniform512__TILE_N, Q_ROWS))
     q_ptr = tle.gpu.local_ptr(q_smem, (q_rows, q_cols))
-    p_ptr = tle.gpu.local_ptr(p_smem, (p_rows, p_cols))
     q = tl.load(Q + batch * Q_SB + seq_m[:, None] * Q_SM + hq[:, None] * Q_SH + offs_d[None, :], mask=valid_row[:, None], other=0.0)
     tl.store(q_ptr, q)
     bid_offs = tl.arange(0, 16)
@@ -1490,10 +1484,6 @@ def _uniform512__bf16_decode_uniform512_delayed_v_kernel(Q, K_DESC, V_DESC, BLOC
     has_value = l_i > 0.0
     result = tl.where(has_value[:, None], acc / l_i[:, None], 0.0)
     tl.store(OUT + batch * O_SB + seq_m[:, None] * O_SM + hq[:, None] * O_SH + offs_d[None, :], result, mask=valid_row[:, None])
-from dataclasses import dataclass
-import torch
-from triton.tools.tensor_descriptor import TensorDescriptor
-from .. import DecodeWorkload
 _bf16_entry__HEAD_DIM = 128
 _bf16_entry__BLOCK_SIZE = 64
 _bf16_entry__TILE_N = 64
@@ -1700,14 +1690,29 @@ StaticBF16Policy = _bf16_entry__StaticBF16Policy
 StaticBF16Workspace = _bf16_entry__StaticBF16Workspace
 def prepare_static_bf16_workspace(inputs):
     if not USE_TLE:
-        return prepare_pure_triton_mtp1_workspace(inputs, "bf16")
+        if inputs.mtp == 1:
+            return prepare_pure_triton_mtp1_workspace(inputs, "bf16")
+        return prepare_pure_triton_mtp_workspace(inputs, "bf16")
     return _bf16_entry__prepare_static_bf16_workspace(inputs)
 
 
 def attention_decode_bf16_tle(inputs, workspace):
     if isinstance(workspace, PureTritonMTP1Workspace):
         return attention_decode_pure_triton_mtp1(inputs, workspace)
+    if isinstance(workspace, PureTritonMTPWorkspace):
+        return attention_decode_pure_triton_mtp(inputs, workspace)
     return _bf16_entry__attention_decode_bf16_tle(inputs, workspace)
 
+
 select_static_bf16_policy = _bf16_entry__select_static_bf16_policy
-__all__ = ['BLOCK_SIZE', 'HEAD_DIM', 'OFFICIAL_CASES', 'StaticBF16Inputs', 'StaticBF16Policy', 'StaticBF16Workspace', 'attention_decode_bf16_tle', 'prepare_static_bf16_workspace', 'select_static_bf16_policy']
+__all__ = [
+    "BLOCK_SIZE",
+    "HEAD_DIM",
+    "OFFICIAL_CASES",
+    "StaticBF16Inputs",
+    "StaticBF16Policy",
+    "StaticBF16Workspace",
+    "attention_decode_bf16_tle",
+    "prepare_static_bf16_workspace",
+    "select_static_bf16_policy",
+]
