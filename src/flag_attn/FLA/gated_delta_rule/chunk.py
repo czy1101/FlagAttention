@@ -9,21 +9,21 @@ import os
 
 import torch
 
-from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from .chunk_fused_tail_vblock import (
+from flag_attn.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from flag_attn.FLA.gated_delta_rule.chunk_fused_tail_vblock import (
     can_use_fused_tail_vblock,
     chunk_gated_delta_rule_fused_tail_vblock,
 )
-from .chunk_fused_forward import (
+from flag_attn.FLA.gated_delta_rule.chunk_fused_forward import (
     can_use_two_kernel_fused_forward,
     chunk_gdn_two_kernel_fwd,
 )
-from .chunk_o import chunk_fwd_o
-from .fused_cumsum_kkt_solve_tril import (
+from flag_attn.FLA.chunk_o import chunk_fwd_o
+from flag_attn.FLA.gated_delta_rule.fused_cumsum_kkt_solve_tril import (
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril,
 )
-from .utils import SUPPRESS_LEVEL
-from .wy_fast import (
+from flag_attn.FLA.utils import SUPPRESS_LEVEL
+from flag_attn.FLA.gated_delta_rule.wy_fast import (
     maybe_set_tle_recompute_allocator,
     recompute_w_u_fwd,
 )
@@ -86,7 +86,7 @@ def chunk_gated_delta_rule_fwd(
 
     if initial_state is None and output_final_state:
         try:
-            from .api import (
+            from flag_attn.FLA.gated_delta_rule.api import (
                 _can_use_tle_chunk_gated_delta_rule,
                 _tle_chunk_gated_delta_rule_fwd,
             )

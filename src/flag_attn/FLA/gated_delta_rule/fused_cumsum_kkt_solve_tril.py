@@ -10,10 +10,10 @@ import torch
 import triton
 import triton.language as tl
 
-from .compat import libentry, libtuner
-from .index import prepare_chunk_indices
-from .triton_ops_helper import exp, make_tensor_descriptor
-from .utils import is_tma_supported
+from flag_attn.FLA.compat import libentry, libtuner
+from flag_attn.FLA.index import prepare_chunk_indices
+from flag_attn.FLA.utils import is_tma_supported
+from flag_attn.FLA.utils import exp, make_tensor_descriptor
 
 
 FLA_TRIL_PRECISION = os.environ.get("FLAG_ATTN_TRIL_PRECISION", "ieee")

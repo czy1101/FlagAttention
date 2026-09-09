@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .compat import libentry
+from flag_attn.FLA.compat import libentry
 
 _FUSED_TAIL_BV = 16
 

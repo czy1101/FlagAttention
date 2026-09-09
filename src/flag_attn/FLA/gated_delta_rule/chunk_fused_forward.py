@@ -8,7 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
-from .compat import has_triton_tle, libentry, libtuner
+from flag_attn.FLA.compat import libentry, libtuner
+from flag_attn.utils import has_triton_tle
 
 TWO_KERNEL_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_TWO_KERNEL_TLE"
 if has_triton_tle(3, 6, 0):

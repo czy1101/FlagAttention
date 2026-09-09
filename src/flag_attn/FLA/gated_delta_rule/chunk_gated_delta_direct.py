@@ -8,8 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
-from .compat import libentry
-from .triton_ops_helper import exp
+from flag_attn.FLA.compat import libentry
+from flag_attn.FLA.utils import exp
 
 _DIRECT_MAX_T = 128
 _DIRECT_MAX_K = 128
