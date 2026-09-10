@@ -34,7 +34,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import current_platform, has_triton_tle, triton_jit
+from ..utils import current_platform, has_triton_tle, triton_jit
 
 if has_triton_tle():
     try:

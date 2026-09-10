@@ -36,12 +36,12 @@ from flag_attn.gated_delta_rule.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
-from flag_attn.runtime.backend._metax.gdn2.compat import (
+from ..compat import (
     autotune_cache_kwargs,
     exp2,
     has_triton_tle,
 )
-from flag_attn.runtime.backend._metax.gdn2.native.chunk_fwd import chunk_gdn2_fwd
+from .native.chunk_fwd import chunk_gdn2_fwd
 
 LN2 = 0.6931471805599453
 RCP_LN2 = 1.4426950408889634

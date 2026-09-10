@@ -11,3 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""MetaX-local native Triton GDN2 helpers.
+
+Keep this package initializer import-free so backend discovery does not eagerly
+load the native fallback dependency graph.
+"""

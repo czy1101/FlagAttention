@@ -12,31 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .gla import chunk_gla
-from .kda import chunk_kda
-from .nsa import parallel_nsa, parallel_nsa_compression
-from .minimax_sparse_attention import (
-    SPARSE_BLOCK_SIZE,
-    minimax_m3_index_decode,
-    minimax_m3_index_decode_score,
-    minimax_m3_index_score,
-    minimax_m3_index_topk,
-    minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode,
-)
-from .gdn2 import chunk_gdn2
+"""MetaX attention backend."""
 
-__all__ = [
-    "SPARSE_BLOCK_SIZE",
-    "chunk_gdn2",
-    "chunk_gla",
-    "chunk_kda",
-    "minimax_m3_index_decode",
-    "minimax_m3_index_decode_score",
-    "minimax_m3_index_score",
-    "minimax_m3_index_topk",
-    "minimax_m3_sparse_attn",
-    "minimax_m3_sparse_attn_decode",
-    "parallel_nsa",
-    "parallel_nsa_compression",
-]
+from __future__ import annotations
+
+import importlib
+
+
+_OPERATOR_EXPORTS = {
+    "SPARSE_BLOCK_SIZE": (".msa", "SPARSE_BLOCK_SIZE"),
+    "chunk_gdn2": (".FLA.gdn2", "chunk_gdn2"),
+    "chunk_gla": (".FLA.gla", "chunk_gla"),
+    "chunk_kda": (".FLA.kda", "chunk_kda"),
+    "minimax_m3_index_decode": (".msa", "minimax_m3_index_decode"),
+    "minimax_m3_index_decode_score": (
+        ".msa",
+        "minimax_m3_index_decode_score",
+    ),
+    "minimax_m3_index_score": (".msa", "minimax_m3_index_score"),
+    "minimax_m3_index_topk": (".msa", "minimax_m3_index_topk"),
+    "minimax_m3_sparse_attn": (".msa", "minimax_m3_sparse_attn"),
+    "minimax_m3_sparse_attn_decode": (
+        ".msa",
+        "minimax_m3_sparse_attn_decode",
+    ),
+    "parallel_nsa": (".FLA.nsa", "parallel_nsa"),
+    "parallel_nsa_compression": (
+        ".FLA.nsa",
+        "parallel_nsa_compression",
+    ),
+}
+
+
+def __getattr__(name: str):
+    try:
+        module_name, symbol = _OPERATOR_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+
+    value = getattr(importlib.import_module(module_name, __name__), symbol)
+    globals()[name] = value
+    return value
+
+
+__all__ = sorted(_OPERATOR_EXPORTS)

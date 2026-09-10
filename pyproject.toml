@@ -28,7 +28,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 
-dependencies = ["PyYAML>=6.0"]
+dependencies = []
 
 [project.optional-dependencies]
 triton = [
@@ -68,8 +68,4 @@ pythonpath = [
 
 [tool.ruff]
 ignore = ["E741"]
-line-length = 120
 
-[tool.setuptools.package-data]
-"flag_attn.runtime.backend._metax" = ["tune_configs.yaml"]
-"flag_attn.runtime.backend._metax.sage_attention" = ["csrc/*.cu", "NATIVE.md"]

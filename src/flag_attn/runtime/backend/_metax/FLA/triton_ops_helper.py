@@ -10,6 +10,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
+from .compat import autotune_cache_kwargs, exp2
+
 
 def get_exp():
     """Return exp implementation (fast or accurate) based on env flag."""
@@ -26,23 +28,6 @@ exp = get_exp()
 def log(x):
     """Wrapper around tl.log that casts to fp32 first (matching the original FLA op.py)."""
     return tl.log(x.to(tl.float32))
-
-
-@triton.jit
-def exp2(x):
-    """Base-2 exponential with fp32 computation."""
-    return tl.math.exp2(x.to(tl.float32))
-
-
-try:
-    import inspect
-
-    _SUPPORTS_AUTOTUNE_CACHE = (
-        "cache_results" in inspect.signature(triton.autotune).parameters
-    )
-except Exception:
-    _SUPPORTS_AUTOTUNE_CACHE = False
-autotune_cache_kwargs = {"cache_results": True} if _SUPPORTS_AUTOTUNE_CACHE else {}
 
 
 if hasattr(triton.language, "_experimental_make_tensor_descriptor"):

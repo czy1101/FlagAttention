@@ -12,17 +12,17 @@ import torch
 import triton
 import triton.language as tl
 
-from .nsa_bwd_preprocess import parallel_attn_bwd_preprocess
+from .bwd_preprocess import parallel_attn_bwd_preprocess
 from flag_attn.gated_linear_attention.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_lens,
     prepare_token_indices,
 )
-from .nsa_mean_pooling import mean_pooling
+from .mean_pooling import mean_pooling
 from .parallel_nsa_compression import parallel_nsa_compression
-from .nsa_triton_ops_helper import autotune_cache_kwargs, exp, log
-from .nsa_utils import _bitonic_merge
+from ..triton_ops_helper import autotune_cache_kwargs, exp, log
+from ..utils import _bitonic_merge
 from flag_attn.gated_linear_attention.utils import check_shared_mem, input_guard
 
 try:

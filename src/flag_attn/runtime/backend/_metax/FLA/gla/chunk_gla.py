@@ -19,8 +19,8 @@ except ImportError:
     tle = None
     HAS_TLE = False
 
-from .chunk_h import chunk_bwd_dh, chunk_fwd_h
-from .cumsum import chunk_local_cumsum
+from ..chunk_h import chunk_bwd_dh, chunk_fwd_h
+from ..cumsum import chunk_local_cumsum
 from flag_attn.gated_linear_attention.index import prepare_chunk_indices
 from flag_attn.gated_linear_attention.utils import check_shared_mem, input_guard
 

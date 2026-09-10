@@ -71,21 +71,17 @@ triton.knobs.autotuning.adjust_block_size = False
 class _CachedPlatform:
     """Return one cached PDL decision during benchmark iterations."""
 
-    def __init__(self, platform):
-        self._platform = platform
-        self._supports_pdl = platform.is_arch_support_pdl()
+    def __init__(self, supports_pdl: bool):
+        self._supports_pdl = supports_pdl
 
     def is_arch_support_pdl(self) -> bool:
         return self._supports_pdl
-
-    def __getattr__(self, name: str):
-        return getattr(self._platform, name)
 
 
 _flag_attn_index_module = sys.modules[minimax_m3_index_decode.__module__]
 _flag_attn_sparse_module = sys.modules[minimax_m3_sparse_attn_decode.__module__]
 _flag_attn_platform = _CachedPlatform(
-    _flag_attn_index_module.current_platform
+    _flag_attn_index_module.current_platform.is_arch_support_pdl()
 )
 _flag_attn_index_module.current_platform = _flag_attn_platform
 _flag_attn_sparse_module.current_platform = _flag_attn_platform
@@ -94,7 +90,7 @@ if VLLM_AVAILABLE:
     _vllm_index_module = sys.modules[vllm_index_decode.__module__]
     _vllm_sparse_module = sys.modules[vllm_sparse_attn_decode.__module__]
     _vllm_platform = _CachedPlatform(
-        _vllm_index_module.current_platform
+        _vllm_index_module.current_platform.is_arch_support_pdl()
     )
     _vllm_index_module.current_platform = _vllm_platform
     _vllm_sparse_module.current_platform = _vllm_platform
@@ -484,7 +480,7 @@ _DTYPES = ["bf16"] + (["fp8"] if _supports_fp8() else [])
 
 configs = [
     triton.testing.Benchmark(
-        x_names=["batch", "seq_len", "num_kv_heads", "num_heads"],
+        x_names=["shape"],
         x_vals=SHAPES,
         line_arg="provider",
         line_vals=_provider_vals(dtype_name),
@@ -501,17 +497,10 @@ configs = [
 
 @triton.testing.perf_report(configs)
 def bench_minimax_sparse_attention(
-    batch,
-    seq_len,
-    num_kv_heads,
-    num_heads,
-    mode,
-    provider,
-    dtype="bf16",
-    device="cuda",
+    shape, mode, provider, dtype="bf16", device="cuda"
 ):
     _require_cuda()
-    shape = (batch, seq_len, num_kv_heads, num_heads)
+    batch, seq_len, num_kv_heads, num_heads = shape
     decode = mode == "decode"
 
     if num_heads % num_kv_heads != 0:

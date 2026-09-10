@@ -22,7 +22,7 @@ import triton
 from triton.runtime.autotuner import Autotuner
 from triton.runtime.jit import JITFunction
 
-from ..compat import autotune_cache_kwargs
+from ...compat import autotune_cache_kwargs
 from ..tuning import get_tuned_config
 
 _shared = importlib.import_module("flag_attn.gated_linear_attention.chunk_gla")

@@ -21,7 +21,7 @@ from pathlib import Path
 
 import triton
 
-_CONFIG_PATH = Path(__file__).resolve().parents[1] / "tune_configs.yaml"
+_CONFIG_PATH = Path(__file__).resolve().parents[2] / "tune_configs.yaml"
 _FIELDS = {"META", "num_warps", "num_stages", "num_ctas", "maxnreg"}
 
 

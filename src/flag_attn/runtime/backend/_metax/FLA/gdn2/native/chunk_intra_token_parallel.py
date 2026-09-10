@@ -23,7 +23,7 @@ import triton.language as tl
 
 from ..tuning import get_tuned_config
 
-from flag_attn.runtime.backend._metax.gdn2.compat import autotune_cache_kwargs, exp2
+from ...compat import autotune_cache_kwargs, exp2
 
 
 @triton.heuristics(
