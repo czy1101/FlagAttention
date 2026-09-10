@@ -8,9 +8,9 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.runtime.backend._hygon.ops.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
-from flag_attn.runtime.backend._hygon.ops.FLA.triton_ops_helper import exp
-from flag_attn.runtime.backend._hygon.ops.FLA.utils import use_cuda_graph
+from ..index import prepare_chunk_indices, prepare_chunk_offsets
+from ..triton_ops_helper import exp
+from ..utils import use_cuda_graph
 from flag_attn.gated_delta_rule.compat import libentry, libtuner
 from flag_attn.runtime.backend._hygon import device
 

@@ -14,17 +14,17 @@ import triton.language as tl
 
 from flag_attn.runtime.backend import _hygon as runtime
 
-from flag_attn.runtime.backend._hygon.ops.FLA.bwd_preprocess import parallel_attn_bwd_preprocess
-from flag_attn.runtime.backend._hygon.ops.FLA.index import (
+from .bwd_preprocess import parallel_attn_bwd_preprocess
+from ..index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_lens,
     prepare_token_indices,
 )
-from flag_attn.runtime.backend._hygon.ops.FLA.mean_pooling import mean_pooling
-from flag_attn.runtime.backend._hygon.ops.FLA.parallel_nsa_compression import parallel_nsa_compression
-from flag_attn.runtime.backend._hygon.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp, log
-from flag_attn.runtime.backend._hygon.ops.FLA.utils import _bitonic_merge, check_shared_mem, input_guard
+from .mean_pooling import mean_pooling
+from .parallel_nsa_compression import parallel_nsa_compression
+from ..triton_ops_helper import autotune_cache_kwargs, exp, log
+from ..utils import _bitonic_merge, check_shared_mem, input_guard
 
 
 _BW1000_EARLY_V_ENV = "FLAGGEMS_NSA_BW1000_EARLY_V"

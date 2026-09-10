@@ -27,8 +27,8 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.runtime.backend._hygon.ops.FLA.index import prepare_chunk_indices
-from flag_attn.runtime.backend._hygon.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp2
+from ...index import prepare_chunk_indices
+from ...triton_ops_helper import autotune_cache_kwargs, exp2
 
 
 @triton.heuristics(

@@ -9,9 +9,9 @@
 
 import torch
 
-from flag_attn.runtime.backend._hygon.ops.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from flag_attn.runtime.backend._hygon.ops.chunk_gla import chunk_gla_fwd_o_gk
-from flag_attn.runtime.backend._hygon.ops.FLA.cumsum import chunk_local_cumsum
+from ..chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from ...gla.chunk_gla import chunk_gla_fwd_o_gk
+from ...cumsum import chunk_local_cumsum
 
 from .chunk_intra import chunk_gdn2_fwd_intra
 from .gate import kda_gate_chunk_cumsum

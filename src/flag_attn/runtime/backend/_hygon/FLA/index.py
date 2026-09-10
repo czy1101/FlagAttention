@@ -6,7 +6,7 @@
 import torch
 import triton
 
-from flag_attn.runtime.backend._hygon.ops.FLA.utils import tensor_cache
+from .utils import tensor_cache
 
 
 @tensor_cache

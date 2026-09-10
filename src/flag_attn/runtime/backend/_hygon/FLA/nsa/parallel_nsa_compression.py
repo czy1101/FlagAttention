@@ -9,14 +9,14 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.runtime.backend._hygon.ops.FLA.bwd_preprocess import parallel_attn_bwd_preprocess
-from flag_attn.runtime.backend._hygon.ops.FLA.index import (
+from .bwd_preprocess import parallel_attn_bwd_preprocess
+from ..index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_token_indices,
 )
-from flag_attn.runtime.backend._hygon.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp, log
-from flag_attn.runtime.backend._hygon.ops.FLA.utils import check_shared_mem, input_guard
+from ..triton_ops_helper import autotune_cache_kwargs, exp, log
+from ..utils import check_shared_mem, input_guard
 
 # ===========================================================================
 # Forward kernel

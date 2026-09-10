@@ -35,7 +35,7 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 
-from .utils import current_platform
+from ..utils import current_platform
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128

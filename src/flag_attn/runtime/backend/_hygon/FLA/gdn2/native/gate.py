@@ -12,8 +12,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from flag_attn.runtime.backend._hygon.ops.FLA.index import prepare_chunk_indices
-from flag_attn.runtime.backend._hygon.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp
+from ...index import prepare_chunk_indices
+from ...triton_ops_helper import autotune_cache_kwargs, exp
 
 
 def input_guard(fn):

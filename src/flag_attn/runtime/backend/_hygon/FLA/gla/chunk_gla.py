@@ -19,10 +19,10 @@ except ImportError:
     tle = None
     HAS_TLE = False
 
-from flag_attn.runtime.backend._hygon.ops.FLA.chunk_h import chunk_bwd_dh, chunk_fwd_h
-from flag_attn.runtime.backend._hygon.ops.FLA.cumsum_gla import chunk_local_cumsum
-from flag_attn.runtime.backend._hygon.ops.FLA.index import prepare_chunk_indices
-from flag_attn.runtime.backend._hygon.ops.FLA.utils import check_shared_mem, input_guard
+from ..chunk_h import chunk_bwd_dh, chunk_fwd_h
+from ..cumsum_gla import chunk_local_cumsum
+from ..index import prepare_chunk_indices
+from ..utils import check_shared_mem, input_guard
 
 RCP_LN2 = 1.4426950216
 

@@ -9,8 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.runtime.backend._hygon.ops.FLA.index import prepare_chunk_offsets
-from flag_attn.runtime.backend._hygon.ops.FLA.utils import check_shared_mem
+from .index import prepare_chunk_offsets
+from .utils import check_shared_mem
 
 BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
