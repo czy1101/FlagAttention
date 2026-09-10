@@ -18,20 +18,8 @@ from flag_attn.parallel_nsa.triton_ops_helper import (
     log,
     tle,
 )
-from flag_attn.parallel_nsa.triton_ops_helper import (
-    autotune_cache_kwargs,
-    exp,
-)
 from ..index import (
     prepare_lens_enflame,
-)
-from flag_attn.parallel_nsa.triton_ops_helper import (
-    autotune_cache_kwargs,
-    exp,
-    log,
-)
-from flag_attn.parallel_nsa.utils import (
-    _bitonic_merge,
 )
 from ..index import (
     prepare_token_indices_enflame as prepare_token_indices,

@@ -9,10 +9,7 @@ import torch
 import triton
 import triton.language as tl
 from ..index import (
-    prepare_chunk_indices_enflame as prepare_chunk_indices,
     prepare_chunk_offsets_enflame as prepare_chunk_offsets,
-    prepare_lens_enflame as prepare_lens,
-    prepare_token_indices_enflame as prepare_token_indices,
 )
 from flag_attn.parallel_nsa.triton_ops_helper import (
     autotune_cache_kwargs,
@@ -21,10 +18,6 @@ from flag_attn.parallel_nsa.triton_ops_helper import (
 )
 from flag_attn.parallel_nsa.utils import (
     check_shared_mem,
-)
-from flag_attn.parallel_nsa.triton_ops_helper import (
-    autotune_cache_kwargs,
-    exp,
 )
 
 

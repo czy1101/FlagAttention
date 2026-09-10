@@ -869,7 +869,8 @@ if HAS_TLE_KDA:
             else kg.new_empty(1, dtype=torch.float32)
         )
 
-        grid = lambda meta: (triton.cdiv(V, meta["BV"]) * N * HV,)
+        def grid(meta):
+            return (triton.cdiv(V, meta["BV"]) * N * HV,)
         _kda_fwd_state_output_s60_kernel[grid](
             kg=kg,
             v=v,
