@@ -7,9 +7,6 @@
 from __future__ import annotations
 
 import importlib
-import torch
-import triton
-import triton.language as tl
 
 from .index_topk import (
     SPARSE_BLOCK_SIZE,

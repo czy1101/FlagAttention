@@ -21,6 +21,7 @@ import triton.language as tl
 _Q_SCALE_BLOCK = 128
 _K_SCALE_BLOCK = 64
 
+
 @triton.jit
 def _dequant_k_fp16(
     K,
@@ -135,6 +136,8 @@ def _attn_fwd_inner(
     Q_SCALE_BLOCK: tl.constexpr,
     K_SCALE_BLOCK: tl.constexpr,
     QK_SCALE_BEFORE_DOT: tl.constexpr,
+    PREFETCH_V: tl.constexpr,
+    PREFETCH_K_NEXT: tl.constexpr,
     K_PREDEQUANT: tl.constexpr,
     K_TILE_MAJOR: tl.constexpr,
     EVEN_N: tl.constexpr,
@@ -145,6 +148,8 @@ def _attn_fwd_inner(
     offs_n: tl.constexpr,
 ):
     lo, hi = 0, kv_len
+    if PREFETCH_K_NEXT:
+        k_raw = tl.load(K_ptrs)
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_block = None
@@ -168,18 +173,27 @@ def _attn_fwd_inner(
             # INT8 tl.dot does not lower to an efficient matrix path with the
             # current S60 Triton backend. Convert the quantized values to FP16
             # while retaining INT8 storage and the per-block scales.
-            if EVEN_N:
+            if PREFETCH_K_NEXT:
+                k = k_raw
+            elif EVEN_N:
                 k = tl.load(K_ptrs)
             else:
                 k_mask = offs_n[None, :] < (kv_len - start_n)
                 k = tl.load(K_ptrs, mask=k_mask, other=0)
+            if PREFETCH_V:
+                if EVEN_N:
+                    v = tl.load(V_ptrs)
+                else:
+                    v = tl.load(
+                        V_ptrs,
+                        mask=offs_n[:, None] < (kv_len - start_n),
+                        other=0.0,
+                    )
             if not K_PREDEQUANT:
                 k = k.to(tl.float16)
                 if BLOCK_N == K_SCALE_BLOCK:
                     k_scale = tl.load(K_scale_ptr)
                 else:
-                    # BLOCK_N=128 spans two independently quantized 64-row K
-                    # blocks, so apply the matching scale to every score column.
                     k_scale_0 = tl.load(K_scale_ptr)
                     if EVEN_N:
                         k_scale_1 = tl.load(K_scale_ptr + 1)
@@ -246,14 +260,25 @@ def _attn_fwd_inner(
             alpha = tl.math.exp2(m_i - m_ij)
             acc = acc * alpha[:, None]
 
-            if EVEN_N:
-                v = tl.load(V_ptrs)
-            else:
-                v = tl.load(
-                    V_ptrs,
-                    mask=offs_n[:, None] < (kv_len - start_n),
-                    other=0.0,
+            if PREFETCH_K_NEXT:
+                if K_TILE_MAJOR:
+                    next_k_ptrs = K_ptrs + HEAD_DIM * BLOCK_N
+                else:
+                    next_k_ptrs = K_ptrs + stride_kblock
+                k_raw_next = tl.load(
+                    next_k_ptrs,
+                    mask=offs_n[None, :] < (hi - start_n - BLOCK_N),
+                    other=0,
                 )
+            if not PREFETCH_V:
+                if EVEN_N:
+                    v = tl.load(V_ptrs)
+                else:
+                    v = tl.load(
+                        V_ptrs,
+                        mask=offs_n[:, None] < (kv_len - start_n),
+                        other=0.0,
+                    )
             # Accumulate PV directly into the FP32 output accumulator.  S60
             # measurements show that this fused path is faster than forming
             # an FP16 dot result followed by a separate FP32 add.
@@ -263,11 +288,14 @@ def _attn_fwd_inner(
             # its scheduling remains identical to the measured baseline.
             l_i = l_i * alpha + l_ij
             m_i = m_ij
+            if PREFETCH_K_NEXT:
+                k_raw = k_raw_next
         if K_TILE_MAJOR:
             K_ptrs += HEAD_DIM * BLOCK_N
         else:
             K_ptrs += stride_kblock
-        K_scale_ptr += BLOCK_N // K_SCALE_BLOCK
+        if not K_PREDEQUANT:
+            K_scale_ptr += BLOCK_N // K_SCALE_BLOCK
         V_ptrs += BLOCK_N * stride_vn
     return acc, l_i, m_i
 
@@ -314,6 +342,8 @@ def _attn_fwd(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     QK_SCALE_BEFORE_DOT: tl.constexpr,
+    PREFETCH_V: tl.constexpr,
+    PREFETCH_K_NEXT: tl.constexpr,
     K_PREDEQUANT: tl.constexpr,
     K_TILE_MAJOR: tl.constexpr,
     FIRST_TILE_FAST: tl.constexpr,
@@ -435,6 +465,8 @@ def _attn_fwd(
         # zero. Initialize the online-softmax state directly and let the
         # regular loop handle only the remaining tiles.
         k = tl.load(K_ptrs)
+        if PREFETCH_V:
+            v = tl.load(V_ptrs)
         if not K_PREDEQUANT:
             k = k.to(tl.float16)
             if BLOCK_N == K_SCALE_BLOCK:
@@ -451,14 +483,16 @@ def _attn_fwd(
         m_i = tl.max(qk, 1)
         p = tl.math.exp2(qk - m_i[:, None]).to(tl.float16)
         l_i = tl.sum(p, 1).to(tl.float32)
-        v = tl.load(V_ptrs)
+        if not PREFETCH_V:
+            v = tl.load(V_ptrs)
         acc = tl.dot(p, v, acc)
 
         if K_TILE_MAJOR:
             K_ptrs += HEAD_DIM * BLOCK_N
         else:
             K_ptrs += stride_kblock
-        K_scale_ptr += BLOCK_N // K_SCALE_BLOCK
+        if not K_PREDEQUANT:
+            K_scale_ptr += BLOCK_N // K_SCALE_BLOCK
         V_ptrs += BLOCK_N * stride_vn
         acc, l_i, m_i = _attn_fwd_inner(
             acc,
@@ -478,6 +512,8 @@ def _attn_fwd(
             Q_SCALE_BLOCK,
             K_SCALE_BLOCK,
             QK_SCALE_BEFORE_DOT,
+            PREFETCH_V,
+            PREFETCH_K_NEXT,
             K_PREDEQUANT,
             K_TILE_MAJOR,
             EVEN_N,
@@ -506,6 +542,8 @@ def _attn_fwd(
             Q_SCALE_BLOCK,
             K_SCALE_BLOCK,
             QK_SCALE_BEFORE_DOT,
+            PREFETCH_V,
+            PREFETCH_K_NEXT,
             K_PREDEQUANT,
             K_TILE_MAJOR,
             EVEN_N,
@@ -559,7 +597,10 @@ def _select_s60_config(
     if block_m not in (64, 128) or _Q_SCALE_BLOCK % block_m != 0:
         raise ValueError("block_m must be 64 or 128 and divide the 128-row Q scale block")
     if block_n not in (64, 128) or block_n % _K_SCALE_BLOCK != 0:
-        raise ValueError("block_n must be 64 or 128 and be a multiple of the 64-row K scale block")
+        raise ValueError(
+            "block_n must be 64 or 128 and be a multiple of the "
+            "64-row K scale block"
+        )
     if num_warps not in (1, 2, 4, 8):
         raise ValueError("num_warps must be one of 1, 2, 4, or 8")
     if num_stages <= 0:
@@ -584,12 +625,19 @@ def forward(
     qk_scale_before_dot=True,
     predequantize_k=True,
     tile_major_predequant_k=True,
+    prefetch_v=True,
+    prefetch_k_next=True,
+    prefetch_d64=False,
+    first_tile_d128=True,
 ):
     """Run per-block INT8 QK attention on Enflame S60.
 
     All supported configurations use the Triton attention kernel. Dense
     self-attention stays on the same path so S60 does not depend on the
     torch-gcu SDPA implementation.
+
+    D128 prefetch and first-tile optimizations are enabled by default. D64 V
+    prefetch defaults to disabled because it regresses the long-sequence path.
     """
 
     if tensor_layout == "HND":
@@ -787,12 +835,53 @@ def forward(
     even_m = qo_len % BLOCK_M == 0
     even_n = kv_len % BLOCK_N == 0
     first_tile_fast = (
-        head_dim == 64
+        (
+            head_dim == 64
+            or (
+                first_tile_d128
+                and head_dim == 128
+                and BLOCK_M == 128
+                and BLOCK_N == 128
+            )
+        )
         and attn_mask is None
         and qk_scale_before_dot
         and even_m
         and even_n
         and kv_len >= BLOCK_N
+    )
+    # D64 benefits from overlapping the V load with QK/softmax except at the
+    # first K-predequant reuse tier.  That boundary configuration exhibits a
+    # reproducible fast/slow scheduling split on S60, so keep it on the
+    # stable load order and re-enable prefetch once reuse reaches 64 blocks.
+    enable_d64_prefetch_v = (
+        prefetch_d64
+        and head_dim == 64
+        and BLOCK_M == 256
+        and (
+            not use_predequant_k
+            or k_reuse_blocks >= 2 * min_k_reuse_blocks
+        )
+    )
+    enable_prefetch_v = (
+        prefetch_v
+        and (
+            (head_dim == 128 and BLOCK_M == 128)
+            or enable_d64_prefetch_v
+        )
+        and BLOCK_N == 128
+        and attn_mask is None
+        and even_m
+        and even_n
+    )
+    enable_prefetch_k_next = (
+        prefetch_k_next
+        and head_dim == 128
+        and BLOCK_M == 128
+        and BLOCK_N == 128
+        and attn_mask is None
+        and even_n
+        and kv_len >= 2 * BLOCK_N
     )
     launch_options = {}
     if maxnreg is not None:
@@ -843,6 +932,8 @@ def forward(
         BLOCK_N=BLOCK_N,
         HEAD_DIM=HEAD_DIM_K,
         QK_SCALE_BEFORE_DOT=qk_scale_before_dot,
+        PREFETCH_V=enable_prefetch_v,
+        PREFETCH_K_NEXT=enable_prefetch_k_next,
         K_PREDEQUANT=use_predequant_k,
         K_TILE_MAJOR=use_tile_major_k,
         FIRST_TILE_FAST=first_tile_fast,

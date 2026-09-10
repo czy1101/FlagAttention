@@ -9,21 +9,9 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-import importlib
-from flag_attn.minimax_sparse_attention.index_topk import (
-    SPARSE_BLOCK_SIZE,
-    minimax_m3_index_score,
-)
-from flag_attn.minimax_sparse_attention.sparse_attn import (
-    SPARSE_BLOCK_SIZE,
-    _FP8_DTYPES,
-    _KV_SCALE_NONE,
-    _kv_scale_args,
-)
-from .utils import round_up
 
 
-SPARSE_BLOCK_SIZE = 128
+from ..utils import SPARSE_BLOCK_SIZE, round_up
 
 
 @triton.jit
@@ -901,7 +889,100 @@ def minimax_m3_index_topk(
     return topk_idx
 
 
-@triton.jit(do_not_specialize=["num_kv_chunks", "decode_query_len"])
+@triton.jit
+def _decode_topk_reduction_enflame(
+    score_ptr,
+    output_ptr,
+    seq_lens,
+    decode_query_len: tl.constexpr,
+    max_blocks: tl.constexpr,
+    stride_sh,
+    stride_sn,
+    stride_sk,
+    stride_oh,
+    stride_on,
+    stride_ok,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    SPARSE_BLOCK: tl.constexpr,
+):
+    """Select Decode pages on-device for the short S60 score rows."""
+    query_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    request_id = query_id // decode_query_len
+    query_offset = query_id - request_id * decode_query_len
+
+    seq_len = tl.load(seq_lens + request_id).to(tl.int32)
+    query_pos = seq_len - decode_query_len + query_offset
+    valid_blocks = (tl.maximum(query_pos + 1, 0) + SPARSE_BLOCK - 1) // SPARSE_BLOCK
+    valid_blocks = tl.minimum(valid_blocks, max_blocks)
+    real_selected = tl.minimum(valid_blocks, TOPK)
+
+    block_ids = tl.arange(0, BLOCK_SIZE_N)
+    available = block_ids < valid_blocks
+    values = tl.load(
+        score_ptr
+        + head_id * stride_sh
+        + query_id * stride_sn
+        + block_ids * stride_sk,
+        mask=block_ids < max_blocks,
+        other=float("-inf"),
+    )
+    values = tl.where((values == values) & available, values, float("-inf"))
+
+    for slot in tl.static_range(0, TOPK):
+        maximum = tl.max(values, axis=0)
+        candidate_mask = available & (values == maximum)
+        # Match deterministic page ordering by resolving ties to the lowest id.
+        selected = -tl.max(
+            tl.where(candidate_mask, -block_ids, -BLOCK_SIZE_N),
+            axis=0,
+        )
+        tl.store(
+            output_ptr
+            + head_id * stride_oh
+            + query_id * stride_on
+            + slot * stride_ok,
+            tl.where(slot < real_selected, selected, -1),
+        )
+        available = available & (block_ids != selected)
+        values = tl.where(available, values, float("-inf"))
+
+
+@triton.jit
+def _decode_topk_identity_enflame(
+    output_ptr,
+    seq_lens,
+    decode_query_len: tl.constexpr,
+    stride_oh,
+    stride_on,
+    stride_ok,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    SPARSE_BLOCK: tl.constexpr,
+):
+    """Generate all-visible Decode page ids directly on-device."""
+    query_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    request_id = query_id // decode_query_len
+    query_offset = query_id - request_id * decode_query_len
+
+    seq_len = tl.load(seq_lens + request_id).to(tl.int32)
+    query_pos = seq_len - decode_query_len + query_offset
+    valid_blocks = (tl.maximum(query_pos + 1, 0) + SPARSE_BLOCK - 1) // SPARSE_BLOCK
+
+    slots = tl.arange(0, BLOCK_SIZE_T)
+    tl.store(
+        output_ptr
+        + head_id * stride_oh
+        + query_id * stride_on
+        + slots * stride_ok,
+        tl.where(slots < valid_blocks, slots, -1),
+        mask=slots < TOPK,
+    )
+
+
+@triton.jit
 def _decode_index_score_kernel_enflame(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
     ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
@@ -912,7 +993,7 @@ def _decode_index_score_kernel_enflame(
     head_dim: tl.constexpr,
     init_blocks,
     local_blocks,
-    decode_query_len,
+    decode_query_len: tl.constexpr,
     stride_q_n,
     stride_q_h,
     stride_q_d,
@@ -925,15 +1006,19 @@ def _decode_index_score_kernel_enflame(
     stride_bt_b,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     BLOCK_SIZE_Q: tl.constexpr,
-    num_kv_chunks,
+    num_kv_chunks: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
+    pid_q = tl.program_id(2)
     hq_offsets = tl.arange(0, BLOCK_SIZE_HQ)
     h_offsets = hq_offsets // BLOCK_SIZE_Q
-    q_offsets = hq_offsets % BLOCK_SIZE_Q
+    q_offsets = (
+        pid_q * BLOCK_SIZE_Q
+        + hq_offsets % BLOCK_SIZE_Q
+    )
     q_mask = q_offsets < decode_query_len
     q_ids = pid_r * decode_query_len + q_offsets
 
@@ -962,33 +1047,35 @@ def _decode_index_score_kernel_enflame(
     # Force-select init (1e30) and local (1e29, higher priority) blocks.
     local_start = tl.maximum(0, num_blocks_q - local_blocks)
     # Query vectors for all index heads in a small spec-decode block.
+    # Keep queries on the M axis so the dot product writes one contiguous
+    # score row per query instead of using the very small HQ dimension as N.
     q = tl.load(
         q_ptr
-        + q_ids[None, :] * stride_q_n
-        + h_offsets[None, :] * stride_q_h
-        + off_d[:, None] * stride_q_d,
-        mask=q_mask[None, :],
+        + q_ids[:, None] * stride_q_n
+        + h_offsets[:, None] * stride_q_h
+        + off_d[None, :] * stride_q_d,
+        mask=q_mask[:, None],
         other=0.0,
-    )  # [D,HQ]
+    )  # [HQ,D]
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int32)
         pos = blk * BLOCK_SIZE_K + off_k
-        pos_mask = pos[:, None] < kv_len[None, :]
+        pos_mask = pos[None, :] < kv_len[:, None]
         # we don't need masked load for K, because KV cache ensures
         # allocation is multiple of BLOCK_SIZE_K.
         # for tokens beyond seqlen, they will be masked in qk later.
         k = tl.load(
             ik_cache_ptr
             + page * stride_ik_blk
-            + off_k[:, None] * stride_ik_pos
-            + off_d * stride_ik_d,
-        )  # [N,D]
+            + off_d[:, None] * stride_ik_d
+            + off_k[None, :] * stride_ik_pos,
+        )  # [D,N]
         # fp32 accumulation is required for the fp8 (e4m3) index cache: q/k are
         # loaded in their stored dtype (bf16 or e4m3) and the MMA accumulates in
         # fp32 so the per-block max score is exact for the fp8 indexer too.
-        kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
-        kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
-        score = tl.max(kq, axis=0)  # [HQ]
+        kq = tl.dot(q, k, out_dtype=tl.float32)  # [HQ,N]
+        kq = tl.where(pos_mask & q_mask[:, None], kq, float("-inf"))
+        score = tl.max(kq, axis=1)  # [HQ]
         is_visible_block = blk < num_blocks_q
         is_init = (blk < init_blocks) & is_visible_block
         is_local = (blk >= local_start) & is_visible_block
@@ -1036,16 +1123,31 @@ def minimax_m3_index_decode_score(
     else:
         score = score_out
 
+    max_grid_z = 255
+    min_block_size_q = triton.cdiv(
+        max_decode_query_len,
+        max_grid_z,
+    )
     block_size_q = triton.next_power_of_2(
-        max_decode_query_len
+        max(1, min_block_size_q)
+    )
+    num_query_tiles = triton.cdiv(
+        max_decode_query_len,
+        block_size_q,
     )
 
-    # GCU300 grid.y limit is 255. Use a power-of-two cap of 128.
+    # Q=1 favors one page per chunk. Speculative Decode keeps two adjacent
+    # pages per chunk to balance query parallelism and program launch count.
+    chunk_limit = (
+        max_block
+        if decode_query_len == 1
+        else triton.cdiv(max_block, 2)
+    )
     target = max(
         1,
         min(
             128,
-            max_block,
+            chunk_limit,
             512 // max(1, seq_lens.shape[0]),
         ),
     )
@@ -1054,6 +1156,7 @@ def minimax_m3_index_decode_score(
     grid = (
         seq_lens.shape[0],
         num_kv_chunks,
+        num_query_tiles,
     )
 
     _decode_index_score_kernel_enflame[grid](
@@ -1111,16 +1214,69 @@ def minimax_m3_index_decode(
     )
 
     if out is None:
-        topk_idx = torch.full(
+        topk_idx = torch.empty(
             (num_idx_heads, total_q, topk),
-            -1,
             dtype=torch.int32,
             device=idx_q.device,
         )
     else:
         topk_idx = out[:, :total_q, :topk]
-        topk_idx.fill_(-1)
 
+    if max_block <= topk and score_out is None:
+        _decode_topk_identity_enflame[(total_q, num_idx_heads)](
+            topk_idx,
+            seq_lens,
+            decode_query_len,
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            TOPK=topk,
+            BLOCK_SIZE_T=triton.next_power_of_2(topk),
+            SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+            num_warps=1,
+            num_stages=1,
+        )
+        return topk_idx
+
+    score = minimax_m3_index_decode_score(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        seq_lens,
+        max_seq_len,
+        init_blocks,
+        local_blocks,
+        num_kv_heads,
+        decode_query_len,
+        max_decode_query_len,
+        score_out=score_out,
+    )
+
+    # The benchmark Decode rows have at most 64 pages. Keep their TopK
+    # selection entirely on GCU and retain the generic Torch fallback for
+    # larger or differently configured rows.
+    if max_block <= 128 and topk == 4:
+        _decode_topk_reduction_enflame[(total_q, num_idx_heads)](
+            score,
+            topk_idx,
+            seq_lens,
+            decode_query_len,
+            max_block,
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            TOPK=topk,
+            BLOCK_SIZE_N=triton.next_power_of_2(max_block),
+            SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+            num_warps=1,
+            num_stages=1,
+        )
+        return topk_idx
+
+    topk_idx.fill_(-1)
     query_ids = torch.arange(
         total_q,
         dtype=torch.int32,
@@ -1147,40 +1303,6 @@ def minimax_m3_index_decode(
         + SPARSE_BLOCK_SIZE
         - 1
     ) // SPARSE_BLOCK_SIZE
-
-    if max_block <= topk and score_out is None:
-        slots = torch.arange(
-            topk,
-            dtype=torch.int32,
-            device=idx_q.device,
-        ).view(1, 1, topk)
-
-        identity = torch.where(
-            slots < valid_blocks.view(1, total_q, 1),
-            slots,
-            torch.full_like(slots, -1),
-        ).expand(
-            num_idx_heads,
-            total_q,
-            topk,
-        )
-
-        topk_idx.copy_(identity)
-        return topk_idx
-
-    score = minimax_m3_index_decode_score(
-        idx_q,
-        index_kv_cache,
-        block_table,
-        seq_lens,
-        max_seq_len,
-        init_blocks,
-        local_blocks,
-        num_kv_heads,
-        decode_query_len,
-        max_decode_query_len,
-        score_out=score_out,
-    )
 
     block_ids = torch.arange(
         max_block,

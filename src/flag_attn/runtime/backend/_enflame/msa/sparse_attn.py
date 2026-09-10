@@ -10,27 +10,14 @@ import torch
 import triton
 import triton.language as tl
 from flag_attn.minimax_sparse_attention.sparse_attn import (
-    SPARSE_BLOCK_SIZE,
     _FP8_DTYPES,
     _KV_SCALE_NONE,
     _kv_scale_args,
 )
-from .utils import round_up
-
-
-SPARSE_BLOCK_SIZE = 128
+from ..utils import SPARSE_BLOCK_SIZE
 
 
 _PREFILL_HALF_KV_MAX_BLOCK_SIZE_QH = 8
-
-
-_FP8_DTYPES = (
-    torch.float8_e4m3fn,
-    torch.float8_e4m3fnuz,
-    torch.float8_e5m2,
-    torch.float8_e5m2fnuz,
-)
-
 
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
 def _gqa_sparse_fwd_direct(
@@ -278,6 +265,7 @@ def _gqa_sparse_fwd_grouped8(
     cu_seqlens_q,
     seq_lens,
     prefix_lens,
+    decode_query_len: tl.constexpr,
     gqa_group_size,
     head_dim,
     sm_scale,
@@ -301,8 +289,9 @@ def _gqa_sparse_fwd_grouped8(
     BLOCK_SIZE_H: tl.constexpr,
     MAX_TOPK: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
+    DECODE_MODE: tl.constexpr,
 ):
-    """Process eight adjacent queries using the union of their selected pages."""
+    """Process a small query group using the union of its selected pages."""
     BLOCK_SIZE_M: tl.constexpr = GROUP_SIZE_Q * BLOCK_SIZE_H
     NUM_CANDIDATES: tl.constexpr = GROUP_SIZE_Q * BLOCK_TOPK
 
@@ -310,13 +299,18 @@ def _gqa_sparse_fwd_grouped8(
     pid_kh = tl.program_id(1)
     pid_b = tl.program_id(2)
 
-    q_start = tl.load(cu_seqlens_q + pid_b)
-    q_len = (
-        tl.load(cu_seqlens_q + pid_b + 1)
-        - q_start
-    )
     seq_len = tl.load(seq_lens + pid_b)
-    prefix_len = tl.load(prefix_lens + pid_b)
+    if DECODE_MODE:
+        q_start = pid_b * decode_query_len
+        q_len = decode_query_len
+        prefix_len = seq_len - decode_query_len
+    else:
+        q_start = tl.load(cu_seqlens_q + pid_b)
+        q_len = (
+            tl.load(cu_seqlens_q + pid_b + 1)
+            - q_start
+        )
+        prefix_len = tl.load(prefix_lens + pid_b)
 
     group_start = pid_g * GROUP_SIZE_Q
     if group_start >= q_len:
@@ -755,6 +749,7 @@ def minimax_m3_sparse_attn(
             cu_seqlens_q,
             seq_lens,
             prefix_lens,
+            0,
             gqa_group_size,
             head_dim,
             sm_scale,
@@ -782,6 +777,7 @@ def minimax_m3_sparse_attn(
             BLOCK_TOPK=triton.next_power_of_2(
                 topk
             ),
+            DECODE_MODE=False,
             num_warps=1,
             num_stages=1,
         )
@@ -849,7 +845,7 @@ def minimax_m3_sparse_attn(
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
     }
 )
-@triton.jit(do_not_specialize=["decode_query_len"])
+@triton.jit
 def _gqa_sparse_decode_kernel_enflame(
     q_ptr,  # [total_q, num_heads, head_dim]
     kv_cache_ptr,  # main cache: [num_blocks, num_kv_heads, 128, 2*head_dim]
@@ -865,7 +861,7 @@ def _gqa_sparse_decode_kernel_enflame(
     head_dim,
     max_topk,
     sm_scale,
-    decode_query_len,
+    decode_query_len: tl.constexpr,
     stride_qn,
     stride_qh,
     stride_qd,
@@ -894,6 +890,7 @@ def _gqa_sparse_decode_kernel_enflame(
     BLOCK_SIZE_D: tl.constexpr,
     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
+    DIRECT_OUTPUT: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -1020,15 +1017,21 @@ def _gqa_sparse_decode_kernel_enflame(
         order=(1, 0),
     )
     tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
-    lse_ptrs = tl.make_block_ptr(
-        base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
-        shape=(gqa_group_size,),
-        strides=(stride_l_h,),
-        offsets=(0,),
-        block_shape=(BLOCK_SIZE_H,),
-        order=(0,),
-    )
-    tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
+    if not DIRECT_OUTPUT:
+        lse_ptrs = tl.make_block_ptr(
+            base=(
+                lse_ptr
+                + pid_c * stride_l_c
+                + pid_b * stride_l_b
+                + pid_h * stride_l_h
+            ),
+            shape=(gqa_group_size,),
+            strides=(stride_l_h,),
+            offsets=(0,),
+            block_shape=(BLOCK_SIZE_H,),
+            order=(0,),
+        )
+        tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
 
 
 @triton.heuristics(
@@ -1111,6 +1114,75 @@ def minimax_m3_sparse_attn_decode(
     group_size = num_heads // num_kv_heads
     use_fp8 = kv_cache.dtype in _FP8_DTYPES
 
+    # Adjacent speculative queries commonly select the same pages. Group them
+    # so K/V pages are loaded once while preserving per-query causal masks.
+    use_grouped_decode = (
+        not use_fp8
+        and q.dtype == torch.bfloat16
+        and kv_cache.dtype == torch.bfloat16
+        and max_topk == 4
+        and group_size == 8
+        and head_dim == 128
+        and 2 <= decode_query_len <= 8
+    )
+    if use_grouped_decode:
+        batch = seq_lens.shape[0]
+        # Two-query groups give D4 enough independent programs on S60 while
+        # retaining adjacent-query K/V reuse.
+        grouped_query_size = (
+            2
+            if decode_query_len == 4
+            else triton.next_power_of_2(
+                decode_query_len
+            )
+        )
+        grouped_grid = (
+            triton.cdiv(
+                decode_query_len,
+                grouped_query_size,
+            ),
+            num_kv_heads,
+            batch,
+        )
+        _gqa_sparse_fwd_grouped8[grouped_grid](
+            q,
+            kv_cache,
+            topk_idx,
+            output,
+            block_table,
+            seq_lens,  # Unused cu_seqlens placeholder in decode mode.
+            seq_lens,
+            seq_lens,  # Unused prefix placeholder in decode mode.
+            decode_query_len,
+            group_size,
+            head_dim,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            kv_cache.stride(3),
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            block_table.stride(0),
+            GROUP_SIZE_Q=grouped_query_size,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            BLOCK_SIZE_D=128,
+            BLOCK_SIZE_H=8,
+            MAX_TOPK=4,
+            BLOCK_TOPK=4,
+            DECODE_MODE=True,
+            num_warps=1,
+            num_stages=1,
+        )
+        return
+
     (
         k_scale_arg,
         v_scale_arg,
@@ -1138,44 +1210,74 @@ def minimax_m3_sparse_attn_decode(
         )
     )
 
-    max_chunks_by_grid = max(
-        1,
-        65535 // max(1, total_q),
-    )
-    target = max(
-        1,
-        min(
-            max_topk,
-            max_chunks_by_grid,
-            256 // max(
-                1,
-                total_q * num_kv_heads,
-            ),
-        ),
-    )
-    num_topk_chunks = 1 << (
-        target.bit_length() - 1
+    # With enough query/head programs, process all selected pages online and
+    # write the final normalized result directly, avoiding partial buffers and
+    # the merge launch. This is the profitable D3 path on S60.
+    direct_output = (
+        not use_fp8
+        and max_topk <= 4
+        and group_size == 8
+        and head_dim == 128
+        and total_q * num_kv_heads >= 16
     )
 
-    partial_output = torch.empty(
-        (
-            num_topk_chunks,
-            total_q,
-            num_heads,
-            head_dim,
-        ),
-        dtype=q.dtype,
-        device=q.device,
-    )
-    partial_lse = torch.empty(
-        (
-            num_topk_chunks,
-            total_q,
-            num_heads,
-        ),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if direct_output:
+        num_topk_chunks = 1
+        partial_output = output
+        partial_lse = output  # Unused in the DIRECT_OUTPUT constexpr branch.
+        stride_o_c = 0
+        stride_o_b = output.stride(0)
+        stride_o_h = output.stride(1)
+        stride_o_d = output.stride(2)
+        stride_l_c = 0
+        stride_l_b = 0
+        stride_l_h = 0
+    else:
+        max_chunks_by_grid = max(
+            1,
+            65535 // max(1, total_q),
+        )
+        target = max(
+            1,
+            min(
+                max_topk,
+                max_chunks_by_grid,
+                256 // max(
+                    1,
+                    total_q * num_kv_heads,
+                ),
+            ),
+        )
+        num_topk_chunks = 1 << (
+            target.bit_length() - 1
+        )
+
+        partial_output = torch.empty(
+            (
+                num_topk_chunks,
+                total_q,
+                num_heads,
+                head_dim,
+            ),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        partial_lse = torch.empty(
+            (
+                num_topk_chunks,
+                total_q,
+                num_heads,
+            ),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        stride_o_c = partial_output.stride(0)
+        stride_o_b = partial_output.stride(1)
+        stride_o_h = partial_output.stride(2)
+        stride_o_d = partial_output.stride(3)
+        stride_l_c = partial_lse.stride(0)
+        stride_l_b = partial_lse.stride(1)
+        stride_l_h = partial_lse.stride(2)
 
     grid = (
         total_q * num_topk_chunks,
@@ -1212,25 +1314,28 @@ def minimax_m3_sparse_attn_decode(
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
-        partial_output.stride(0),
-        partial_output.stride(1),
-        partial_output.stride(2),
-        partial_output.stride(3),
-        partial_lse.stride(0),
-        partial_lse.stride(1),
-        partial_lse.stride(2),
+        stride_o_c,
+        stride_o_b,
+        stride_o_h,
+        stride_o_d,
+        stride_l_c,
+        stride_l_b,
+        stride_l_h,
         block_table.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
         USE_FP8=use_fp8,
         KV_SCALE_MODE=kv_scale_mode,
+        DIRECT_OUTPUT=direct_output,
         USE_PDL=False,
         num_warps=1,
         num_stages=1,
     )
 
-    merge_grid = (total_q, num_heads)
+    if direct_output:
+        return
 
+    merge_grid = (total_q, num_heads)
     _merge_topk_attn_out_kernel_enflame[merge_grid](
         partial_output,
         partial_lse,
