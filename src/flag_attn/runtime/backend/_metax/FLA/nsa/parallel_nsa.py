@@ -21,7 +21,8 @@ from flag_attn.gated_linear_attention.index import (
 )
 from .mean_pooling import mean_pooling
 from .parallel_nsa_compression import parallel_nsa_compression
-from ..triton_ops_helper import autotune_cache_kwargs, exp, log
+from ..compat import autotune_cache_kwargs
+from ..triton_ops_helper import exp, log
 from ..utils import _bitonic_merge
 from flag_attn.gated_linear_attention.utils import check_shared_mem, input_guard
 

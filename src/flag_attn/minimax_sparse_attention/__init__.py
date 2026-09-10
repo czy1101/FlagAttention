@@ -24,7 +24,7 @@ The cache layout is compatible with vLLM:
 from flag_attn.runtime.backend import is_metax_backend
 
 if is_metax_backend():
-    from flag_attn.runtime.backend._metax.minimax_sparse_attention import (
+    from flag_attn.runtime.backend._metax.msa import (
         SPARSE_BLOCK_SIZE,
         minimax_m3_index_decode,
         minimax_m3_index_decode_score,

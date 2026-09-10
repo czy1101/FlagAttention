@@ -15,7 +15,8 @@ from flag_attn.gated_linear_attention.index import (
     prepare_chunk_offsets,
     prepare_token_indices,
 )
-from ..triton_ops_helper import autotune_cache_kwargs, exp, log
+from ..compat import autotune_cache_kwargs
+from ..triton_ops_helper import exp, log
 from flag_attn.gated_linear_attention.utils import check_shared_mem, input_guard
 
 # ===========================================================================

@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from flag_attn.gated_linear_attention.index import prepare_chunk_indices
-from ..triton_ops_helper import autotune_cache_kwargs
+from ..compat import autotune_cache_kwargs
 from flag_attn.gated_linear_attention.utils import input_guard
 
 
