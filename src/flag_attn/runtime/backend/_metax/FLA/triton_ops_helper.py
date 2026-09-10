@@ -10,7 +10,6 @@ import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
-from .compat import autotune_cache_kwargs, exp2
 
 
 def get_exp():
