@@ -13,9 +13,13 @@ import triton.language.extra.libdevice as tldevice
 
 def get_exp():
     """Return exp implementation (fast or accurate) based on env flag."""
+    use_fast_ops = os.environ.get(
+        "FLAG_ATTN_USE_FAST_OPS",
+        os.environ.get("FLA_USE_FAST_OPS", "0"),
+    )
     return (
         tldevice.fast_expf
-        if os.environ.get("FLAG_ATTN_USE_FAST_OPS", "0") == "1"
+        if use_fast_ops == "1"
         else tl.exp
     )
 
