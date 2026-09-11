@@ -43,15 +43,9 @@ from .utils import current_platform
 SPARSE_BLOCK_SIZE = 128
 # Optional decode tuning controls. A value of 0 for the chunk override keeps
 # the original shape-based split-K policy.
-_DECODE_MIN_BLOCK_H = int(
-    os.getenv("FLAG_ATTN_DECODE_MIN_BLOCK_H", "16")
-)
-_DECODE_NUM_TOPK_CHUNKS = int(
-    os.getenv("FLAG_ATTN_DECODE_NUM_TOPK_CHUNKS", "0")
-)
-_DECODE_NUM_WARPS = int(
-    os.getenv("FLAG_ATTN_DECODE_NUM_WARPS", "8")
-)
+_DECODE_MIN_BLOCK_H = int(os.getenv("FLAG_ATTN_DECODE_MIN_BLOCK_H", "16"))
+_DECODE_NUM_TOPK_CHUNKS = int(os.getenv("FLAG_ATTN_DECODE_NUM_TOPK_CHUNKS", "0"))
+_DECODE_NUM_WARPS = int(os.getenv("FLAG_ATTN_DECODE_NUM_WARPS", "8"))
 
 # Final MUSA Prefill direct-kernel configuration for the current MTT S5000
 # workload. H=8 lowers the per-CTA accumulator/register footprint and exposes
@@ -62,14 +56,10 @@ _PREFILL_NUM_WARPS = 4
 _PREFILL_NUM_STAGES = 3
 
 if _DECODE_NUM_WARPS not in (1, 2, 4, 8):
-    raise ValueError(
-        "FLAG_ATTN_DECODE_NUM_WARPS must be one of 1, 2, 4, or 8"
-    )
+    raise ValueError("FLAG_ATTN_DECODE_NUM_WARPS must be one of 1, 2, 4, or 8")
 
 if _PREFILL_BLOCK_H not in (4, 8, 16):
-    raise ValueError(
-        "_PREFILL_BLOCK_H must be one of 4, 8, or 16"
-    )
+    raise ValueError("_PREFILL_BLOCK_H must be one of 4, 8, or 16")
 
 # A 64-token double buffer amortizes its extra softmax/barrier work only for
 # the smallest benchmark GQA tile. Larger tiles reuse one full-page KV stage.
@@ -193,9 +183,7 @@ def _gqa_sparse_fwd_direct(
             # scaled once, then its scale is restored on the FP32 logits.
             # This keeps the existing K cache in FP8 through tl.dot instead
             # of materializing a BF16 K tile for every selected page.
-            qk_q_scale = tl.maximum(
-                tl.max(tl.abs(q), axis=1) * (1.0 / 448.0), 1.0e-8
-            )
+            qk_q_scale = tl.maximum(tl.max(tl.abs(q), axis=1) * (1.0 / 448.0), 1.0e-8)
             q_qk = (q / qk_q_scale[:, None]).to(tl.float8e4nv)
         else:
             q_qk = q
@@ -225,9 +213,7 @@ def _gqa_sparse_fwd_direct(
             if USE_FP8:
                 if KV_SCALE_MODE == 2:
                     k_scale = tl.load(
-                        k_scale_ptr
-                        + pid_kh * stride_ks_h
-                        + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
+                        k_scale_ptr + pid_kh * stride_ks_h + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
                         mask=pos_mask,
                         other=1.0,
                     )
@@ -236,7 +222,7 @@ def _gqa_sparse_fwd_direct(
                 qk_dot *= qk_q_scale[:, None]
 
             is_full_causal = (c + BLOCK_SIZE_K) <= q_abs
-            is_full_seq    = (c + BLOCK_SIZE_K) <= seq_len
+            is_full_seq = (c + BLOCK_SIZE_K) <= seq_len
 
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             if not is_full_causal:
@@ -284,9 +270,7 @@ def _gqa_sparse_fwd_direct(
             if USE_FP8:
                 if KV_SCALE_MODE == 2:
                     v_scale = tl.load(
-                        v_scale_ptr
-                        + pid_kh * stride_vs_h
-                        + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
+                        v_scale_ptr + pid_kh * stride_vs_h + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
                         mask=pos_mask,
                         other=1.0,
                     )
@@ -298,9 +282,7 @@ def _gqa_sparse_fwd_direct(
                 pv_p = p
                 if KV_SCALE_MODE == 2:
                     pv_p *= v_scale[None, :]
-                pv_p_scale = tl.maximum(
-                    tl.max(tl.abs(pv_p), axis=1) * (1.0 / 448.0), 1.0e-8
-                )
+                pv_p_scale = tl.maximum(tl.max(tl.abs(pv_p), axis=1) * (1.0 / 448.0), 1.0e-8)
                 p_dot = (pv_p / pv_p_scale[:, None]).to(tl.float8e4nv)
                 acc_o += tl.dot(p_dot, v) * pv_p_scale[:, None]
             else:
@@ -334,8 +316,7 @@ def _gqa_sparse_fwd_direct(
     {
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
         "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
-        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
-        * triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"] * triton.next_power_of_2(args["gqa_group_size"]),
     }
 )
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
@@ -581,17 +562,11 @@ def _gqa_sparse_fwd_kernel(
                 next_buf_idx = next_tile % 2
                 next_reuse_iter = next_tile // 2
                 next_k_phase = next_reuse_iter * 2
-                next_blk = tl.load(
-                    topk_ptr + next_block_iter * stride_tk
-                ).to(tl.int32)
+                next_blk = tl.load(topk_ptr + next_block_iter * stride_tk).to(tl.int32)
                 next_page = tl.load(bt_row + next_blk).to(tl.int32)
-                next_kv_row = (
-                    next_page * num_kv_heads + pid_kh
-                ) * BLOCK_SIZE_K + next_half_idx * HALF_K
+                next_kv_row = (next_page * num_kv_heads + pid_kh) * BLOCK_SIZE_K + next_half_idx * HALF_K
                 next_c = next_blk * BLOCK_SIZE_K + next_half_idx * HALF_K
-                tle.gpu.barrier_wait(
-                    kv_empty[next_buf_idx], phaseIdx=next_k_phase
-                )
+                tle.gpu.barrier_wait(kv_empty[next_buf_idx], phaseIdx=next_k_phase)
                 tle.gpu.copy(
                     kv_cache_desc,
                     kv_smem.slot(next_buf_idx),
@@ -664,9 +639,7 @@ def _gqa_sparse_fwd_kernel(
         if loop_blocks > 0:
             first_blk = tl.load(topk_ptr).to(tl.int32)
             first_page = tl.load(bt_row + first_blk).to(tl.int32)
-            cur_kv_row = (
-                first_page * num_kv_heads + pid_kh
-            ) * BLOCK_SIZE_K
+            cur_kv_row = (first_page * num_kv_heads + pid_kh) * BLOCK_SIZE_K
             cur_c = first_blk * BLOCK_SIZE_K
 
         for block_iter in tl.range(loop_blocks, disable_licm=True, num_stages=1):
@@ -711,13 +684,9 @@ def _gqa_sparse_fwd_kernel(
             )
 
             if block_iter + 1 < loop_blocks:
-                next_blk = tl.load(
-                    topk_ptr + (block_iter + 1) * stride_tk
-                ).to(tl.int32)
+                next_blk = tl.load(topk_ptr + (block_iter + 1) * stride_tk).to(tl.int32)
                 next_page = tl.load(bt_row + next_blk).to(tl.int32)
-                cur_kv_row = (
-                    next_page * num_kv_heads + pid_kh
-                ) * BLOCK_SIZE_K
+                cur_kv_row = (next_page * num_kv_heads + pid_kh) * BLOCK_SIZE_K
                 cur_c = next_blk * BLOCK_SIZE_K
 
             if (c + BLOCK_SIZE_K) > (prefix_len + q_tile_start):
@@ -898,9 +867,7 @@ def _gqa_sparse_decode_kernel(
                 k = (k * tl.load(k_scale_ptr)).to(q.dtype)
             elif KV_SCALE_MODE == 2:
                 k_scale = tl.load(
-                    k_scale_ptr
-                    + pid_kh * stride_ks_h
-                    + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
+                    k_scale_ptr + pid_kh * stride_ks_h + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
                     mask=pos_mask,
                     other=1.0,
                 )
@@ -927,9 +894,7 @@ def _gqa_sparse_decode_kernel(
                 v = (v * tl.load(v_scale_ptr)).to(q.dtype)
             elif KV_SCALE_MODE == 2:
                 v_scale = tl.load(
-                    v_scale_ptr
-                    + pid_kh * stride_vs_h
-                    + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
+                    v_scale_ptr + pid_kh * stride_vs_h + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
                     mask=pos_mask,
                     other=1.0,
                 )
@@ -965,9 +930,7 @@ def _gqa_sparse_decode_kernel(
     tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.heuristics(
-    {"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])}
-)
+@triton.heuristics({"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])})
 @triton.jit
 def _merge_topk_attn_out_kernel(
     o_ptr,  # partials: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
@@ -1012,9 +975,7 @@ def _merge_topk_attn_out_kernel(
     weights = tl.exp2(lse - lse_max)
     weights = weights / tl.sum(weights, axis=0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
-    out_ptrs = (
-        out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
-    )
+    out_ptrs = out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
     tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=off_d < head_dim)
 
 
@@ -1042,10 +1003,7 @@ def _kv_scale_args(
         return k_scale, v_scale, 0, 0, 0, 0, _KV_SCALE_SCALAR
     if k_scale.dim() == 2 and v_scale.dim() == 2:
         if k_scale.shape[0] != num_kv_heads or v_scale.shape[0] != num_kv_heads:
-            raise ValueError(
-                "per-token/head KV scales must have shape "
-                f"[{num_kv_heads}, max_kv_tokens]"
-            )
+            raise ValueError("per-token/head KV scales must have shape " f"[{num_kv_heads}, max_kv_tokens]")
         if k_scale.shape != v_scale.shape:
             raise ValueError("k_scale and v_scale must have matching shapes")
         return (
@@ -1181,9 +1139,7 @@ def minimax_m3_sparse_attn(
         return torch.empty(size, dtype=torch.int8, device=kv_cache.device)
 
     triton.set_allocator(alloc_fn)
-    use_half_kv_pipe = (
-        not use_direct and block_size_h <= _PREFILL_HALF_KV_MAX_BLOCK_SIZE_QH
-    )
+    use_half_kv_pipe = not use_direct and block_size_h <= _PREFILL_HALF_KV_MAX_BLOCK_SIZE_QH
     kv_tma_rows = SPARSE_BLOCK_SIZE // 2 if use_half_kv_pipe else SPARSE_BLOCK_SIZE
     kv_cache_2d = kv_cache.view(-1, 2 * head_dim)
     kv_cache_desc = TensorDescriptor(
@@ -1295,22 +1251,14 @@ def minimax_m3_sparse_attn_decode(
     if _DECODE_NUM_TOPK_CHUNKS > 0:
         override = _DECODE_NUM_TOPK_CHUNKS
         if override > max_topk:
-            raise ValueError(
-                f"Decode top-k chunks ({override}) cannot exceed topk ({max_topk})"
-            )
+            raise ValueError(f"Decode top-k chunks ({override}) cannot exceed topk ({max_topk})")
         if override & (override - 1):
             raise ValueError("Decode top-k chunks must be a power of two")
         if max_topk % override != 0:
-            raise ValueError(
-                f"topk ({max_topk}) must be divisible by chunks ({override})"
-            )
+            raise ValueError(f"topk ({max_topk}) must be divisible by chunks ({override})")
         num_topk_chunks = override
-    o_partial = torch.empty(
-        num_topk_chunks, total_q, num_heads, head_dim, dtype=q.dtype, device=q.device
-    )
-    lse_partial = torch.empty(
-        num_topk_chunks, total_q, num_heads, dtype=torch.float32, device=q.device
-    )
+    o_partial = torch.empty(num_topk_chunks, total_q, num_heads, head_dim, dtype=q.dtype, device=q.device)
+    lse_partial = torch.empty(num_topk_chunks, total_q, num_heads, dtype=torch.float32, device=q.device)
     grid = (total_q * num_topk_chunks, num_kv_heads)
     _gqa_sparse_decode_kernel[grid](
         q,
@@ -1380,5 +1328,3 @@ def minimax_m3_sparse_attn_decode(
         USE_PDL=use_pdl,
         **pdl_launch,
     )
-
-

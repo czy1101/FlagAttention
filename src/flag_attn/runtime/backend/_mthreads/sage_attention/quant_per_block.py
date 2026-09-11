@@ -47,18 +47,10 @@ def quant_per_block_int8_kernel(
     valid = offs_n[:, None] < L
 
     input_ptrs = (
-        Input
-        + off_b * stride_iz
-        + off_h * stride_ih
-        + offs_n[:, None] * stride_in
-        + offs_k[None, :] * stride_id
+        Input + off_b * stride_iz + off_h * stride_ih + offs_n[:, None] * stride_in + offs_k[None, :] * stride_id
     )
     output_ptrs = (
-        Output
-        + off_b * stride_oz
-        + off_h * stride_oh
-        + offs_n[:, None] * stride_on
-        + offs_k[None, :] * stride_od
+        Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :] * stride_od
     )
     scale_ptr = Scale + off_b * stride_sz + off_h * stride_sh + off_blk
 
@@ -94,9 +86,7 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
         # [B, H, D, N] backing allocation.  The returned transpose view has a
         # unit N stride, so the attention kernel can load its logical [D, N]
         # SQMMA operand without re-transposing a row-major [N, D] tile.
-        k_storage = torch.empty(
-            (b_k, h_kv, k_head_dim, kv_len), dtype=torch.int8, device=k.device
-        )
+        k_storage = torch.empty((b_k, h_kv, k_head_dim, kv_len), dtype=torch.int8, device=k.device)
         k_int8 = k_storage.transpose(-2, -1)
         q_strides = (q.stride(0), q.stride(1), q.stride(2), q.stride(3))
         qo_strides = (
@@ -117,9 +107,7 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
         b_k, kv_len, h_kv, k_head_dim = k.shape
         # NHD exposes [B, N, H, D].  Use the same [B, H, D, N] backing
         # allocation and permute it into the requested logical layout.
-        k_storage = torch.empty(
-            (b_k, h_kv, k_head_dim, kv_len), dtype=torch.int8, device=k.device
-        )
+        k_storage = torch.empty((b_k, h_kv, k_head_dim, kv_len), dtype=torch.int8, device=k.device)
         k_int8 = k_storage.permute(0, 3, 1, 2)
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         qo_strides = (
@@ -143,12 +131,8 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
     if head_dim not in (64, 128):
         raise ValueError(f"MUSA SageAttention supports head_dim 64 or 128, got {head_dim}")
 
-    q_scale = torch.empty(
-        (b, h_qo, triton.cdiv(qo_len, BLKQ)), device=q.device, dtype=torch.float32
-    )
-    k_scale = torch.empty(
-        (b, h_kv, triton.cdiv(kv_len, BLKK)), device=k.device, dtype=torch.float32
-    )
+    q_scale = torch.empty((b, h_qo, triton.cdiv(qo_len, BLKQ)), device=q.device, dtype=torch.float32)
+    k_scale = torch.empty((b, h_kv, triton.cdiv(kv_len, BLKK)), device=k.device, dtype=torch.float32)
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 

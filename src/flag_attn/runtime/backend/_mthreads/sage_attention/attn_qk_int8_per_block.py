@@ -62,9 +62,7 @@ def _attn_fwd_inner(
         qk *= q_scale * k_scale
 
         if HAS_MASK:
-            mask_valid = (offs_m[:, None] < qo_len) & (
-                offs_n[None, :] < kv_len - start_n
-            )
+            mask_valid = (offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n)
             if MASK_IS_BOOL:
                 mask_block = tl.load(
                     mask_ptrs + start_n * stride_maskn,
@@ -165,21 +163,13 @@ def _attn_fwd(
     off_z = tl.program_id(2).to(tl.int64)
 
     q_scale_offset = (off_z * H + off_h) * tl.cdiv(qo_len, Q_SCALE_BLOCK)
-    k_scale_offset = (
-        off_z * (H // num_kv_groups) + off_h // num_kv_groups
-    ) * tl.cdiv(kv_len, K_SCALE_BLOCK)
+    k_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, K_SCALE_BLOCK)
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, HEAD_DIM)
 
-    Q_ptrs = (
-        Q
-        + off_z * stride_qz
-        + off_h * stride_qh
-        + offs_m[:, None] * stride_qn
-        + offs_k[None, :]
-    )
+    Q_ptrs = Q + off_z * stride_qz + off_h * stride_qh + offs_m[:, None] * stride_qn + offs_k[None, :]
     # Programs may be smaller than the 128-row Q quantization group; adjacent
     # programs then share the same scale without changing quantization semantics.
     if BLOCK_M == Q_SCALE_BLOCK:
@@ -196,19 +186,9 @@ def _attn_fwd(
     )
     K_scale_ptr = K_scale + k_scale_offset
     V_ptrs = (
-        V
-        + off_z * stride_vz
-        + (off_h // num_kv_groups) * stride_vh
-        + offs_n[:, None] * stride_vn
-        + offs_k[None, :]
+        V + off_z * stride_vz + (off_h // num_kv_groups) * stride_vh + offs_n[:, None] * stride_vn + offs_k[None, :]
     )
-    O_ptrs = (
-        Out
-        + off_z * stride_oz
-        + off_h * stride_oh
-        + offs_m[:, None] * stride_on
-        + offs_k[None, :]
-    )
+    O_ptrs = Out + off_z * stride_oz + off_h * stride_oh + offs_m[:, None] * stride_on + offs_k[None, :]
 
     if HAS_MASK:
         mask_ptrs = (
@@ -314,8 +294,7 @@ def _validate_forward_inputs(q, k, v, q_scale, k_scale, tensor_layout, attn_mask
     if tensor_layout not in {"HND", "NHD"}:
         raise ValueError(f"Unknown tensor layout: {tensor_layout}")
     if attn_mask is not None and (
-        attn_mask.ndim != 4
-        or attn_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32)
+        attn_mask.ndim != 4 or attn_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32)
     ):
         raise TypeError("attn_mask must be a rank-4 bool or floating-point tensor")
     if not q_scale.is_contiguous() or not k_scale.is_contiguous():
@@ -338,11 +317,7 @@ def _select_launch_config(
     """
     block_n = 64
     use_packed_aligned_core = (
-        k_stride_n == 1
-        and not has_mask
-        and not return_lse
-        and qo_len % 128 == 0
-        and kv_len % block_n == 0
+        k_stride_n == 1 and not has_mask and not return_lse and qo_len % 128 == 0 and kv_len % block_n == 0
     )
     if use_packed_aligned_core:
         if head_dim == 64:
@@ -353,12 +328,7 @@ def _select_launch_config(
         return 128, 8, 1
 
     block_m = 64
-    use_two_stages = (
-        not has_mask
-        and not return_lse
-        and qo_len % block_m == 0
-        and kv_len % block_n == 0
-    )
+    use_two_stages = not has_mask and not return_lse and qo_len % block_m == 0 and kv_len % block_n == 0
     return block_m, 8, 2 if use_two_stages else 1
 
 
@@ -413,13 +383,9 @@ def forward(
     expected_q_blocks = triton.cdiv(qo_len, 128)
     expected_k_blocks = triton.cdiv(kv_len, 64)
     if q_scale.shape != (b, h_qo, expected_q_blocks):
-        raise ValueError(
-            f"q_scale must have shape {(b, h_qo, expected_q_blocks)}, got {tuple(q_scale.shape)}"
-        )
+        raise ValueError(f"q_scale must have shape {(b, h_qo, expected_q_blocks)}, got {tuple(q_scale.shape)}")
     if k_scale.shape != (b, h_kv, expected_k_blocks):
-        raise ValueError(
-            f"k_scale must have shape {(b, h_kv, expected_k_blocks)}, got {tuple(k_scale.shape)}"
-        )
+        raise ValueError(f"k_scale must have shape {(b, h_kv, expected_k_blocks)}, got {tuple(k_scale.shape)}")
 
     if attn_mask is not None:
         expected_mask = (b, h_qo, qo_len, kv_len)
