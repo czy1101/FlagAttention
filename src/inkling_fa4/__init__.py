@@ -1,4 +1,9 @@
-"""Inkling FA4 relative-attention implementations."""
+"""Inkling FA4 relative-attention implementations.
+
+Triton and Hopper TLE share a single module, ``inkling_fa4.triton_kernel``.
+``inkling_fa4_rel_attention`` is the unified entry point: it prefers TLE and
+falls back to Triton when TLE is unavailable or unsupported for the shape.
+"""
 
 from __future__ import annotations
 
@@ -17,14 +22,15 @@ def __getattr__(name: str) -> Any:
 
         return inkling_fa4_rel_attention
 
-    if name == "inkling_fa4_rel_attention_triton":
-        from .triton_kernel import inkling_fa4_rel_attention_triton
+    if name in ("inkling_fa4_rel_attention_triton", "inkling_fa4_rel_attention_tle"):
+        from .triton_kernel import (
+            inkling_fa4_rel_attention_tle,
+            inkling_fa4_rel_attention_triton,
+        )
 
-        return inkling_fa4_rel_attention_triton
-
-    if name == "inkling_fa4_rel_attention_tle":
-        from .triton_tle_kernel import inkling_fa4_rel_attention_tle
-
-        return inkling_fa4_rel_attention_tle
+        return {
+            "inkling_fa4_rel_attention_triton": inkling_fa4_rel_attention_triton,
+            "inkling_fa4_rel_attention_tle": inkling_fa4_rel_attention_tle,
+        }[name]
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

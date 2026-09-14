@@ -13,22 +13,27 @@ guide::
 with causal (and optionally sliding-window) masking handled by the backend.
 """
 
-import importlib
-
 import pytest
 import torch
 
-from vllm.models.inkling.nvidia.attention import (
+pytest.importorskip("vllm", reason="vLLM is not installed")
+
+from inkling_fa4.reference import ref_rel_attn  # noqa: E402
+from vllm.models.inkling.nvidia.attention import (  # noqa: E402
     InklingAttention,
     compute_log_scaling_tau,
 )
-from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
-    _use_sheared_bias,
-    inkling_fa4_num_splits,
-    inkling_fa4_rel_attention,
+from vllm.platforms import current_platform  # noqa: E402
+from vllm.platforms.interface import DeviceCapability  # noqa: E402
+
+FA4_OPS = pytest.importorskip(
+    "vllm.models.inkling.nvidia.ops.fa4_rel_attention",
+    reason="vLLM Inkling FA4 relative-attention operator not available",
 )
-from vllm.platforms import current_platform
-from vllm.platforms.interface import DeviceCapability
+
+_use_sheared_bias = FA4_OPS._use_sheared_bias
+inkling_fa4_num_splits = FA4_OPS.inkling_fa4_num_splits
+inkling_fa4_rel_attention = FA4_OPS.inkling_fa4_rel_attention
 
 _cap = current_platform.get_device_capability() if current_platform.is_cuda() else None
 
@@ -166,66 +171,6 @@ def test_num_splits_long_context_bound(blackwell_platform, tp, max_kv_len, expec
     )
 
 
-def _ref_rel_attn(
-    q: torch.Tensor,  # [total_q, H, D]
-    key_cache: torch.Tensor,  # [num_blocks, block, Hkv, D]
-    value_cache: torch.Tensor,
-    rel_logits: torch.Tensor,  # [total_q, H, rel_extent]
-    *,
-    q_lens: list[int],
-    kv_lens: list[int],
-    block_table: torch.Tensor,
-    scale: float,
-    rel_extent: int,
-    window_left: int | None,
-) -> torch.Tensor:
-    num_kv_heads = key_cache.shape[2]
-    num_heads = q.shape[1]
-    g = num_heads // num_kv_heads
-    bt = block_table.cpu().numpy()
-    out = torch.empty_like(q)
-
-    start = 0
-    for i, (ql, kl) in enumerate(zip(q_lens, kv_lens)):
-        qi = q[start : start + ql].float()  # [ql, H, D]
-        rl = rel_logits[start : start + ql].float()  # [ql, H, rel_extent]
-
-        nblk = (kl + BLOCK_SIZE - 1) // BLOCK_SIZE
-        blk = bt[i, :nblk]
-        k = key_cache[blk].reshape(-1, num_kv_heads, HEAD_DIM)[:kl].float()
-        v = value_cache[blk].reshape(-1, num_kv_heads, HEAD_DIM)[:kl].float()
-        k = k.repeat_interleave(g, dim=1)  # [kl, H, D]
-        v = v.repeat_interleave(g, dim=1)
-
-        # [H, ql, kl]
-        scores = torch.einsum("qhd,khd->hqk", qi, k) * scale
-
-        dev = q.device
-        qpos = torch.arange(ql, device=dev).view(ql, 1) + (kl - ql)  # query pos
-        kpos = torch.arange(kl, device=dev).view(1, kl)
-        dist = qpos - kpos  # [ql, kl] = i - j
-
-        # Relative bias: rel_logits[i, h, dist] when 0 <= dist < rel_extent.
-        in_rng = (dist >= 0) & (dist < rel_extent)  # [ql, kl]
-        idx = dist.clamp(0, rel_extent - 1)
-        # gather per head: bias[h, i, j] = rl[i, h, idx[i, j]]
-        bias = rl.permute(1, 0, 2).gather(  # [H, ql, rel_extent]
-            2, idx.unsqueeze(0).expand(num_heads, -1, -1)
-        )  # [H, ql, kl]
-        bias = torch.where(in_rng.unsqueeze(0), bias, torch.zeros_like(bias))
-        scores = scores + bias
-
-        mask = dist < 0  # causal
-        if window_left is not None:
-            mask = mask | (dist > window_left)
-        scores.masked_fill_(mask.unsqueeze(0), float("-inf"))
-
-        probs = torch.softmax(scores, dim=-1)
-        out[start : start + ql] = torch.einsum("hqk,khd->qhd", probs, v).to(q.dtype)
-        start += ql
-    return out
-
-
 def _run_case(seq_lens, num_heads, num_kv_heads, rel_extent, window_left, seed=0):
     torch.manual_seed(seed)
     device = "cuda"
@@ -298,17 +243,18 @@ def _run_case(seq_lens, num_heads, num_kv_heads, rel_extent, window_left, seed=0
     assert out.data_ptr() == preallocated_out.data_ptr()
     out = out.view(total_q, num_heads, HEAD_DIM)
 
-    ref = _ref_rel_attn(
+    ref = ref_rel_attn(
         q,
         key_cache,
         value_cache,
-        rel_logits,
-        q_lens=q_lens,
-        kv_lens=kv_lens,
         block_table=block_table,
-        scale=scale,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
         rel_extent=rel_extent,
-        window_left=window_left,
+        rel_logits=rel_logits,
     )
 
     torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
@@ -321,8 +267,7 @@ def _run_case(seq_lens, num_heads, num_kv_heads, rel_extent, window_left, seed=0
 )
 @torch.inference_mode()
 def test_score_mod_relative_attention(monkeypatch):
-    module = importlib.import_module("vllm.models.inkling.nvidia.ops.fa4_rel_attention")
-    monkeypatch.setattr(module, "_use_sheared_bias", lambda: False)
+    monkeypatch.setattr(FA4_OPS, "_use_sheared_bias", lambda: False)
     _run_case(
         [(64, 64), (1, 80)],
         num_heads=4,
