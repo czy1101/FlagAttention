@@ -2,16 +2,16 @@
 #
 # Licensed under the Apache License, Version 2.0.
 
-"""Standalone DiffKV decode benchmark.
+"""Pytest-only DiffKV decode benchmark.
 
-Run from the FlagAttention repository root, for example::
+Run from the FlagAttention repository root with::
 
-    python benchmark/diffkv_attention_benchmark.py --mode both
+    pytest -q -s benchmark/diffkv_attention_benchmark.py
 
-Use ``--backend tle`` to require the optional TLE extension, or
-``--backend triton`` to force the standard non-TLE ``tl.load`` path.  Run the two
-commands in separate processes when comparing them; Triton caches JIT kernels
-per process and should not be mixed in one timing loop.
+Benchmark settings are defined in ``BenchmarkConfig`` below.  The TLE and
+standard Triton paths must be measured in separate pytest processes when they
+are compared; Triton caches JIT kernels per process and should not be mixed in
+one timing loop.
 
 The benchmark allocates all paged-cache/workspace tensors before timing and
 uses one CUDA event pair per operator call, with Triton's benchmark-cache
@@ -20,16 +20,14 @@ clear between calls.  It reports one row per shape with locally measured FA3
 Triton 2D/3D, best speedup, and timing credibility diagnostics.  A
 vLLM benchmark CSV can still be supplied as a fallback/reference with
 ``--fa3-csv``.  The FA3 extension is loaded directly with
-``torch.ops.load_library`` so the standalone repository does not need to be
-installed as a vLLM package.  When no path is supplied, the benchmark looks
-for the conventional ``fa3-torch210-overlay`` sibling of the checkout (and
-other checkout/cwd ancestors), so the pytest entry point can measure FA3
-without proxy environment variables or ``PYTHONPATH`` settings.
+``torch.ops.load_library`` from the active Python environment's
+``site-packages/fa3_runtime`` directory.  The benchmark does not search the
+repository, checkout ancestors, or external overlay directories for FA3.
 """
 
 from __future__ import annotations
 
-import argparse
+from dataclasses import dataclass
 import importlib
 import csv
 import math
@@ -46,6 +44,26 @@ import triton
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    """Fixed benchmark configuration used by the pytest entry point."""
+
+    mode: str = "both"
+    paths: tuple[str, ...] = ("2d", "3d")
+    batches: tuple[int, ...] = (1, 8, 16, 32)
+    seq_lens: tuple[int, ...] = (512, 2048, 8192, 32768)
+    window_size: int = 128
+    dtype: str = "bfloat16"
+    warmup: int = 20
+    iterations: int = 30
+    samples: int = 9
+    stability_cv_pct: float = 5.0
+    backend: str = "auto"
+    fa3_csv: tuple[pathlib.Path, ...] | None = None
+    fa3: str = "auto"
+    csv: pathlib.Path | None = None
 
 
 def fa3_key(
@@ -99,13 +117,9 @@ def _fa3_module():
     return importlib.import_module("flag_attn.diffkv_attention.FA3")
 
 
-def _fa3_op_available() -> bool:
-    return _fa3_module().fa3_op_available()
-
-
-def load_fa3_provider(requested: str, extension_path: str | None):
-    """Delegate FA3 loading to the self-contained DiffKV package."""
-    return _fa3_module().load_fa3_provider(requested, extension_path)
+def load_fa3_provider(requested: str):
+    """Load FA3 exclusively from the active Python environment."""
+    return _fa3_module().load_fa3_provider(requested)
 
 
 def make_inputs(
@@ -138,7 +152,7 @@ def make_inputs(
     return query, key_cache, value_cache, context_lens, block_tables
 
 
-def build_runner(inputs, path: str, window_size: int, diffkv_impl, baseline_impl=None):
+def build_runner(inputs, path: str, window_size: int, diffkv_impl):
     """Build a runner with the unified TLE/standard backend dispatcher."""
     query, key_cache, value_cache, context_lens, block_tables = inputs
     batch, hq, dqk = query.shape
@@ -151,31 +165,20 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl, baseline_impl
         raise ValueError(f"unsupported path: {path}")
     use_3d = path == "3d"
 
-    # Match the optimized vLLM launcher: validated short 3D requests can be
-    # changed to a single 2D launch when the resulting grid is dense enough.
     num_q_per_kv = hq // hkv
     block_m = 16 if num_q_per_kv <= 16 else triton.next_power_of_2(num_q_per_kv)
     block_q = block_m // num_q_per_kv
     total_num_q_blocks = query.shape[0] // block_q + batch
     num_sms = torch.cuda.get_device_properties(query.device).multi_processor_count
-    if use_3d and (
-        diffkv_impl.should_use_tle_split_head_2d(
-            dqk, 128, 1, seq_len, batch, hq, hkv, block_size, True
-        )
-        or diffkv_impl.should_use_tle_short_2d(
-            dqk, 1, seq_len, True, total_num_q_blocks, hkv, num_sms
-        )
-    ):
-        use_3d = False
 
-    use_optimized = diffkv_impl.USE_TLE and diffkv_impl.should_use_tle_diffkv(
-        dqk, 1, seq_len, batch, use_3d, hq, hkv
-    )
+    # Backend selection is environment-based: the benchmark keeps TLE and
+    # standard Triton as explicit, reproducible comparison modes.
+    use_optimized = diffkv_impl.USE_TLE
     impl_name = "TLE" if use_optimized else "non-TLE"
-    selected_backend = "tle" if use_optimized else "triton"
+    selected_backend = diffkv_impl.SELECTED_BACKEND
     if use_3d:
         if use_optimized:
-            num_segments = diffkv_impl.get_tle_num_par_softmax_segments(
+            num_segments = diffkv_impl.get_num_par_softmax_segments(
                 seq_len,
                 batch,
                 True,
@@ -185,7 +188,9 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl, baseline_impl
                 block_size=block_size,
             )
         else:
-            num_segments = 64 if batch == 1 and seq_len == 2048 else 16
+            num_segments = diffkv_impl.get_num_par_softmax_segments(
+                seq_len, batch, True
+            )
         padded_v = 128
         segm_output = torch.empty(
             batch,
@@ -204,11 +209,12 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl, baseline_impl
         num_segments = None
         segm_output = segm_max = segm_expsum = None
         threshold = None
+
     triton_window = (window_size - 1, 0) if window_size > 0 else (-1, -1)
     out = torch.empty(batch, hq, 128, device="cuda", dtype=query.dtype)
     extra_kwargs = {}
     if use_optimized and use_3d and diffkv_impl.should_use_tle_fused_reducer(
-        dqk, 128, 1, seq_len, batch, hq, hkv, block_size, True
+        dqk, 128, 1, seq_len, batch, block_size, True
     ):
         extra_kwargs["fused_reducer_counter"] = torch.zeros(
             batch * hq, device="cuda", dtype=torch.int32
@@ -235,6 +241,7 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl, baseline_impl
             softmax_segm_expsum=segm_expsum,
             max_seqlen_k=seq_len,
             backend=selected_backend,
+            path=path,
             **extra_kwargs,
         )
 
@@ -290,10 +297,9 @@ def parse_dtype(name: str):
 def load_diffkv_backend(name: str):
     """Load exactly one backend before Triton JIT compilation starts."""
     os.environ["FLAG_ATTN_DIFFKV_BACKEND"] = name
-    # ``flag_attn.__init__`` intentionally exports a convenience function
-    # named ``diffkv_attention``.  Import the submodule explicitly so that
-    # this benchmark receives the backend metadata and dispatch helpers.
-    diffkv_impl = importlib.import_module("flag_attn.diffkv_attention")
+    # Import the submodule explicitly so this benchmark remains independent
+    # of the package's top-level exports.
+    diffkv_impl = importlib.import_module("flag_attn.diffkv_attention.diffkv_attention")
 
     if name == "tle" and not diffkv_impl.HAS_TLE:
         detail = diffkv_impl.get_diffkv_backend_info()["tle_error"]
@@ -302,75 +308,23 @@ def load_diffkv_backend(name: str):
             "build exposing triton.experimental.tle.language. "
             f"Import error: {detail}"
         )
-    # The unified module contains both entry points.  Keep the second return
-    # value for source compatibility with older benchmark helpers.
-    return diffkv_impl, diffkv_impl
+    return diffkv_impl
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["full", "swa", "both"], default="both")
-    parser.add_argument("--paths", nargs="+", choices=["2d", "3d"], default=["2d", "3d"])
-    parser.add_argument("--batches", nargs="+", type=int, default=[1, 8, 16, 32])
-    parser.add_argument("--seq-lens", nargs="+", type=int, default=[512, 2048, 8192, 32768])
-    parser.add_argument("--window-size", type=int, default=128)
-    parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iterations", type=int, default=20)
-    parser.add_argument("--samples", type=int, default=5)
-    parser.add_argument(
-        "--backend",
-        choices=["auto", "tle", "triton"],
-        default="auto",
-        help=(
-            "kernel load backend: auto uses TLE when importable, triton "
-            "forces standard synchronous tl.load"
-        ),
-    )
-    parser.add_argument(
-        "--fa3-csv",
-        type=pathlib.Path,
-        nargs="+",
-        default=None,
-        help=(
-            "Optional vLLM benchmark CSV(s) containing FA3 rows.  The files "
-            "are matched by mode, shape and head configuration."
-        ),
-    )
-    parser.add_argument(
-        "--fa3",
-        choices=["auto", "on", "off"],
-        default="auto",
-        help=(
-            "measure FA3 directly when _vllm_fa3_C is available; auto keeps "
-            "running without it, on fails if it cannot be loaded, and off "
-            "disables the local FA3 provider"
-        ),
-    )
-    parser.add_argument(
-        "--fa3-extension",
-        type=str,
-        default=None,
-        help=(
-            "FA3 shared library or directory. Defaults to "
-            "VLLM_FLASH_ATTN_EXTENSION_DIR, then auto-discovers a "
-            "fa3-torch210-overlay sibling of the checkout"
-        ),
-    )
-    parser.add_argument("--csv", type=pathlib.Path, default=None)
-    args = parser.parse_args(argv)
+def run_benchmark(config: BenchmarkConfig | None = None):
+    config = BenchmarkConfig() if config is None else config
     if not torch.cuda.is_available():
         raise RuntimeError("DiffKV benchmark requires CUDA")
-    diffkv_impl, baseline_impl = load_diffkv_backend(args.backend)
-    dtype = parse_dtype(args.dtype)
-    fa3_reference = load_fa3_reference(args.fa3_csv)
-    fa3_status = load_fa3_provider(args.fa3, args.fa3_extension)
-    modes = ["full", "swa"] if args.mode == "both" else [args.mode]
+    diffkv_impl = load_diffkv_backend(config.backend)
+    dtype = parse_dtype(config.dtype)
+    fa3_reference = load_fa3_reference(config.fa3_csv)
+    fa3_status = load_fa3_provider(config.fa3)
+    modes = ["full", "swa"] if config.mode == "both" else [config.mode]
     rows = []
-    print(f"Device: {torch.cuda.get_device_name()} dtype={args.dtype}")
+    print(f"Device: {torch.cuda.get_device_name()} dtype={config.dtype}")
     print(
         "DiffKV backend: "
-        f"requested={args.backend}, selected={diffkv_impl.SELECTED_BACKEND}, "
+        f"requested={config.backend}, selected={diffkv_impl.SELECTED_BACKEND}, "
         f"HAS_TLE={diffkv_impl.is_tle_available()}"
     )
     if not fa3_status["available"]:
@@ -389,21 +343,21 @@ def main(argv=None):
         "Triton benchmark cache cleared between calls"
     )
     for mode in modes:
-        window = -1 if mode == "full" else args.window_size
+        window = -1 if mode == "full" else config.window_size
         hkv = 4 if mode == "full" else 8
         section_rows = []
-        for batch in args.batches:
-            for seq_len in args.seq_lens:
+        for batch in config.batches:
+            for seq_len in config.seq_lens:
                 inputs = make_inputs(batch, seq_len, dtype, hkv)
                 measurements = {}
                 path_impls = {}
-                for path in args.paths:
+                for path in config.paths:
                     runner, impl_name = build_runner(
-                        inputs, path, window, diffkv_impl, baseline_impl
+                        inputs, path, window, diffkv_impl
                     )
                     p50, pmin, pmax, cv_pct = measure(
                         runner,
-                        args.warmup, args.iterations, args.samples,
+                        config.warmup, config.iterations, config.samples,
                     )
                     measurements[path] = (p50, pmin, pmax, cv_pct)
                     path_impls[path] = impl_name
@@ -413,9 +367,9 @@ def main(argv=None):
                     try:
                         fa3_measurement = measure(
                             build_fa3_runner(inputs, window),
-                            args.warmup,
-                            args.iterations,
-                            args.samples,
+                            config.warmup,
+                            config.iterations,
+                            config.samples,
                         )
                     except Exception as exc:  # pragma: no cover - host-specific
                         fa3_error = f"{type(exc).__name__}: {exc}"
@@ -441,14 +395,16 @@ def main(argv=None):
                 best_speedup = fa3_us / best[0] if fa3_us is not None else None
                 credibility = (
                     f"range=[{best[1] / 1000:.6f},{best[2] / 1000:.6f}]ms "
-                    f"CV={best[3]:.2f}% samples={args.samples} stable"
+                    f"CV={best[3]:.2f}% samples={config.samples} "
+                    f"{'stable' if best[3] <= config.stability_cv_pct else 'noisy'}"
                 )
                 if fa3_us is None:
                     credibility += " FA3=n/a"
                 else:
                     if fa3_measurement is not None:
                         credibility += (
-                            f" FA3=local CV={fa3_measurement[3]:.2f}%"
+                            f" FA3=local CV={fa3_measurement[3]:.2f}% "
+                            f"{'stable' if fa3_measurement[3] <= config.stability_cv_pct else 'noisy'}"
                         )
                     else:
                         credibility += " FA3=reference-CSV"
@@ -456,7 +412,7 @@ def main(argv=None):
                     credibility += f" FA3-error={fa3_error}"
                 shape_text = (
                     f"B={batch} Q=1 KV={seq_len} HQ=64 HKV={hkv} "
-                    f"DQK=192 DV=128 {args.dtype}"
+                    f"DQK=192 DV=128 {config.dtype}"
                 )
                 section_rows.append(
                     (
@@ -480,7 +436,7 @@ def main(argv=None):
                         "seq_len": seq_len,
                         "path": path,
                         "implementation": path_impls[path],
-                        "dtype": args.dtype,
+                        "dtype": config.dtype,
                         "backend": diffkv_impl.SELECTED_BACKEND,
                         "fa3_source": fa3_source,
                         "fa3_p50_us": ""
@@ -528,13 +484,13 @@ def main(argv=None):
             print("  ".join(value.ljust(widths[index])
                              for index, value in enumerate(row)))
         print("-" * separator_length)
-    if args.csv is not None:
-        args.csv.parent.mkdir(parents=True, exist_ok=True)
-        with args.csv.open("w", newline="") as f:
+    if config.csv is not None:
+        config.csv.parent.mkdir(parents=True, exist_ok=True)
+        with config.csv.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=rows[0].keys())
             writer.writeheader()
             writer.writerows(rows)
-        print(f"\nWrote {args.csv}")
+        print(f"\nWrote {config.csv}")
 
 
 @pytest.mark.skipif(
@@ -543,8 +499,4 @@ def main(argv=None):
 )
 def test_perf_diffkv_attention():
     """Run the default DiffKV benchmark under pytest."""
-    main([])
-
-
-if __name__ == "__main__":
-    main()
+    run_benchmark()

@@ -1,25 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Standalone adapter for the optional FlashAttention-3 CUDA extension.
+"""Adapter for the optional FlashAttention-3 CUDA extension.
 
-The FA3 kernel itself is compiled in ``_vllm_fa3_C.abi3.so``.  This module
-loads that binary directly with ``torch.ops.load_library`` and exposes the
-same paged-cache runner used by the DiffKV benchmark.  No vLLM Python package
-is required.  An explicit path or ``VLLM_FLASH_ATTN_EXTENSION_DIR`` takes
-precedence; otherwise the conventional overlay directories are discovered
-relative to the checkout/currdir.
+The FA3 kernel is installed in the active Python environment as
+``fa3_runtime/_vllm_fa3_C.abi3.so``.  This module loads that binary directly
+with ``torch.ops.load_library`` and exposes the paged-cache runner used by the
+DiffKV benchmark.  No vLLM Python package is required.
+
+Install the matching FA3 revision in the active Conda environment before
+running the benchmark (the build is memory-limited intentionally)::
+
+    conda activate yu
+    git clone https://github.com/vllm-project/flash-attention.git
+    cd flash-attention
+    git checkout f3e1a4f74c99145c0717709860bf765de1703779
+    export CUDA_HOME=/home/yuli/cuda-tle-12.8
+    export CUDACXX=/root/miniconda3/envs/tle/bin/nvcc
+    export MAX_JOBS=1 CMAKE_BUILD_PARALLEL_LEVEL=1 NINJAFLAGS=-j1
+    python -m pip install --no-build-isolation .
+    SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
+    mkdir -p "$SITE_PACKAGES/fa3_runtime"
+    install -m 644 /path/to/_vllm_fa3_C.abi3.so "$SITE_PACKAGES/fa3_runtime/"
+
+The resulting ``_vllm_fa3_C.abi3.so`` must be placed under the active
+environment's ``site-packages/fa3_runtime`` directory.  Verify with::
+
+    python -c "from flag_attn.diffkv_attention.FA3 import load_fa3_provider; print(load_fa3_provider('on'))"
 """
 
 from __future__ import annotations
 
 import os
 import pathlib
-from typing import Any
+import site
+import sys
 
 import torch
-
-
-ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
 def fa3_op_available() -> bool:
@@ -31,48 +47,39 @@ def fa3_op_available() -> bool:
         return False
 
 
-def _auto_search_roots() -> list[pathlib.Path]:
-    """Return bounded roots for conventional sibling FA3 overlays."""
+def _environment_roots() -> list[pathlib.Path]:
+    """Return FA3 search roots inside the active Python environment only."""
+    environment = pathlib.Path(sys.prefix).resolve()
     roots: list[pathlib.Path] = []
-    seen: set[pathlib.Path] = set()
-    for start in (ROOT, pathlib.Path.cwd()):
-        for ancestor in (start, *start.parents):
-            try:
-                ancestor = ancestor.resolve()
-            except OSError:
-                continue
-            if ancestor in seen:
-                continue
-            seen.add(ancestor)
-            roots.append(ancestor)
+    for directory in site.getsitepackages():
+        site_packages = pathlib.Path(directory).resolve()
+        try:
+            site_packages.relative_to(environment)
+        except ValueError:
+            continue
+        roots.extend((site_packages / "fa3_runtime", site_packages))
     return roots
 
 
 def extension_candidates(path: str | None = None):
-    """Yield FA3 shared libraries from an explicit or auto-discovered path."""
+    """Yield FA3 shared libraries installed in the active environment."""
     configured = path or os.environ.get("VLLM_FLASH_ATTN_EXTENSION_DIR")
     if configured:
         roots = [pathlib.Path(configured).expanduser()]
     else:
-        roots: list[pathlib.Path] = []
-        for ancestor in _auto_search_roots():
-            roots.extend(
-                (
-                    ancestor / "_vllm_fa3_C.abi3.so",
-                    ancestor / "fa3-torch210-overlay",
-                    ancestor / "fa3-tle-build-v2",
-                )
-            )
-            try:
-                roots.extend(sorted(ancestor.glob("fa3*-overlay")))
-            except OSError:
-                pass
+        roots = _environment_roots()
+
+    environment = pathlib.Path(sys.prefix).resolve()
 
     seen: set[pathlib.Path] = set()
     for root in roots:
         try:
             root = root.resolve()
         except OSError:
+            continue
+        try:
+            root.relative_to(environment)
+        except ValueError:
             continue
         if root in seen:
             continue
@@ -106,8 +113,8 @@ def load_fa3_provider(requested: str = "auto", extension_path: str | None = None
         errors.append(f"no _vllm_fa3_C*.so found under {configured}")
     elif not configured and not candidates:
         errors.append(
-            "no FA3 overlay found in checkout/cwd ancestors; pass "
-            "--fa3-extension to use a non-standard location"
+            "no FA3 extension found in the active Python environment; "
+            "install _vllm_fa3_C.abi3.so under site-packages/fa3_runtime"
         )
     for candidate in candidates:
         try:
@@ -227,7 +234,6 @@ def build_fa3_runner(inputs: tuple[torch.Tensor, ...], window_size: int):
 
 
 __all__ = [
-    "ROOT",
     "fa3_op_available",
     "extension_candidates",
     "load_fa3_provider",

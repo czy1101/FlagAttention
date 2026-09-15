@@ -2,21 +2,35 @@
 #
 # Licensed under the Apache License, Version 2.0.
 
+# Run the DiffKV correctness tests from the repository root:
+#   pytest -q tests/flag_attn/test_diffkv_attention.py
+
+import importlib
 import pathlib
 import sys
 
 import pytest
 import torch
 
+
+pytest.importorskip("triton")
+
 # Keep the test runnable directly from a source checkout.
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from flag_attn.diffkv_attention import diffkv_attention, unified_attention_diffkv
+from flag_attn.diffkv_attention.diffkv_attention import (
+    diffkv_attention,
+    unified_attention_diffkv,
+)
+
+diffkv_impl = importlib.import_module(
+    "flag_attn.diffkv_attention.diffkv_attention"
+)
 
 
-pytestmark = pytest.mark.skipif(
+CUDA_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="DiffKV Triton tests require CUDA"
 )
 
@@ -128,16 +142,29 @@ def _run_baseline(query, key_cache, value_cache, context_lens, block_tables,
         softmax_segm_max=segm_max,
         softmax_segm_expsum=segm_expsum,
         max_seqlen_k=seq_len,
+        path=path,
         backend="triton",
     )
     return out
 
 
 @pytest.mark.parametrize(
-    "batch,seq_len", [(1, 512), (1, 2048), (1, 8192), (8, 2048), (32, 8192)]
+    "batch,seq_len",
+    [
+        (1, 512),
+        (1, 2048),
+        (1, 8192),
+        (4, 512),
+        (2, 2048),
+        (8, 512),
+        (4, 4096),
+        (8, 2048),
+        (32, 8192),
+    ],
 )
 @pytest.mark.parametrize("path", ["2d", "3d"])
 @pytest.mark.parametrize("window_size", [-1, 128])
+@CUDA_REQUIRED
 def test_diffkv_attention_matches_reference(batch, seq_len, path, window_size):
     torch.manual_seed(0)
     query, key_cache, value_cache, context_lens, block_tables = _make_case(
@@ -170,6 +197,7 @@ def test_diffkv_attention_matches_reference(batch, seq_len, path, window_size):
     (1, 512, "3d", -1),
     (8, 2048, "3d", 128),
 ])
+@CUDA_REQUIRED
 def test_diffkv_baseline_matches_reference(batch, seq_len, path, window_size):
     """Validate the standard Triton implementation used by benchmark fallback."""
     torch.manual_seed(0)
@@ -186,3 +214,69 @@ def test_diffkv_baseline_matches_reference(batch, seq_len, path, window_size):
         scale, window_size,
     )
     torch.testing.assert_close(actual.float(), expected.float(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize(
+    ("max_seqlen_k", "expected"),
+    [
+        (None, None),
+        (512, "short"),
+        (1024, "short"),
+        (1025, "medium"),
+        (8192, "medium"),
+        (8193, "long"),
+    ],
+)
+def test_workload_class_boundaries(max_seqlen_k, expected):
+    assert diffkv_impl._tle_workload_class(max_seqlen_k) == expected
+
+
+def test_path_normalization():
+    assert diffkv_impl._normalize_path(" 3D ") == "3d"
+    assert diffkv_impl._normalize_path("2d") == "2d"
+    with pytest.raises(ValueError, match="path must be 2d or 3d"):
+        diffkv_impl._normalize_path("auto")
+
+
+def _select_config(**overrides):
+    values = {
+        "head_size_qk": 192,
+        "head_size_v": 128,
+        "max_seqlen_q": 1,
+        "max_seqlen_k": 512,
+        "num_seqs": 8,
+        "num_query_heads": 64,
+        "num_kv_heads": 4,
+        "block_size": 16,
+        "num_query_tokens": 8,
+        "is_decode": True,
+        "path": "2d",
+        "num_par_softmax_segments": None,
+        "has_softmax_buffers": False,
+        "num_sms": 108,
+        "fused_reducer_available": False,
+    }
+    values.update(overrides)
+    return diffkv_impl._select_tle_launch_config(**values)
+
+
+def test_short_2d_policy_uses_wide_tile_for_batch_eight():
+    config = _select_config()
+    assert config.use_3d is False
+    assert config.split_heads is False
+    assert config.tile_size == 128
+    assert config.loop_num_stages == 5
+
+
+def test_short_3d_policy_uses_light_pipeline():
+    config = _select_config(
+        num_seqs=1,
+        num_query_tokens=1,
+        path="3d",
+        num_par_softmax_segments=64,
+        has_softmax_buffers=True,
+    )
+    assert config.use_3d is True
+    assert config.num_segments == 64
+    assert config.split_heads is True
+    assert config.loop_num_stages == 1
