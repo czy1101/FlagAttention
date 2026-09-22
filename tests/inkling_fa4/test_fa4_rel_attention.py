@@ -16,6 +16,8 @@ with causal (and optionally sliding-window) masking handled by the backend.
 import pytest
 import torch
 
+pytestmark = pytest.mark.inkling_fa4_rel_attention
+
 pytest.importorskip("vllm", reason="vLLM is not installed")
 
 from inkling_fa4.reference import ref_rel_attn  # noqa: E402

@@ -7,16 +7,14 @@ suite runs unchanged on a CI box that has neither CuTe nor vLLM installed.
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import sys
 from functools import cache
 from pathlib import Path
 
 import pytest
 import torch
-
-import importlib.util
-import sys
-from pathlib import Path
 
 _UTILS_PATH = Path(__file__).parent / "benchmark_utils.py"
 _spec = importlib.util.spec_from_file_location(
@@ -34,6 +32,7 @@ resolve_backends = _impl.resolve_backends
 run_benchmark = _impl.run_benchmark
 
 pytestmark = [
+    pytest.mark.inkling_fa4_rel_attention,
     pytest.mark.gpu,
     pytest.mark.benchmark,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),

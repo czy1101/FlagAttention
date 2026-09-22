@@ -23,7 +23,7 @@ authors = [
 description = "A collection of memory efficient attention operators implemented in triton language."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
-license = { text = "LICENSE.txt" }
+license = { file = "LICENSE" }
 
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -75,6 +75,8 @@ pythonpath = [
 markers = [
     "gpu: requires CUDA GPU",
     "performance: performance benchmark",
+    "benchmark: benchmark entry point",
+    "inkling_fa4_rel_attention: Inkling FA4 relative-attention operator tests",
 ]
 
 [tool.ruff]

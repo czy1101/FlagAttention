@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-files: '^src/.*'
+files: '^(src/inkling_fa4/|tests/inkling_fa4/|benchmark/inkling_fa4/|conf/)'
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0

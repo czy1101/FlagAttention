@@ -29,10 +29,12 @@ _inkling_benchmark_utils = importlib.util.module_from_spec(_spec)
 sys.modules["inkling_benchmark_utils"] = _inkling_benchmark_utils
 _spec.loader.exec_module(_inkling_benchmark_utils)
 append_csv = _inkling_benchmark_utils.append_csv
+performance_cases = _inkling_benchmark_utils.performance_cases
 resolve_backends = _inkling_benchmark_utils.resolve_backends
 run_benchmark = _inkling_benchmark_utils.run_benchmark
 
 pytestmark = [
+    pytest.mark.inkling_fa4_rel_attention,
     pytest.mark.gpu,
     pytest.mark.performance,
     pytest.mark.skipif(
@@ -41,15 +43,20 @@ pytestmark = [
     ),
 ]
 
-CASES = [
-    ("full_prefill", 1),
-    ("ragged_prefill", 1),
-    ("long_prefill", 2),
-    ("chunked_prefill", 8),
-    ("sliding_window", 8),
-    ("decode_1k", 32),
-    ("decode_8k", 64),
-]
+
+
+def _configured_cases() -> tuple[tuple[str, int], ...]:
+    raw_splits = os.getenv("PERF_SPLITS")
+    if raw_splits is None:
+        return performance_cases()
+    try:
+        splits = tuple(int(value.strip()) for value in raw_splits.split(","))
+    except ValueError as exc:
+        raise ValueError("PERF_SPLITS must be comma-separated integers") from exc
+    return performance_cases(split_config=splits)
+
+
+CASES = _configured_cases()
 
 RUNS = int(os.getenv("PERF_RUNS", "3"))
 WARMUP = int(os.getenv("PERF_WARMUP", "100"))

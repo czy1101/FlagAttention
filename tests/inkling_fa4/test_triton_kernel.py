@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from inkling_fa4 import backend as backend_dispatch
+from inkling_fa4 import autotune_configs
 from inkling_fa4.reference import ref_rel_attn
 
 HEAD_DIM = 128
@@ -19,6 +20,8 @@ BLOCK_SIZE = 16
 DTYPE = torch.bfloat16
 
 BACKENDS = ("triton", "tle")
+
+pytestmark = pytest.mark.inkling_fa4_rel_attention
 
 CASES = [
     ([(64, 64)], 4, 4, 128, None),
@@ -40,9 +43,24 @@ def _load(name: str) -> tuple[object | None, str]:
 RESOLVED = {name: _load(name) for name in BACKENDS}
 
 
+@pytest.mark.parametrize("max_seqlen_q,q_heads_per_kv_head", [(1, 4), (64, 1)])
+def test_tle_small_query_uses_wgmma_tile(
+    max_seqlen_q: int, q_heads_per_kv_head: int
+) -> None:
+    cfg = autotune_configs.get_tle_preset(
+        max_seqlen_q,
+        max_seqlen_k=8192,
+        head_dim_q=128,
+        head_dim_v=128,
+        q_heads_per_kv_head=q_heads_per_kv_head,
+        arch="sm90",
+    )
+    assert cfg["BLOCK_Q"] == 64
+
+
 def _operator(name: str):
-    operator, reason = RESOLVED[name]
-    if operator is None:
+    backend_impl, reason = RESOLVED[name]
+    if backend_impl is None:
         pytest.skip(f"{name} backend unavailable ({reason})")
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -51,7 +69,14 @@ def _operator(name: str):
         pytest.skip(f"BF16 Tensor Core path requires SM80+, got {capability}")
     if name == "tle" and capability < (9, 0):
         pytest.skip(f"TLE path requires SM90+, got {capability}")
-    return operator
+    # Exercise the public dispatcher, while keeping backend availability and
+    # capability checks explicit for each implementation.
+    def call_public_api(*args, **kwargs):
+        return backend_dispatch.inkling_fa4_rel_attention(
+            *args, backend=name, **kwargs
+        )
+
+    return call_public_api
 
 
 def run_case(

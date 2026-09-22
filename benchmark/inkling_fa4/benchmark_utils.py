@@ -34,6 +34,7 @@ BLOCK_SIZE = 16
 DTYPE = torch.bfloat16
 
 BACKEND_NAMES = ("official_cute", "triton", "tle")
+_PERFORMANCE_NUM_SPLITS = (1, 1, 2, 8, 8, 32, 64)
 CSV_COLUMNS = (
     "backend",
     "case",
@@ -89,8 +90,6 @@ class Prepared:
     total_q: int
     total_kv: int
     max_q: int
-    max_k: int
-    rel_mode: str
     outputs: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
@@ -109,6 +108,20 @@ def build_cases(quick: bool = False) -> list[BenchmarkCase]:
 
 def case_names() -> list[str]:
     return [case.name for case in build_cases()]
+
+
+def performance_cases(
+    split_config: tuple[int, ...] | None = None,
+) -> tuple[tuple[str, int], ...]:
+    """Return the shared performance cases and their configured split counts."""
+    cases = build_cases()
+    splits = _PERFORMANCE_NUM_SPLITS if split_config is None else split_config
+    if len(cases) != len(splits):
+        raise RuntimeError("performance split configuration is out of sync with cases")
+    return tuple(
+        (case.name, split_count)
+        for case, split_count in zip(cases, splits, strict=True)
+    )
 
 
 def fallback_num_splits(
@@ -318,8 +331,6 @@ def prepare_case(
         total_q=total_q,
         total_kv=sum(kv_lens),
         max_q=max(q_lens),
-        max_k=max(kv_lens),
-        rel_mode=rel_mode,
         outputs={name: torch.empty_like(q) for name in backends},
     )
 
@@ -554,6 +565,7 @@ __all__ = [
     "fallback_num_splits",
     "load_num_splits_fn",
     "make_relative_score_mod",
+    "performance_cases",
     "prepare_case",
     "resolve_backends",
     "run_benchmark",

@@ -9,14 +9,13 @@ The module exposes two implementations and one dispatcher:
 ``inkling_fa4_rel_attention_tle``
     Hopper warp-specialized implementation built on ``triton.experimental.tle``
     (V3 N64 macro pipeline). It requires ``block_size == 16`` and
-    ``head_dim_q == head_dim_v == 128`` and falls back to the Triton path for
-    small query blocks. The symbol always exists; calling it without a working
-    TLE installation raises ``RuntimeError``.
+    ``head_dim_q == head_dim_v == 128``. Short query blocks use a masked 64-row
+    WGMMA tile. The symbol always exists; calling it without a working TLE
+    installation raises ``RuntimeError``.
 
-``inkling_fa4_rel_attention``
+    ``inkling_fa4_rel_attention``
     Unified entry point. ``backend="auto"`` (default) uses TLE when it is
-    importable and falls back to Triton otherwise, including when TLE rejects
-    the shape with ``NotImplementedError``. ``backend="triton"`` and
+    importable and falls back to Triton otherwise. ``backend="triton"`` and
     ``backend="tle"`` force a path.
 
 Both implementations share ``_validate_inputs`` and ``_combine_split_kv_kernel``.
@@ -871,7 +870,7 @@ if TLE_AVAILABLE:
         # work.  Reading cache_seqlens.max().item() here would serialize every
         # serving invocation with the CPU.
         max_seqlen_k_bound = block_table.shape[1] * block_size
-        cfg = autotune_configs.get_preset(
+        cfg = autotune_configs.get_tle_preset(
             max_seqlen_q,
             max_seqlen_k=max_seqlen_k_bound,
             head_dim_q=head_dim_q,
@@ -879,26 +878,6 @@ if TLE_AVAILABLE:
             q_heads_per_kv_head=q_heads_per_kv_head,
         )
         block_q = cfg["BLOCK_Q"]
-        if block_q % 64 != 0:
-            # WGMMA requires an M dimension divisible by 64. Preserve complete
-            # operator coverage by dispatching small-query/decode workloads to
-            # the Triton path defined above in this module.
-            return inkling_fa4_rel_attention_triton(
-                q,
-                key_cache,
-                value_cache,
-                block_table=block_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                rel_extent=rel_extent,
-                rel_logits=rel_logits,
-                num_splits=num_splits,
-                out=out,
-            )
         pack_gqa = q_heads_per_kv_head > 1
         scheduler_heads = num_kv_heads if pack_gqa else num_heads
         rows_per_q_token = q_heads_per_kv_head if pack_gqa else 1
@@ -2097,8 +2076,9 @@ def inkling_fa4_rel_attention(
 
     ``backend`` accepts ``"auto"`` (default), ``"triton"``, or ``"tle"``, and
     can also be set through the ``INKLING_FA4_BACKEND`` environment variable.
-    Auto prefers TLE and falls back to Triton when TLE is unavailable or
-    rejects the requested shape.
+    Auto prefers TLE and falls back to Triton when TLE is unavailable. The TLE
+    implementation handles short query shapes with masked WGMMA tiles; it
+    raises ``NotImplementedError`` only for unsupported tensor layouts.
     """
     selected = (
         backend or os.getenv("INKLING_FA4_BACKEND", "auto")
@@ -2122,8 +2102,8 @@ def inkling_fa4_rel_attention(
     try:
         return inkling_fa4_rel_attention_tle(*args, **kwargs)
     except NotImplementedError:
-        # TLE only supports block_size=16 with 128-wide heads and query blocks
-        # that are multiples of 64. Fall back instead of failing the call.
+        # TLE only supports block_size=16 with 128-wide Q/K/V heads. Fall back
+        # instead of failing the call for unsupported tensor layouts.
         return inkling_fa4_rel_attention_triton(*args, **kwargs)
 
 

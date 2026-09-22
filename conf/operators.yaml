@@ -1,0 +1,8 @@
+- id: inkling_fa4_rel_attention
+  description: Triton and Hopper TLE paged relative attention with relative-position logits.
+  for:
+    - inkling_fa4_rel_attention
+  labels:
+    - KernelGen
+  kind:
+    - NeuralNetwork

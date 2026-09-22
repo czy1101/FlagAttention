@@ -110,52 +110,30 @@ def get_preset(
     }
 
 
-def recommend_num_splits(
-    *,
-    batch_size: int,
-    num_kv_heads: int,
+def get_tle_preset(
     max_seqlen_q: int,
-    max_seqlen_k_bound: int,
-    block_k: int,
-    sm_count: int,
-) -> int:
-    """Return a conservative synchronization-free Split-KV seed.
+    *,
+    max_seqlen_k: int | None = None,
+    head_dim_q: int = 128,
+    head_dim_v: int = 128,
+    q_heads_per_kv_head: int = 1,
+    arch: str | None = None,
+) -> dict[str, int]:
+    """Return a launch preset whose query tile is valid for Hopper WGMMA.
 
-    This is only a fallback heuristic. Explicit benchmarked split counts should
-    take priority for known serving workloads.
+    The TLE macro kernel masks query rows internally, so short decode and
+    prefill workloads can use the same 64-row WGMMA tile as larger workloads.
+    Triton keeps using :func:`get_preset` and its smaller tiles where those are
+    faster.
     """
-    if max_seqlen_k_bound < 64:
-        return 1
-
-    # Calibrated H100 seeds for the currently benchmarked batch-1/GQA shapes.
-    # These conditions deliberately remain narrow; unknown production shapes
-    # should use a workload table or an offline autotuning result.
-    if batch_size == 1 and num_kv_heads == 2:
-        if max_seqlen_q == 1:
-            if max_seqlen_k_bound <= 1024:
-                return 16
-            if max_seqlen_k_bound <= 8192:
-                return 64
-
-        if max_seqlen_q <= 32 and max_seqlen_k_bound >= 512:
-            return 8
-
-        if max_seqlen_q <= 64 and max_seqlen_k_bound >= 512:
-            return 8
-
-        if max_seqlen_q <= 512 and max_seqlen_k_bound >= 512:
-            return 4
-
-    # General fallback: estimate how many additional KV partitions are useful
-    # before exceeding roughly two CTA waves.
-    query_tiles = max(1, (max_seqlen_q + 63) // 64)
-    base_ctas = max(1, batch_size * num_kv_heads * query_tiles)
-    target_ctas = min(sm_count * 2, 256)
-
-    by_occupancy = max(1, target_ctas // base_ctas)
-    by_work = max(
-        1,
-        (max_seqlen_k_bound + block_k - 1) // block_k,
+    cfg = get_preset(
+        max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        head_dim_q=head_dim_q,
+        head_dim_v=head_dim_v,
+        q_heads_per_kv_head=q_heads_per_kv_head,
+        arch=arch,
     )
-
-    return min(128, by_occupancy, by_work)
+    if cfg["BLOCK_Q"] % 64:
+        cfg = {**cfg, "BLOCK_Q": 64}
+    return cfg
