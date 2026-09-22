@@ -136,6 +136,17 @@ The tests for numerical accuracy enforce that the maximum difference between the
 pytest .
 ```
 
+Use the FlagGems-compatible JSON recorder to save each selected case's
+parameters, outcome, operator markers, and failure or skip reason:
+
+```sh
+pytest -m "sage_attention" --record json --output accuracy_sage_attention.json -vs
+```
+
+If `--output` is omitted, the report is written to `accuracy_result.json`.
+Existing reports are merged by pytest node ID, with results from the current
+run replacing entries for the same cases.
+
 To save per-operator logs and JUnit/JSON results across all development stages:
 
 ```sh
@@ -151,6 +162,16 @@ to also run the optional GDN performance cases in the pytest suite.
 Benchmarks are included to quantify the achieved `TFLOP/s`, which serves as a metric of speed operators. The calculation of FLOPs for an operator considers only the matmul operation. The resulting FLOPs are then divided by the median runtime to determine the achieved FLOPs/s.
 
 The benchmarking process involves comparing the Triton implementations with counterparts in Pytorch. When the input size is large, resulting in memory exhaustion in the Pytorch implementation, the FLOP/s is considered zero.
+
+Pytest-driven benchmarks can write FlagGems-compatible structured results,
+including baseline latency, FlagAttention latency, and speedup:
+
+```sh
+cd benchmark/
+pytest -m "sage_attention" --record json --output benchmark_sage_attention.json -vs
+```
+
+Without `--output`, benchmark runs use `benchmark_result.json`.
 
 ```sh
 cd benchmark/

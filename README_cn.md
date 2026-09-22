@@ -150,6 +150,16 @@ print(flag_attn.device)       # NVIDIA GPU 上为 "cuda"，可直接传给 torch
 pytest .
 ```
 
+可以使用与 FlagGems 兼容的 JSON 记录功能，保存每个选中用例的参数、
+执行结果、算子 marker，以及失败或跳过原因：
+
+```sh
+pytest -m "sage_attention" --record json --output accuracy_sage_attention.json -vs
+```
+
+省略 `--output` 时，结果默认写入 `accuracy_result.json`。已有报告按照
+pytest node ID 合并，相同用例的旧结果会被本次结果替换。
+
 按算子运行所有开发阶段的测试，并保存日志及 JUnit/JSON 结果：
 
 ```sh
@@ -164,6 +174,16 @@ python tools/run_tests.py --stages all --skip-benchmarks --dump-output
 项目中提供了性能基准测试来衡量算子所能达到的的 TFLOPs/s。FLOPs/s 用来作为衡量算子运行速度的指标。算子的浮点数运算总量 (FLOPs) 仅考虑矩阵乘。总计算量除以运行时间的中位数，得到算子运行的 FLOPs/s。
 
 我们对比了算子的 Triton 实现和 PyTorch 实现的性能。当输入规模较大时，PyTorch 参考实现会遇到内存不足的问题，这种情况下，FLOPs/s 记为 0.
+
+pytest 驱动的 benchmark 可以生成与 FlagGems 兼容的结构化结果，其中包含
+基线延迟、FlagAttention 延迟和加速比：
+
+```sh
+cd benchmark/
+pytest -m "sage_attention" --record json --output benchmark_sage_attention.json -vs
+```
+
+省略 `--output` 时，benchmark 结果默认写入 `benchmark_result.json`。
 
 ```sh
 cd benchmark/
