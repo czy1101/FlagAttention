@@ -36,6 +36,7 @@ triton = [
 ]
 test = [
     "pytest>=7.1.0",
+    "PyYAML>=6.0",
 ]
 
 [project.urls]
@@ -58,12 +59,30 @@ namespaces = false
 # https://docs.pytest.org/en/7.3.x/reference/customize.html#rootdir
 # https://docs.pytest.org/en/7.3.x/reference/reference.html#confval-pythonpath
 [tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
 testpaths = [
     "tests",
 ]
 pythonpath = [
+    ".",
     "src",
     "tests/flag_attn",
+]
+markers = [
+    "chunk_gated_delta_rule: chunked gated delta rule tests and benchmarks",
+    "chunk_gdn2: chunked GDN2 tests and benchmarks",
+    "chunk_gla: chunked gated linear attention tests and benchmarks",
+    "chunk_gla_chunk: chunked gated linear attention",
+    "chunk_gla_state_v_first: gated linear attention state layout",
+    "chunk_gla_varlen: variable-length gated linear attention",
+    "chunk_kda: Kimi Delta Attention",
+    "minimax_m3_sparse_attn: MiniMax M3 sparse attention tests and benchmarks",
+    "minimax_sparse_attention_decode: MiniMax sparse attention decoding",
+    "minimax_sparse_attention_prefill: MiniMax sparse attention prefill",
+    "minimax_sparse_attention_topk: MiniMax sparse attention top-k selection",
+    "parallel_nsa: native sparse attention",
+    "parallel_nsa_compression: native sparse attention compression",
+    "sage_attention: SageAttention tests and benchmarks",
 ]
 
 [tool.ruff]

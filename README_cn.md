@@ -121,6 +121,21 @@ pip install dist/flag_attn-xxx.whl
 
 FlagAttention 提供了自定义的 attention 算子。当一个算子的功能和 torch 函数等价的时候，就可以用它替换对应的 torch 函数。
 
+设备信息接口与 FlagGems、FlagGems-vllm 保持一致：
+
+```python
+import flag_attn
+
+print(flag_attn.vendor_name)  # NVIDIA GPU 上为 "nvidia"
+print(flag_attn.vendor)       # vendor_name 的别名
+print(flag_attn.device)       # NVIDIA GPU 上为 "cuda"，可直接传给 torch 的 device 参数
+```
+
+`flag_attn.runtime.device` 保存对应的 `name` 和 `vendor_name` 字段。
+默认根据可用的 PyTorch 设备和编译器后端识别厂商；也可在导入前设置
+`FLAG_ATTN_BACKEND` 或 `FLAG_ATTN_VENDOR` 指定厂商，前者优先。
+仅有 CPU 时设备信息返回 `"cpu"`，attention 内核仍需要支持的加速设备。
+
 ## 运行测试
 
 需要较新版本的 `pytest`(>=7.1.0) 以运行 `tests/` 中的测试。FlagAttention 中的运算符以 `flag_attn.testing` 中的 PyTorch [参考实现](src/flag_attn/testing) 为参考进行测试，包括前向和反向。对于支持 `float16` 和 `bfloat16` 数据类型的算子，测试中包含了三种实现用于对比。
@@ -135,11 +150,40 @@ FlagAttention 提供了自定义的 attention 算子。当一个算子的功能�
 pytest .
 ```
 
+可以使用与 FlagGems 兼容的 JSON 记录功能，保存每个选中用例的参数、
+执行结果、算子 marker，以及失败或跳过原因：
+
+```sh
+pytest -m "sage_attention" --record json --output accuracy_sage_attention.json -vs
+```
+
+省略 `--output` 时，结果默认写入 `accuracy_result.json`。已有报告按照
+pytest node ID 合并，相同用例的旧结果会被本次结果替换。
+
+按算子运行所有开发阶段的测试，并保存日志及 JUnit/JSON 结果：
+
+```sh
+python tools/run_tests.py --stages all --skip-benchmarks --dump-output
+```
+
+厂商专用测试会在其他设备上注明跳过原因；TLE 测试需要支持 TLE 的 Triton 环境。
+设置 `FLAG_ATTN_RUN_EXTERNAL_BENCHMARKS=1` 可同时运行 pytest 中可选的 GDN 性能用例。
+
 ## 运行性能测试
 
 项目中提供了性能基准测试来衡量算子所能达到的的 TFLOPs/s。FLOPs/s 用来作为衡量算子运行速度的指标。算子的浮点数运算总量 (FLOPs) 仅考虑矩阵乘。总计算量除以运行时间的中位数，得到算子运行的 FLOPs/s。
 
 我们对比了算子的 Triton 实现和 PyTorch 实现的性能。当输入规模较大时，PyTorch 参考实现会遇到内存不足的问题，这种情况下，FLOPs/s 记为 0.
+
+pytest 驱动的 benchmark 可以生成与 FlagGems 兼容的结构化结果，其中包含
+基线延迟、FlagAttention 延迟和加速比：
+
+```sh
+cd benchmark/
+pytest -m "sage_attention" --record json --output benchmark_sage_attention.json -vs
+```
+
+省略 `--output` 时，benchmark 结果默认写入 `benchmark_result.json`。
 
 ```sh
 cd benchmark/
