@@ -31,11 +31,11 @@ except ImportError:
     version_tuple = (0, 0, 0)
 
 
-from flag_attn.piecewise import attention as piecewise_attention  # noqa: F401
-from flag_attn.flash import attention as flash_attention  # noqa: F401
-from flag_attn.split_kv import attention as flash_attention_split_kv  # noqa: F401
-from flag_attn.paged import attention as paged_attention  # noqa: F401
-from flag_attn import testing  # noqa: F401
+from flag_attn.piecewise import attention as piecewise_attention  # noqa: E402, F401
+from flag_attn.flash import attention as flash_attention  # noqa: E402, F401
+from flag_attn.split_kv import attention as flash_attention_split_kv  # noqa: E402, F401
+from flag_attn.paged import attention as paged_attention  # noqa: E402, F401
+from flag_attn import testing  # noqa: E402, F401
 
 _OPERATOR_EXPORTS = {
     "chunk_gated_delta_rule": (
@@ -48,6 +48,7 @@ _OPERATOR_EXPORTS = {
     ),
     "chunk_gdn2": ("flag_attn.gdn2", "chunk_gdn2"),
     "chunk_kda": ("flag_attn.FLA.chunk_kda", "chunk_kda_fwd_infer"),
+    "parallel_wall_attn": ("flag_attn.FLA.wall_attn", "parallel_wall_attn"),
 }
 
 for _name in (
@@ -92,6 +93,7 @@ __all__ = [
     "chunk_gla",
     "chunk_gdn2",
     "chunk_kda",
+    "parallel_wall_attn",
     "minimax_m3_index_decode",
     "minimax_m3_index_decode_score",
     "minimax_m3_index_score",

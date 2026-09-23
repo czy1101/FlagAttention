@@ -13,6 +13,24 @@
 # limitations under the License.
 
 ops:
+  - id: parallel_wall_attn
+    description: Run Wall-Attention correctness and H100 performance tests.
+    for:
+      - parallel_wall_attn
+    labels:
+      - fused
+      - Attention
+      - FLA
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_parallel_wall_attn.py
+    benchmark: benchmark/test_parallel_wall_attn_benchmark.py
+    benchmark_requires:
+      - fla
   - id: chunk_gated_delta_rule_fwd
     description: Run the forward path for chunked gated delta rule attention.
     for:
