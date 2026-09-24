@@ -4,16 +4,9 @@ from __future__ import annotations
 
 import argparse
 import math
-from collections.abc import Callable
 
-import pytest
 import torch
 import triton
-
-try:
-    from benchmark.recording import benchmark_metric, record_benchmark_result
-except ModuleNotFoundError:  # Direct script execution.
-    from recording import benchmark_metric, record_benchmark_result
 
 from flag_attn import chunk_gdn2
 from flag_attn.gdn2.chunk import HAS_TLE_GDN2
@@ -99,17 +92,14 @@ def _tle_forward(inputs):
     )
 
 
-def main(
-    argv: list[str] | None = None,
-    record_property: Callable[[str, object], None] | None = None,
-) -> None:
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
     parser.add_argument("--shape", action="append", type=_parse_shape)
     parser.add_argument("--full", action="store_true", help="run all migrated workload shapes")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--rep", type=int, default=100)
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("GDN2 benchmark requires CUDA")
@@ -121,7 +111,6 @@ def main(
     print(f"GPU: {torch.cuda.get_device_name()} | dtype: {args.dtype}")
     print("B,T,H,K,V                     native_ms      tle_ms     speedup")
     print("-" * 66)
-    metrics = []
     for shape in shapes:
         torch.manual_seed(42)
         inputs = _make_inputs(shape, dtype)
@@ -136,34 +125,8 @@ def main(
         )
         shape_text = ",".join(str(item) for item in shape)
         print(f"{shape_text:<28} {native_ms:>10.4f} {tle_ms:>11.4f} {native_ms / tle_ms:>10.3f}x")
-        metrics.append(
-            benchmark_metric(
-                shape_detail=shape,
-                latency_base=native_ms,
-                latency=tle_ms,
-                speedup=native_ms / tle_ms,
-            )
-        )
         del inputs
         torch.cuda.empty_cache()
-    record_benchmark_result(
-        record_property,
-        op_name="chunk_gdn2",
-        dtype=str(dtype),
-        result=metrics,
-        baseline="native",
-        phase="forward",
-    )
-
-
-@pytest.mark.chunk_gdn2
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GDN2 benchmark requires CUDA")
-@pytest.mark.skipif(
-    not HAS_TLE_GDN2,
-    reason="GDN2 benchmark requires a compatible Triton TLE build",
-)
-def test_chunk_gdn2_benchmark(record_property) -> None:
-    main([], record_property)
 
 
 if __name__ == "__main__":

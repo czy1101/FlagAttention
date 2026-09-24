@@ -17,6 +17,8 @@ import argparse
 import torch
 import triton
 
+from flag_attn.sage_attention import forward
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark SageAttention QK INT8 / PV FP16 forward")
@@ -32,36 +34,22 @@ def parse_args():
 
 
 def benchmark(args):
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        from flag_attn.runtime.backend._ascend import forward
-
-        device = "npu"
-    elif torch.cuda.is_available():
-        # The Ascend kernel statically unrolls the KV loop for its NPU backend.
-        # Use the CUDA implementation when running this benchmark on CUDA.
-        from flag_attn.sage_attention import forward
-
-        device = "cuda"
-    else:
-        raise RuntimeError("SageAttention benchmark requires a CUDA or NPU device")
-
     dtype = getattr(torch, args.dtype)
-    print(f"device: {device}")
     print("seq_len\tlatency_ms\ttflops")
 
     for seq_len in args.seq_lens:
         shape = (args.batch_size, args.num_heads, seq_len, args.head_dim)
-        q = torch.randint(-100, 100, shape, device=device, dtype=torch.int8)
-        k = torch.randint(-100, 100, shape, device=device, dtype=torch.int8)
-        v = torch.randn(shape, device=device, dtype=torch.float16)
+        q = torch.randint(-100, 100, shape, device="cuda", dtype=torch.int8)
+        k = torch.randint(-100, 100, shape, device="cuda", dtype=torch.int8)
+        v = torch.randn(shape, device="cuda", dtype=torch.float16)
         q_scale = torch.rand(
             (args.batch_size, args.num_heads, triton.cdiv(seq_len, 128)),
-            device=device,
+            device="cuda",
             dtype=torch.float32,
         )
         k_scale = torch.rand(
             (args.batch_size, args.num_heads, triton.cdiv(seq_len, 64)),
-            device=device,
+            device="cuda",
             dtype=torch.float32,
         )
 
