@@ -2,53 +2,97 @@
 #
 # Licensed under the Apache License, Version 2.0.
 
-"""Pytest-only DiffKV decode benchmark.
+"""Reproducible DiffKV decode benchmark with an FA3 baseline.
 
 Run from the FlagAttention repository root with::
 
     pytest -q -s benchmark/diffkv_attention_benchmark.py
 
-Benchmark settings are defined in ``BenchmarkConfig`` below.  The TLE and
-standard Triton paths must be measured in separate pytest processes when they
-are compared; Triton caches JIT kernels per process and should not be mixed in
-one timing loop.
+The same benchmark is also available as a script::
+
+    python benchmark/diffkv_attention_benchmark.py
+
+The benchmark follows the GLA benchmark convention: edit the constants in
+``DEFAULT_BENCHMARK_CONFIG`` below instead of passing command-line options.
+The TLE and standard Triton paths should be run in separate Python processes
+when compared; Triton caches JIT kernels per process and should not be mixed
+in one timing loop.  The seed and page-table mode make input generation
+reproducible.  Tail shapes can be enabled in the configuration to exercise
+non-page-aligned masking.
 
 The benchmark allocates all paged-cache/workspace tensors before timing and
-uses one CUDA event pair per operator call, with Triton's benchmark-cache
-clear between calls.  It reports one row per shape with locally measured FA3
-(when the optional vLLM FA3 extension is available), TLE or non-TLE
-Triton 2D/3D, best speedup, and timing credibility diagnostics.  A
-vLLM benchmark CSV can still be supplied as a fallback/reference with
-``--fa3-csv``.  The FA3 extension is loaded directly with
+uses ``triton.testing.do_bench`` for every provider.  ``do_bench`` records one
+CUDA event pair per operator call and clears Triton's benchmark cache between
+calls.  It reports one row per shape with locally measured FA3
+(or a reference configured through ``BenchmarkConfig.fa3_csv``), TLE or
+non-TLE Triton 2D/3D, best speedup, and best path.  Detailed timing
+diagnostics are kept in the optional CSV output.  The FA3 extension is loaded
+directly with
 ``torch.ops.load_library`` from the active Python environment's
 ``site-packages/fa3_runtime`` directory.  The benchmark does not search the
 repository, checkout ancestors, or external overlay directories for FA3.
+
+The FA3 provider is kept in this module, following the single-file provider
+style used by the repository's FlashAttention benchmarks.  It is benchmark
+support code only; the public DiffKV operator has no FA3 dependency.
+
+The default configuration is suitable for formal performance reports and
+requires a directly measured FA3 provider.  For an environment where the
+extension cannot be loaded, set ``require_fa3=False`` in
+``BenchmarkConfig`` for diagnostic runs, or set ``fa3_csv`` there to one or
+more reference CSV paths.  This benchmark intentionally follows the GLA/MSA
+style and does not expose a command-line argument parser.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import importlib
 import csv
 import math
 import os
 import pathlib
+import platform
+import site
 import statistics
 import sys
-import time
+from dataclasses import dataclass
 
 import pytest
 import torch
 import triton
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 
+# Keep benchmark-domain options local, as in the MSA benchmark.  Model layout
+# values are imported from the operator so the benchmark cannot silently use a
+# different HQ/HKV/DQK/DV/block-size contract.
+from flag_attn.diffkv_attention.api import (  # noqa: E402
+    DEFAULT_LAYOUT,
+    LAUNCH,
+    SUPPORTED_PATHS,
+)
+
+SUPPORTED_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+DEFAULT_DIAGNOSTIC_SEQ_LENS = (513, 2049)
+
+
 @dataclass(frozen=True)
 class BenchmarkConfig:
-    """Fixed benchmark configuration used by the pytest entry point."""
+    """Fixed benchmark contract used by the pytest entry point.
+
+    Head counts are mode-specific because the MiMo workload uses GQA for Full
+    Attention and a wider KV grouping for SWA.  The remaining fields are
+    shared by FA3 and both Triton paths so every provider receives identical
+    tensors and timing settings.  This object deliberately has no large
+    ``__post_init__`` validator: the production benchmark is a fixed module
+    configuration, following the MSA/GLA benchmark style.  Public operator
+    inputs are still validated in ``diffkv_attention.api``.
+    """
 
     mode: str = "both"
     paths: tuple[str, ...] = ("2d", "3d")
@@ -56,14 +100,33 @@ class BenchmarkConfig:
     seq_lens: tuple[int, ...] = (512, 2048, 8192, 32768)
     window_size: int = 128
     dtype: str = "bfloat16"
-    warmup: int = 20
-    iterations: int = 30
+    num_query_heads: int = DEFAULT_LAYOUT.num_query_heads
+    full_num_kv_heads: int = DEFAULT_LAYOUT.full_num_kv_heads
+    swa_num_kv_heads: int = DEFAULT_LAYOUT.swa_num_kv_heads
+    head_size_qk: int = DEFAULT_LAYOUT.head_size_qk
+    head_size_v: int = DEFAULT_LAYOUT.head_size_v
+    block_size: int = DEFAULT_LAYOUT.block_size
+    # Triton's do_bench accepts warmup/rep in milliseconds, not iteration
+    # counts.  Keep the units explicit so the benchmark cannot accidentally
+    # pass an iteration count as a timing budget.
+    warmup_ms: int = 100
+    rep_ms: int = 500
     samples: int = 9
     stability_cv_pct: float = 5.0
     backend: str = "auto"
+    # Optional vLLM benchmark CSV reference, configured in Python rather than
+    # through a command-line option.
     fa3_csv: tuple[pathlib.Path, ...] | None = None
     fa3: str = "auto"
     csv: pathlib.Path | None = None
+    seed: int = 0
+    page_table: str = "random"
+    include_tail_shapes: bool = False
+    tail_seq_lens: tuple[int, ...] = DEFAULT_DIAGNOSTIC_SEQ_LENS
+    # Formal runs must have a directly measured FA3 baseline (or an explicit
+    # fa3_csv reference); diagnostic callers may opt out explicitly.
+    require_fa3: bool = True
+    device: str = "cuda:0"
 
 
 def fa3_key(
@@ -86,8 +149,20 @@ def fa3_key(
     )
 
 
-def load_fa3_reference(paths: list[pathlib.Path] | None):
-    """Load FA3 p50 values from vLLM benchmark CSV files, if provided."""
+def load_fa3_reference(
+    paths: list[pathlib.Path] | None,
+    *,
+    num_query_heads: int = DEFAULT_LAYOUT.num_query_heads,
+    num_kv_heads: int = DEFAULT_LAYOUT.full_num_kv_heads,
+    head_size_qk: int = DEFAULT_LAYOUT.head_size_qk,
+    head_size_v: int = DEFAULT_LAYOUT.head_size_v,
+):
+    """Load FA3 p50 values from vLLM benchmark CSV files, if provided.
+
+    Older vLLM CSVs do not contain all layout columns.  The explicit defaults
+    keep those files usable while making the assumed model layout visible at
+    the call site.
+    """
     reference: dict[tuple[str, int, int, int, int, int, int], float] = {}
     for path in paths or []:
         with path.open(newline="", encoding="utf-8") as input_file:
@@ -99,10 +174,10 @@ def load_fa3_reference(paths: list[pathlib.Path] | None):
                         row.get("mode", "decode"),
                         int(row.get("batch_size", row.get("batch", "0"))),
                         int(row["seq_len"]),
-                        int(row.get("num_query_heads", "64")),
-                        int(row.get("num_kv_heads", "4")),
-                        int(row.get("head_size_qk", "192")),
-                        int(row.get("head_size_v", "128")),
+                        int(row.get("num_query_heads", str(num_query_heads))),
+                        int(row.get("num_kv_heads", str(num_kv_heads))),
+                        int(row.get("head_size_qk", str(head_size_qk))),
+                        int(row.get("head_size_v", str(head_size_v))),
                     )
                     value = float(row["latency_p50_us"])
                 except (KeyError, TypeError, ValueError):
@@ -112,43 +187,164 @@ def load_fa3_reference(paths: list[pathlib.Path] | None):
     return reference
 
 
-def _fa3_module():
-    """Import the in-repository FA3 adapter lazily after CUDA is available."""
-    return importlib.import_module("flag_attn.diffkv_attention.FA3")
+def fa3_op_available() -> bool:
+    """Return whether the FA3 custom op is registered in this process."""
+    try:
+        namespace = getattr(torch.ops, "_vllm_fa3_C", None)
+        return namespace is not None and hasattr(namespace, "fwd")
+    except Exception:
+        return False
 
 
-def load_fa3_provider(requested: str):
-    """Load FA3 exclusively from the active Python environment."""
-    return _fa3_module().load_fa3_provider(requested)
+def _fa3_environment_roots() -> list[pathlib.Path]:
+    """Return FA3 search roots inside the active Python environment only."""
+    environment = pathlib.Path(sys.prefix).resolve()
+    roots: list[pathlib.Path] = []
+    for directory in site.getsitepackages():
+        site_packages = pathlib.Path(directory).resolve()
+        try:
+            site_packages.relative_to(environment)
+        except ValueError:
+            continue
+        roots.extend((site_packages / "fa3_runtime", site_packages))
+    return roots
+
+
+def fa3_extension_candidates(path: str | None = None):
+    """Yield FA3 shared libraries installed in the active environment."""
+    configured = path or os.environ.get("VLLM_FLASH_ATTN_EXTENSION_DIR")
+    roots = ([pathlib.Path(configured).expanduser()]
+             if configured else _fa3_environment_roots())
+    environment = pathlib.Path(sys.prefix).resolve()
+
+    seen: set[pathlib.Path] = set()
+    for root in roots:
+        try:
+            root = root.resolve()
+        except OSError:
+            continue
+        try:
+            root.relative_to(environment)
+        except ValueError:
+            continue
+        if root in seen:
+            continue
+        seen.add(root)
+        if root.is_file():
+            yield root
+            continue
+        if not root.is_dir():
+            continue
+        exact = root / "_vllm_fa3_C.abi3.so"
+        if exact.is_file():
+            yield exact
+        for candidate in sorted(root.glob("*_vllm_fa3_C*.so")):
+            if candidate != exact:
+                yield candidate
+
+
+def load_fa3_provider(requested: str = "auto", extension_path: str | None = None):
+    """Load FA3 and return ``available/source/error`` status metadata."""
+    if requested not in {"auto", "on", "off"}:
+        raise ValueError(f"unsupported FA3 mode: {requested!r}")
+    if requested == "off":
+        return {"available": False, "source": "disabled", "error": None}
+    if fa3_op_available():
+        return {"available": True, "source": "already-registered", "error": None}
+
+    errors: list[str] = []
+    candidates = list(fa3_extension_candidates(extension_path))
+    configured = extension_path or os.environ.get("VLLM_FLASH_ATTN_EXTENSION_DIR")
+    if configured and not candidates:
+        errors.append(f"no _vllm_fa3_C*.so found under {configured}")
+    elif not configured and not candidates:
+        errors.append(
+            "no FA3 extension found in the active Python environment; "
+            "install _vllm_fa3_C.abi3.so under site-packages/fa3_runtime"
+        )
+    for candidate in candidates:
+        try:
+            torch.ops.load_library(str(candidate))
+        except Exception as exc:  # pragma: no cover - host ABI dependent
+            errors.append(f"{candidate}: {type(exc).__name__}: {exc}")
+            continue
+        if fa3_op_available():
+            return {"available": True, "source": str(candidate), "error": None}
+        errors.append(f"{candidate}: loaded but _vllm_fa3_C.fwd was not registered")
+
+    detail = "; ".join(errors) if errors else "FA3 extension unavailable"
+    status = {"available": False, "source": "unavailable", "error": detail}
+    if requested == "on":
+        raise RuntimeError(
+            "FA3 was requested but _vllm_fa3_C.fwd is unavailable: " + detail
+        )
+    return status
+
+
+def shape_seed(base_seed: int, mode: str, batch: int, seq_len: int, num_kv_heads: int) -> int:
+    """Derive a stable per-shape seed without relying on Python's hash()."""
+    mode_offset = 0 if mode == "full" else 1_000_003
+    return (
+        base_seed
+        + mode_offset
+        + batch * 1_009
+        + seq_len * 9_176
+        + num_kv_heads * 65_537
+    ) % (2**63 - 1)
 
 
 def make_inputs(
     batch: int,
     seq_len: int,
     dtype: torch.dtype,
+    num_query_heads: int,
     num_kv_heads: int,
+    head_size_qk: int,
+    head_size_v: int,
+    block_size: int,
+    *,
+    seed: int,
+    page_table: str,
+    device: str,
 ):
-    hq, hkv, dqk, dv, block_size = 64, num_kv_heads, 192, 128, 16
+    generator = torch.Generator(device=device).manual_seed(seed)
     blocks_per_seq = (seq_len + block_size - 1) // block_size
-    query = torch.randn(batch, hq, dqk, device="cuda", dtype=dtype)
+    query = torch.randn(
+        batch,
+        num_query_heads,
+        head_size_qk,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
     # Keep the same packed HND storage layout as vLLM's DiffKV backend, then
     # expose NHD K/V views.  FA3 is sensitive to cache strides (and this also
     # makes the Triton-vs-FA3 comparison use the production layout).
     kv_cache = torch.randn(
         batch * blocks_per_seq,
-        hkv,
+        num_kv_heads,
         block_size,
-        dqk + dv,
-        device="cuda",
+        head_size_qk + head_size_v,
+        device=device,
         dtype=dtype,
+        generator=generator,
     )
     kv_cache_nhd = kv_cache.transpose(1, 2)
-    key_cache = kv_cache_nhd[..., :dqk]
-    value_cache = kv_cache_nhd[..., dqk:]
-    block_tables = torch.arange(
-        batch * blocks_per_seq, device="cuda", dtype=torch.int32
-    ).reshape(batch, blocks_per_seq)
-    context_lens = torch.full((batch,), seq_len, device="cuda", dtype=torch.int32)
+    key_cache = kv_cache_nhd[..., :head_size_qk]
+    value_cache = kv_cache_nhd[..., head_size_qk:]
+    if page_table == "identity":
+        physical_pages = torch.arange(
+            batch * blocks_per_seq, device=device, dtype=torch.int32
+        )
+    else:
+        physical_pages = torch.randperm(
+            batch * blocks_per_seq,
+            device=device,
+            dtype=torch.int64,
+            generator=generator,
+        ).to(torch.int32)
+    block_tables = physical_pages.reshape(batch, blocks_per_seq)
+    context_lens = torch.full((batch,), seq_len, device=device, dtype=torch.int32)
     return query, key_cache, value_cache, context_lens, block_tables
 
 
@@ -157,16 +353,23 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl):
     query, key_cache, value_cache, context_lens, block_tables = inputs
     batch, hq, dqk = query.shape
     hkv = key_cache.shape[2]
+    dv = value_cache.shape[-1]
     seq_len = int(context_lens.max().item())
     block_size = key_cache.shape[1]
-    cu_seqlens_q = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.arange(
+        batch + 1, device=query.device, dtype=torch.int32
+    )
     scale = dqk**-0.5
-    if path not in {"2d", "3d"}:
+    if path not in SUPPORTED_PATHS:
         raise ValueError(f"unsupported path: {path}")
     use_3d = path == "3d"
 
     num_q_per_kv = hq // hkv
-    block_m = 16 if num_q_per_kv <= 16 else triton.next_power_of_2(num_q_per_kv)
+    block_m = (
+        LAUNCH.query_block_m
+        if num_q_per_kv <= LAUNCH.query_block_m
+        else triton.next_power_of_2(num_q_per_kv)
+    )
     block_q = block_m // num_q_per_kv
     total_num_q_blocks = query.shape[0] // block_q + batch
     num_sms = torch.cuda.get_device_properties(query.device).multi_processor_count
@@ -191,7 +394,7 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl):
             num_segments = diffkv_impl.get_num_par_softmax_segments(
                 seq_len, batch, True
             )
-        padded_v = 128
+        padded_v = triton.next_power_of_2(value_cache.shape[-1])
         segm_output = torch.empty(
             batch,
             hq,
@@ -211,10 +414,12 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl):
         threshold = None
 
     triton_window = (window_size - 1, 0) if window_size > 0 else (-1, -1)
-    out = torch.empty(batch, hq, 128, device="cuda", dtype=query.dtype)
+    out = torch.empty(
+        batch, hq, value_cache.shape[-1], device="cuda", dtype=query.dtype
+    )
     extra_kwargs = {}
     if use_optimized and use_3d and diffkv_impl.should_use_tle_fused_reducer(
-        dqk, 128, 1, seq_len, batch, block_size, True
+        dqk, dv, 1, seq_len, batch, block_size, True
     ):
         extra_kwargs["fused_reducer_counter"] = torch.zeros(
             batch * hq, device="cuda", dtype=torch.int32
@@ -248,42 +453,120 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl):
     return run, impl_name
 
 
-def build_fa3_runner(inputs, window_size: int):
-    """Build a direct FA3 runner from the in-repository adapter."""
-    return _fa3_module().build_fa3_runner(inputs, window_size)
+def build_fa3_runner(inputs: tuple[torch.Tensor, ...], window_size: int):
+    """Build a direct FA3 paged-cache runner with preallocated buffers."""
+    if not fa3_op_available():
+        raise RuntimeError("_vllm_fa3_C.fwd is not registered")
+    query, key_cache, value_cache, context_lens, block_tables = inputs
+    batch, hq, dqk = query.shape
+    dv = value_cache.shape[-1]
+    seq_len = int(context_lens.max().item())
+    cu_seqlens_q = torch.arange(batch + 1, device=query.device, dtype=torch.int32)
+    out = torch.empty(batch, hq, dv, device=query.device, dtype=query.dtype)
+    scale = dqk**-0.5
+    window_left, window_right = (
+        (window_size - 1, 0) if window_size > 0 else (-1, -1)
+    )
 
-
-def measure(fn, warmup: int, iterations: int, samples: int):
-    """Measure per-call GPU latency using Triton's do_bench protocol.
-
-    Recording one event around a long Python loop can include host submission
-    gaps for microsecond kernels.  vLLM's benchmark records an event pair for
-    every invocation and clears the benchmark cache before each one; mirror
-    that protocol here so standalone FlagAttention numbers are comparable.
-    """
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    cache = None
+    scheduler_metadata = None
     try:
-        driver = triton.runtime.driver.active
-        cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
-    except Exception:
-        driver = None
+        get_scheduler_metadata = getattr(
+            torch.ops._vllm_fa3_C, "get_scheduler_metadata"
+        )
+        scheduler_metadata = get_scheduler_metadata(
+            batch,
+            1,
+            seq_len,
+            hq,
+            key_cache.shape[2],
+            dqk,
+            dv,
+            query.dtype,
+            context_lens,
+            cu_seqlens_q,
+            None,
+            None,
+            None,
+            None,
+            key_cache.shape[1],
+            0,
+            True,
+            window_left,
+            window_right,
+            False,
+            0,
+            None,
+            0,
+        )
+    except (AttributeError, RuntimeError):
+        # Older overlays may not expose scheduler metadata; fwd remains valid
+        # and selects its fallback schedule.
+        scheduler_metadata = None
+
+    def run():
+        torch.ops._vllm_fa3_C.fwd(
+            query,
+            key_cache,
+            value_cache,
+            None,
+            None,
+            None,
+            out,
+            cu_seqlens_q,
+            None,
+            None,
+            None,
+            context_lens,
+            1,
+            seq_len,
+            block_tables,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            scale,
+            True,
+            window_left,
+            window_right,
+            0.0,
+            True,
+            scheduler_metadata,
+            0,
+            None,
+            0,
+            None,
+            1,
+            0,
+            None,
+        )
+
+    return run
+
+
+def measure(fn, warmup_ms: int, rep_ms: int, samples: int):
+    """Measure a callable with Triton's standard ``do_bench`` protocol.
+
+    ``do_bench`` owns warmup, CUDA-event placement, synchronization, adaptive
+    repetition count, and benchmark-cache clearing.  We invoke it once per
+    sample and reduce each returned list of per-repetition millisecond values
+    to a sample median.  The outer sample distribution is retained for the
+    stability CV reported by this benchmark.
+    """
     values = []
     for _ in range(samples):
-        starts = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
-        ends = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
-        for start, end in zip(starts, ends):
-            if driver is not None and cache is not None:
-                driver.clear_cache(cache)
-            start.record()
-            fn()
-            end.record()
-        torch.cuda.synchronize()
-        per_call = [start.elapsed_time(end) * 1000.0
-                    for start, end in zip(starts, ends)]
-        values.append(statistics.median(per_call))
+        timings_ms = triton.testing.do_bench(
+            fn,
+            warmup=warmup_ms,
+            rep=rep_ms,
+            return_mode="all",
+        )
+        if not isinstance(timings_ms, (list, tuple)):
+            timings_ms = [timings_ms]
+        values.append(statistics.median(float(value) for value in timings_ms))
     median = statistics.median(values)
     mean = statistics.fmean(values)
     cv_pct = 100.0 * statistics.pstdev(values) / mean if mean else 0.0
@@ -291,7 +574,12 @@ def measure(fn, warmup: int, iterations: int, samples: int):
 
 
 def parse_dtype(name: str):
-    return {"float16": torch.float16, "bfloat16": torch.bfloat16}[name]
+    try:
+        return SUPPORTED_DTYPES[name]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported dtype {name!r}; choose from {sorted(SUPPORTED_DTYPES)}"
+        ) from exc
 
 
 def load_diffkv_backend(name: str):
@@ -299,7 +587,9 @@ def load_diffkv_backend(name: str):
     os.environ["FLAG_ATTN_DIFFKV_BACKEND"] = name
     # Import the submodule explicitly so this benchmark remains independent
     # of the package's top-level exports.
-    diffkv_impl = importlib.import_module("flag_attn.diffkv_attention.diffkv_attention")
+    # Public API follows the same structure as GLA/MSA: dispatch lives in
+    # ``api.py`` while Triton kernels remain private to ``diffkv.py``.
+    diffkv_impl = importlib.import_module("flag_attn.diffkv_attention.api")
 
     if name == "tle" and not diffkv_impl.HAS_TLE:
         detail = diffkv_impl.get_diffkv_backend_info()["tle_error"]
@@ -312,16 +602,57 @@ def load_diffkv_backend(name: str):
 
 
 def run_benchmark(config: BenchmarkConfig | None = None):
-    config = BenchmarkConfig() if config is None else config
+    # The default path is intentionally fixed, like the MSA/GLA benchmarks.
+    # An explicit config remains useful for local diagnostics, but it is not
+    # part of the normal pytest/script interface.
+    config = DEFAULT_BENCHMARK_CONFIG if config is None else config
     if not torch.cuda.is_available():
         raise RuntimeError("DiffKV benchmark requires CUDA")
+    torch_device = torch.device(config.device)
+    if torch_device.index is not None:
+        torch.cuda.set_device(torch_device)
     diffkv_impl = load_diffkv_backend(config.backend)
     dtype = parse_dtype(config.dtype)
-    fa3_reference = load_fa3_reference(config.fa3_csv)
+    fa3_reference = load_fa3_reference(
+        config.fa3_csv,
+        num_query_heads=config.num_query_heads,
+        num_kv_heads=config.full_num_kv_heads,
+        head_size_qk=config.head_size_qk,
+        head_size_v=config.head_size_v,
+    )
     fa3_status = load_fa3_provider(config.fa3)
+    if config.require_fa3 and not fa3_status["available"] and not fa3_reference:
+        raise RuntimeError(
+            "FA3 is required, but direct FA3 is unavailable and no usable "
+            "BenchmarkConfig.fa3_csv reference was supplied. "
+            f"Reason: {fa3_status['error']}"
+        )
     modes = ["full", "swa"] if config.mode == "both" else [config.mode]
+    seq_lens = list(config.seq_lens)
+    if config.include_tail_shapes:
+        seq_lens.extend(config.tail_seq_lens)
+    seq_lens = list(dict.fromkeys(seq_lens))
     rows = []
-    print(f"Device: {torch.cuda.get_device_name()} dtype={config.dtype}")
+    torch_version = torch.__version__
+    triton_version = getattr(triton, "__version__", "unknown")
+    cuda_runtime = torch.version.cuda or "unknown"
+    device_name = torch.cuda.get_device_name(torch_device)
+    capability = torch.cuda.get_device_capability(torch_device)
+    print(
+        f"Device: {device_name} ({config.device}) dtype={config.dtype} "
+        f"compute_capability={capability[0]}.{capability[1]}"
+    )
+    print(
+        f"Environment: torch={torch_version} triton={triton_version} "
+        f"torch_cuda={cuda_runtime} seed={config.seed} "
+        f"page_table={config.page_table} host={platform.node()}"
+    )
+    print(
+        f"Workload: modes={','.join(modes)} paths={','.join(config.paths)} "
+        f"batches={config.batches} seq_lens={tuple(seq_lens)} "
+        f"warmup_ms={config.warmup_ms} rep_ms={config.rep_ms} "
+        f"samples={config.samples}"
+    )
     print(
         "DiffKV backend: "
         f"requested={config.backend}, selected={diffkv_impl.SELECTED_BACKEND}, "
@@ -330,7 +661,7 @@ def run_benchmark(config: BenchmarkConfig | None = None):
     if not fa3_status["available"]:
         print(
             "FA3 direct measurement unavailable; "
-            "a supplied --fa3-csv may still be used as a reference. "
+            "BenchmarkConfig.fa3_csv may still provide a reference. "
             f"Reason: {fa3_status['error']}"
         )
     if not diffkv_impl.is_tle_available():
@@ -339,16 +670,34 @@ def run_benchmark(config: BenchmarkConfig | None = None):
             f"Reason: {diffkv_impl.get_diffkv_backend_info()['tle_error']}"
         )
     print(
-        "Timing: per-call CUDA events around preallocated operators; "
-        "Triton benchmark cache cleared between calls"
+        "Timing: triton.testing.do_bench around preallocated operators; "
+        "adaptive per-call CUDA events and cache clear"
     )
     for mode in modes:
         window = -1 if mode == "full" else config.window_size
-        hkv = 4 if mode == "full" else 8
+        hkv = (
+            config.full_num_kv_heads
+            if mode == "full"
+            else config.swa_num_kv_heads
+        )
         section_rows = []
         for batch in config.batches:
-            for seq_len in config.seq_lens:
-                inputs = make_inputs(batch, seq_len, dtype, hkv)
+            for seq_len in seq_lens:
+                inputs = make_inputs(
+                    batch,
+                    seq_len,
+                    dtype,
+                    config.num_query_heads,
+                    hkv,
+                    config.head_size_qk,
+                    config.head_size_v,
+                    config.block_size,
+                    seed=shape_seed(
+                        config.seed, mode, batch, seq_len, hkv
+                    ),
+                    page_table=config.page_table,
+                    device=config.device,
+                )
                 measurements = {}
                 path_impls = {}
                 for path in config.paths:
@@ -357,7 +706,7 @@ def run_benchmark(config: BenchmarkConfig | None = None):
                     )
                     p50, pmin, pmax, cv_pct = measure(
                         runner,
-                        config.warmup, config.iterations, config.samples,
+                        config.warmup_ms, config.rep_ms, config.samples,
                     )
                     measurements[path] = (p50, pmin, pmax, cv_pct)
                     path_impls[path] = impl_name
@@ -367,8 +716,8 @@ def run_benchmark(config: BenchmarkConfig | None = None):
                     try:
                         fa3_measurement = measure(
                             build_fa3_runner(inputs, window),
-                            config.warmup,
-                            config.iterations,
+                            config.warmup_ms,
+                            config.rep_ms,
                             config.samples,
                         )
                     except Exception as exc:  # pragma: no cover - host-specific
@@ -380,10 +729,10 @@ def run_benchmark(config: BenchmarkConfig | None = None):
                         "decode",
                         batch,
                         seq_len,
-                        64,
+                        config.num_query_heads,
                         hkv,
-                        192,
-                        128,
+                        config.head_size_qk,
+                        config.head_size_v,
                     )
                 )
                 if fa3_measurement is not None:
@@ -392,27 +741,17 @@ def run_benchmark(config: BenchmarkConfig | None = None):
                 else:
                     fa3_us = reference_fa3_us
                     fa3_source = "reference-csv" if fa3_us is not None else "n/a"
+                if config.require_fa3 and fa3_us is None:
+                    raise RuntimeError(
+                        "FA3 is required but no measurement/reference exists for "
+                        f"mode={mode}, batch={batch}, seq_len={seq_len}, "
+                        f"HKV={hkv}"
+                    )
                 best_speedup = fa3_us / best[0] if fa3_us is not None else None
-                credibility = (
-                    f"range=[{best[1] / 1000:.6f},{best[2] / 1000:.6f}]ms "
-                    f"CV={best[3]:.2f}% samples={config.samples} "
-                    f"{'stable' if best[3] <= config.stability_cv_pct else 'noisy'}"
-                )
-                if fa3_us is None:
-                    credibility += " FA3=n/a"
-                else:
-                    if fa3_measurement is not None:
-                        credibility += (
-                            f" FA3=local CV={fa3_measurement[3]:.2f}% "
-                            f"{'stable' if fa3_measurement[3] <= config.stability_cv_pct else 'noisy'}"
-                        )
-                    else:
-                        credibility += " FA3=reference-CSV"
-                if fa3_error is not None:
-                    credibility += f" FA3-error={fa3_error}"
                 shape_text = (
-                    f"B={batch} Q=1 KV={seq_len} HQ=64 HKV={hkv} "
-                    f"DQK=192 DV=128 {config.dtype}"
+                    f"B={batch} Q=1 KV={seq_len} HQ={config.num_query_heads} "
+                    f"HKV={hkv} DQK={config.head_size_qk} "
+                    f"DV={config.head_size_v} {config.dtype}"
                 )
                 section_rows.append(
                     (
@@ -422,11 +761,8 @@ def run_benchmark(config: BenchmarkConfig | None = None):
                         if "2d" in measurements else "n/a",
                         f"{measurements['3d'][0] / 1000:.6f}"
                         if "3d" in measurements else "n/a",
-                        path_impls.get("2d", "n/a"),
-                        path_impls.get("3d", "n/a"),
                         f"{best_speedup:.3f}x" if best_speedup is not None else "n/a",
                         best_path.upper(),
-                        credibility,
                     )
                 )
                 for path, measurement in measurements.items():
@@ -456,17 +792,27 @@ def run_benchmark(config: BenchmarkConfig | None = None):
                         "best_path": best_path,
                         "best_speedup": ""
                         if best_speedup is None else f"{best_speedup:.6f}",
+                        "device": device_name,
+                        "device_capability": f"{capability[0]}.{capability[1]}",
+                        "torch_version": torch_version,
+                        "triton_version": triton_version,
+                        "torch_cuda": cuda_runtime,
+                        "seed": config.seed,
+                        "shape_seed": shape_seed(
+                            config.seed, mode, batch, seq_len, hkv
+                        ),
+                        "page_table": config.page_table,
+                        "warmup_ms": config.warmup_ms,
+                        "rep_ms": config.rep_ms,
+                        "samples": config.samples,
                     })
         headers = (
             "shape (B,Q,KV,HQ,HKV,DQK,DV,dtype)",
             "FA3 p50(ms)",
             "Triton-2D p50(ms)",
             "Triton-3D p50(ms)",
-            "2D impl",
-            "3D impl",
             "best speedup",
             "best path",
-            "data credibility",
         )
         widths = [
             max(len(headers[index]), *(len(row[index]) for row in section_rows))
@@ -493,10 +839,44 @@ def run_benchmark(config: BenchmarkConfig | None = None):
         print(f"\nWrote {config.csv}")
 
 
+DEFAULT_BENCHMARK_CONFIG = BenchmarkConfig(
+    # Edit this object to change the default benchmark, following the GLA
+    # benchmark convention instead of passing command-line arguments.
+    mode="both",
+    paths=("2d", "3d"),
+    batches=(1, 8, 16, 32),
+    seq_lens=(512, 2048, 8192, 32768),
+    window_size=128,
+    dtype="bfloat16",
+    num_query_heads=DEFAULT_LAYOUT.num_query_heads,
+    full_num_kv_heads=DEFAULT_LAYOUT.full_num_kv_heads,
+    swa_num_kv_heads=DEFAULT_LAYOUT.swa_num_kv_heads,
+    head_size_qk=DEFAULT_LAYOUT.head_size_qk,
+    head_size_v=DEFAULT_LAYOUT.head_size_v,
+    block_size=DEFAULT_LAYOUT.block_size,
+    warmup_ms=100,
+    rep_ms=500,
+    samples=9,
+    stability_cv_pct=5.0,
+    backend="auto",
+    fa3="auto",
+    seed=0,
+    page_table="random",
+    include_tail_shapes=False,
+    tail_seq_lens=DEFAULT_DIAGNOSTIC_SEQ_LENS,
+    require_fa3=True,
+    device="cuda:0",
+)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="DiffKV benchmark requires CUDA",
 )
 def test_perf_diffkv_attention():
     """Run the default DiffKV benchmark under pytest."""
-    run_benchmark()
+    run_benchmark(DEFAULT_BENCHMARK_CONFIG)
+
+
+if __name__ == "__main__":
+    run_benchmark(DEFAULT_BENCHMARK_CONFIG)

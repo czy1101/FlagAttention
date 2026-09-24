@@ -24,6 +24,7 @@ from flag_attn.piecewise import attention as piecewise_attention # noqa: F401
 from flag_attn.flash import attention as flash_attention # noqa: F401
 from flag_attn.split_kv import attention as flash_attention_split_kv # noqa: F401
 from flag_attn.paged import attention as paged_attention # noqa: F401
+from flag_attn.diffkv_attention.api import diffkv_attention # noqa: F401
 import importlib
 from flag_attn.minimax_sparse_attention import (
     minimax_m3_index_decode as minimax_m3_index_decode,
@@ -47,11 +48,19 @@ _FLA_EXPORTS = {
     ),
 }
 
+_DIFFKV_EXPORTS = {
+    "unified_attention_diffkv": (
+        "flag_attn.diffkv_attention.api",
+        "unified_attention_diffkv",
+    ),
+}
+
 
 def __getattr__(name: str):
-    """Lazily expose FLA operators without importing their Triton kernels at package init."""
+    """Lazily expose optional Triton operators without eager kernel imports."""
+    exports = {**_FLA_EXPORTS, **_DIFFKV_EXPORTS}
     try:
-        module_name, attribute_name = _FLA_EXPORTS[name]
+        module_name, attribute_name = exports[name]
     except KeyError as exc:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
     value = getattr(importlib.import_module(module_name), attribute_name)
@@ -64,8 +73,10 @@ __all__ = [
     "flash_attention",
     "flash_attention_split_kv",
     "paged_attention",
+    "diffkv_attention",
     "chunk_gated_delta_rule",
     "chunk_gla",
+    "unified_attention_diffkv",
     "minimax_m3_index_decode",
     "minimax_m3_index_decode_score",
     "minimax_m3_index_score",
