@@ -189,7 +189,6 @@ def _index_block_score_kernel(
         q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
         tl.store(s_ptrs, score, mask=q_store_mask)
 
-
 # ---------------------------------------------------------------------------
 # Top-k selection over per-token block scores (layout-agnostic). block_size_q
 # is 1 for M3, so top-k is computed per query token.
@@ -719,13 +718,28 @@ def _decode_index_score_kernel(
     num_kv_chunks,
     USE_PDL: tl.constexpr,
 ):
-    BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
+    # Hygon MFMA requires a sufficiently wide output tile.  A qlen=1 decode
+    # with 4/8/12 index heads otherwise produces an N=4/8/12 dot tile and
+    # falls back to VALU with high VGPR/LDS pressure.  Pad only the logical
+    # head dimension; masked lanes never read or write user-visible memory.
+    # Keep the unpadded (16+ heads) path structurally identical to the old
+    # kernel: the extra head predicate is compile-time disabled there, so it
+    # cannot add a runtime mask or alter register allocation.
+    BLOCK_SIZE_HQ: tl.constexpr = triton.next_power_of_2(
+        max(16, num_idx_heads * BLOCK_SIZE_Q)
+    )
+    HEAD_PADDED: tl.constexpr = BLOCK_SIZE_HQ > num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
     hq_offsets = tl.arange(0, BLOCK_SIZE_HQ)
     h_offsets = hq_offsets // BLOCK_SIZE_Q
     q_offsets = hq_offsets % BLOCK_SIZE_Q
     q_mask = q_offsets < decode_query_len
+    if HEAD_PADDED:
+        head_mask = h_offsets < num_idx_heads
+        lane_mask = q_mask & head_mask
+    else:
+        lane_mask = q_mask
     q_ids = pid_r * decode_query_len + q_offsets
 
     if USE_PDL:
@@ -738,7 +752,10 @@ def _decode_index_score_kernel(
     # attention range instead of letting padded rows produce negative lengths.
     kv_len = tl.maximum(query_pos + 1, 0)
     num_blocks_q = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
-    kv_len_max = tl.max(tl.where(q_mask, kv_len, 0), axis=0)
+    if HEAD_PADDED:
+        kv_len_max = tl.max(tl.where(lane_mask, kv_len, 0), axis=0)
+    else:
+        kv_len_max = tl.max(tl.where(q_mask, kv_len, 0), axis=0)
     num_blocks = (kv_len_max + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
 
     # block-aligned fixed-count split: grid independent of seq_len (cuda graph).
@@ -753,14 +770,24 @@ def _decode_index_score_kernel(
     # Force-select init (1e30) and local (1e29, higher priority) blocks.
     local_start = tl.maximum(0, num_blocks_q - local_blocks)
     # Query vectors for all index heads in a small spec-decode block.
-    q = tl.load(
-        q_ptr
-        + q_ids[None, :] * stride_q_n
-        + h_offsets[None, :] * stride_q_h
-        + off_d[:, None] * stride_q_d,
-        mask=q_mask[None, :],
-        other=0.0,
-    ).to(tl.float32)  # [D,HQ]
+    if HEAD_PADDED:
+        q = tl.load(
+            q_ptr
+            + q_ids[None, :] * stride_q_n
+            + h_offsets[None, :] * stride_q_h
+            + off_d[:, None] * stride_q_d,
+            mask=lane_mask[None, :],
+            other=0.0,
+        )  # [D,HQ]
+    else:
+        q = tl.load(
+            q_ptr
+            + q_ids[None, :] * stride_q_n
+            + h_offsets[None, :] * stride_q_h
+            + off_d[:, None] * stride_q_d,
+            mask=q_mask[None, :],
+            other=0.0,
+        )  # [D,HQ]
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
@@ -773,22 +800,38 @@ def _decode_index_score_kernel(
             + page * stride_ik_blk
             + off_k[:, None] * stride_ik_pos
             + off_d * stride_ik_d,
-        ).to(tl.float32)  # [N,D]
+        )  # [N,D]
         # fp32 accumulation is required for the fp8 (e4m3) index cache: q/k are
         # loaded in their stored dtype (bf16 or e4m3) and the MMA accumulates in
         # fp32 so the per-block max score is exact for the fp8 indexer too.
         kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
-        kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
+        if HEAD_PADDED:
+            kq = tl.where(pos_mask & lane_mask[None, :], kq, float("-inf"))
+        else:
+            kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [HQ]
         is_visible_block = blk < num_blocks_q
         is_init = (blk < init_blocks) & is_visible_block
         is_local = (blk >= local_start) & is_visible_block
         score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
-        tl.store(
-            score_ptr + h_offsets * stride_s_h + q_ids * stride_s_n + blk * stride_s_k,
-            score,
-            mask=q_mask,
-        )
+        if HEAD_PADDED:
+            tl.store(
+                score_ptr
+                + h_offsets * stride_s_h
+                + q_ids * stride_s_n
+                + blk * stride_s_k,
+                score,
+                mask=lane_mask,
+            )
+        else:
+            tl.store(
+                score_ptr
+                + h_offsets * stride_s_h
+                + q_ids * stride_s_n
+                + blk * stride_s_k,
+                score,
+                mask=q_mask,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -958,7 +1001,7 @@ def _topk_index_partial_kernel(
         axis=0,
     )
 
-    # Always write all BLOCK_SIZE_T slots — invalid slots carry -1e30 / 0
+    # Always write all BLOCK_SIZE_T slots 鈥?invalid slots carry -1e30 / 0
     # sentinels and lose to real scores in the merge stage.
     ts_ptrs = (
         ts_partial_ptr
@@ -1060,7 +1103,7 @@ def _topk_index_merge_kernel(
         score, idx = _bitonic_merge(score, idx.to(tl.int32), j, 2, n_dims)
     score, idx = _bitonic_merge(score, idx.to(tl.int32), n_dims, True, n_dims)
 
-    # Extract first BLOCK_SIZE_T positions — these are the global top-K.
+    # Extract first BLOCK_SIZE_T positions 鈥?these are the global top-K.
     extract_mask = tl.arange(0, BLOCK_SIZE_K // BLOCK_SIZE_T) == 0
     topk_idx_final = tl.sum(
         extract_mask[:, None]
@@ -1116,7 +1159,10 @@ def minimax_m3_index_score(
         dtype=torch.float32,
         device=idx_q.device,
     )
-    BLOCK_SIZE_Q = 64
+    # Hygon family-wide tile: 128 query rows amortize page loads and score
+    # stores while retaining the original score semantics.  A larger tile
+    # crosses the register/occupancy cliff, so it is intentionally avoided.
+    BLOCK_SIZE_Q = 128
     grid_score = (triton.cdiv(max_query_len, BLOCK_SIZE_Q), batch * num_idx_heads)
     _index_block_score_kernel[grid_score](
         idx_q,
@@ -1142,7 +1188,6 @@ def minimax_m3_index_score(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
     )
     return score
-
 
 def _supports_prefill_selector_input(score: torch.Tensor, topk: int) -> bool:
     """Common correctness boundary for the optimized Prefill selectors."""
@@ -1381,7 +1426,7 @@ def minimax_m3_index_decode_score(
     # single-head codegen unchanged.
     score_kwargs = pdl_kwargs.copy()
     if num_idx_heads > 1 and max_decode_query_len > 1:
-        score_kwargs.update({"num_warps": 4, "num_stages": 1})
+        score_kwargs.update({"num_warps": 4, "num_stages": 2})
 
     if score_out is not None:
         score = score_out

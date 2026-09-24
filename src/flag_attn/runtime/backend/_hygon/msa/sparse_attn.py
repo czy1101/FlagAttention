@@ -25,11 +25,13 @@ Main K/V cache layout (vLLM):
   K=[..., :head_dim] V=[..., head_dim:]
 
 Only the paths MiniMax M3 uses are implemented: no attention sink, base-2
-(exp2/log2) softmax. The decode kernels use split-K (flash-decoding) over the
-selected blocks with a separate merge step, since one query token per request
-leaves the prefill kernels (which parallelize over the query dim) idle.
+(exp2/log2) softmax. Decode uses an adaptive schedule: low aggregate
+query/head parallelism can process all selected blocks in one workgroup, while
+larger batches use split-K (flash-decoding) with a separate merge step.
 """
+
 import os
+
 import torch
 import triton
 import triton.experimental.tle.language as tle
@@ -44,13 +46,85 @@ SPARSE_BLOCK_SIZE = 128
 # the smallest benchmark GQA tile. Larger tiles reuse one full-page KV stage.
 _PREFILL_HALF_KV_MAX_BLOCK_SIZE_QH = 8
 
+# The Hygon-specific schedule can be disabled for A/B diagnosis, but is on by
+# default after passing the full-shape benchmark and BF16 correctness suite.
+_HYGON_ADAPTIVE_QUERY_REUSE_ENABLED = (
+    os.environ.get("FLAG_ATTN_MSA_HYGON_ADAPTIVE_QUERY_REUSE", "1") != "0"
+)
+_HYGON_LONG_Q_LOOP = 2
+# Long-context page-union threshold. At and below this threshold the pair
+# schedule is used for Hygon GQA=6; the 64-token sub-tile path keeps LDS at
+# 16 KiB while reusing each selected page across two adjacent queries.
+_HYGON_QUERY_PAIR_MAX_Q = int(
+    os.environ.get("FLAG_ATTN_MSA_HYGON_QUERY_PAIR_MAX_Q", "32768")
+)
+# Pair reuse is selected by MFMA tile family rather than by one benchmark
+# shape.  GQA=6/8/16 (M=16) and GQA=12 (M=32) share the same two-query
+# schedule; larger groups remain on the direct path to avoid an oversized M tile.
+_HYGON_QUERY_PAIR_GQA_GROUPS = tuple(
+    int(item)
+    for item in os.environ.get(
+        "FLAG_ATTN_MSA_HYGON_QUERY_PAIR_GQA_GROUPS", "6,8,12,16,24"
+    ).split(",")
+    if item.strip()
+)
+# The M=32 pair tile is useful when enough KV-head workgroups exist to hide
+# its larger register footprint.  With only four KV heads, long contexts lose
+# that parallelism to the pair schedule overhead; keep the pair path for the
+# short-prefix class where its page reuse still amortizes the schedule.
+_HYGON_QUERY_PAIR_GQA24_MIN_KV_HEADS = int(
+    os.environ.get("FLAG_ATTN_MSA_HYGON_QUERY_PAIR_GQA24_MIN_KV_HEADS", "8")
+)
+_HYGON_QUERY_PAIR_GQA24_MAX_SHORT_Q = int(
+    os.environ.get("FLAG_ATTN_MSA_HYGON_QUERY_PAIR_GQA24_MAX_SHORT_Q", "8192")
+)
+_HYGON_DECODE_PAIR_MIN_OVERLAP = float(
+    os.environ.get("FLAG_ATTN_MSA_HYGON_DECODE_PAIR_MIN_OVERLAP", "0.25")
+)
+# Natural M=8 GQA groups can share the same Hygon M=16 padding route.  Keep
+# this list separate from the pair family: padding repairs MFMA generation,
+# while pair reuse additionally depends on page overlap and QH resources.
+_HYGON_MFMA_PAD_GQA_GROUPS = tuple(
+    int(item)
+    for item in os.environ.get("FLAG_ATTN_MSA_HYGON_MFMA_PAD_GQA_GROUPS", "6,8")
+    .split(",")
+    if item.strip()
+)
+# Hygon LDS layout: load K as a logical [D, K] tile so QK can consume it
+# directly, while retaining the native [K, D] V tile for PV.  The layout is
+# enabled by default after the gfx936 correctness and all-shape stability
+# checks; set the flag to 0 for an A/B comparison or emergency rollback.
+_HYGON_TRANSPOSED_K_ENABLED = (
+    os.environ.get("FLAG_ATTN_MSA_HYGON_TRANSPOSED_K", "1") != "0"
+)
+# Two-stage page tile for the Hygon BF16 prefill families.  A 64-token K/V
+# stage halves LDS residency; the launch policy below selects it by context
+# length rather than by an individual benchmark shape.
+_HYGON_HALF_KV_DIRECT_ENABLED = (
+    os.environ.get("FLAG_ATTN_MSA_HYGON_HALF_KV_DIRECT", "1") != "0"
+)
+# Direct fallback tile family eligible for 64-token KV staging.  The default
+# covers the validated M=8 family plus GQA=24, which remains on direct because
+# its M=32 pair tile is too costly for short/medium contexts.
+_HYGON_HALF_KV_DIRECT_GQA_GROUPS = tuple(
+    int(item)
+    for item in os.environ.get(
+        "FLAG_ATTN_MSA_HYGON_HALF_KV_DIRECT_GQA_GROUPS", "6,8,24"
+    ).split(",")
+    if item.strip()
+)
+# Pair and direct schedules use the same two-stage 64-token KV tile policy.
+# Keep the context cut-over configurable for family-level A/B testing instead
+# of baking a single benchmark length into the launch logic.
+_HYGON_HALF_KV_MIN_Q = int(
+    os.environ.get("FLAG_ATTN_MSA_HYGON_HALF_KV_MIN_Q", "4096")
+)
 _FP8_DTYPES = (
     torch.float8_e4m3fn,
     torch.float8_e4m3fnuz,
     torch.float8_e5m2,
     torch.float8_e5m2fnuz,
 )
-
 
 # ---------------------------------------------------------------------------
 # GQA block-sparse attention (paged). Main heads attend only to the selected
@@ -103,6 +177,7 @@ def _gqa_sparse_fwd_direct(
     BLOCK_SIZE_QH: tl.constexpr,
     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
+    USE_TRANSPOSED_K: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -161,34 +236,46 @@ def _gqa_sparse_fwd_direct(
             qk_q_scale = tl.maximum(
                 tl.max(tl.abs(q), axis=1) * (1.0 / 448.0), 1.0e-8
             )
-            q_qk = q / qk_q_scale[:, None]
+            q_qk = (q / qk_q_scale[:, None]).to(tl.float8e4nv)
         else:
             q_qk = q
-        for _ in range(real_topk):
-            blk = tl.load(t_ptr_j).to(tl.int32)
-            t_ptr_j = t_ptr_j + stride_tk
-            c = blk * BLOCK_SIZE_K
+        num_sub_tiles = 2 if BLOCK_SIZE_K == 64 else 1
+        for iter_idx in range(real_topk * num_sub_tiles):
+            page_idx = iter_idx // num_sub_tiles
+            tile_idx = iter_idx % num_sub_tiles
+            blk = tl.load(t_ptr_j + page_idx * stride_tk).to(tl.int32)
+            tile_offset = tile_idx * BLOCK_SIZE_K
+            c = blk * 128 + tile_offset
             page = tl.load(bt_row + blk).to(tl.int64)
 
             pos = c + off_n
             pos_mask = pos < seq_len
 
             k_base_ptr = kv_cache_ptr + page * stride_kv_blk + pid_kh * stride_kv_h
-            k_ptrs = tl.make_block_ptr(
-                base=k_base_ptr,
-                shape=(BLOCK_SIZE_K, head_dim),
-                strides=(stride_kv_pos, stride_kv_d),
-                offsets=(0, 0),
-                block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
-                order=(1, 0),
-            )
+            if USE_TRANSPOSED_K:
+                k_ptrs = tl.make_block_ptr(
+                    base=k_base_ptr,
+                    shape=(head_dim, BLOCK_SIZE_K),
+                    strides=(stride_kv_d, stride_kv_pos),
+                    offsets=(0, tile_offset),
+                    block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_K),
+                    order=(1, 0),
+                )
+            else:
+                k_ptrs = tl.make_block_ptr(
+                    base=k_base_ptr,
+                    shape=(BLOCK_SIZE_K, head_dim),
+                    strides=(stride_kv_pos, stride_kv_d),
+                    offsets=(tile_offset, 0),
+                    block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
+                    order=(1, 0),
+                )
             k = tl.load(
                 k_ptrs,
                 boundary_check=(0, 1),
                 padding_option="zero",
             )
             if USE_FP8:
-                k = k.to(tl.float32)
                 if KV_SCALE_MODE == 2:
                     k_scale = tl.load(
                         k_scale_ptr
@@ -197,7 +284,10 @@ def _gqa_sparse_fwd_direct(
                         mask=pos_mask,
                         other=1.0,
                     )
-            qk_dot = tl.dot(q_qk, tl.trans(k))
+            if USE_TRANSPOSED_K:
+                qk_dot = tl.dot(q_qk, k)
+            else:
+                qk_dot = tl.dot(q_qk, tl.trans(k))
             if USE_FP8:
                 qk_dot *= qk_q_scale[:, None]
 
@@ -237,7 +327,7 @@ def _gqa_sparse_fwd_direct(
                 base=v_base_ptr,
                 shape=(BLOCK_SIZE_K, head_dim),
                 strides=(stride_kv_pos, stride_kv_d),
-                offsets=(0, 0),
+                offsets=(tile_offset, 0),
                 block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
                 order=(1, 0),
             )
@@ -267,13 +357,13 @@ def _gqa_sparse_fwd_direct(
                 pv_p_scale = tl.maximum(
                     tl.max(tl.abs(pv_p), axis=1) * (1.0 / 448.0), 1.0e-8
                 )
-                p_dot = pv_p / pv_p_scale[:, None]
-                acc_o += tl.dot(p_dot, v.to(tl.float32)) * pv_p_scale[:, None]
+                p_dot = (pv_p / pv_p_scale[:, None]).to(tl.float8e4nv)
+                acc_o += tl.dot(p_dot, v) * pv_p_scale[:, None]
             else:
                 # QH=32 uses the native PV accumulator layout above, but its
                 # FP8 PV lowering spills heavily; retain BF16 operands there.
                 if USE_FP8:
-                    v = v.to(tl.float32)
+                    v = v.to(q.dtype)
                 p_dot = p.to(v.dtype)
                 if USE_FP8 and KV_SCALE_MODE == 2:
                     p_dot = (p * v_scale[None, :]).to(v.dtype)
@@ -294,6 +384,289 @@ def _gqa_sparse_fwd_direct(
             order=(2, 1, 0),
         )
         tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
+
+
+@triton.jit
+def _build_hygon_query_pair_schedule(
+    topk_ptr,
+    block_table_ptr,
+    cu_seqlens_q,
+    logical_ptr,
+    page_mask_ptr,
+    count_ptr,
+    max_pairs,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_bt_b,
+    stride_bt_k,
+    stride_sb,
+    stride_sh,
+    stride_sp,
+    stride_su,
+    stride_cb,
+    stride_ch,
+    stride_cp,
+    TOPK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    """Build a compact two-query union outside the attention hot loop.
+
+    Each union entry stores the logical block and ``physical_page * 4 + mask``.
+    Mask bit 0 belongs to the first query and bit 1 to the second query.  Doing
+    membership and compaction here avoids vector comparisons and dynamic page
+    branches around the Hygon MFMA operations.
+    """
+
+    pid_pair = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    q_start = tl.load(cu_seqlens_q + pid_b)
+    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
+    q0 = pid_pair * 2
+    if q0 >= q_len:
+        return
+
+    off = tl.arange(0, BLOCK_TOPK)
+    topk0_ptr = (
+        topk_ptr
+        + pid_h * stride_th
+        + (q_start + q0) * stride_tn
+        + off * stride_tk
+    )
+    logical0 = tl.load(topk0_ptr, mask=off < TOPK, other=-1).to(tl.int32)
+    q1_valid = q0 + 1 < q_len
+    logical1 = tl.load(
+        topk0_ptr + stride_tn,
+        mask=(off < TOPK) & q1_valid,
+        other=-1,
+    ).to(tl.int32)
+    valid0 = (off < TOPK) & (logical0 >= 0)
+    valid1 = (off < TOPK) & (logical1 >= 0) & q1_valid
+
+    equal = (
+        (logical0[:, None] == logical1[None, :])
+        & valid0[:, None]
+        & valid1[None, :]
+    )
+    shared0 = tl.sum(equal.to(tl.int32), axis=1) > 0
+    shared1 = tl.sum(equal.to(tl.int32), axis=0) > 0
+    unique1 = valid1 & ~shared1
+
+    rank0 = tl.cumsum(valid0.to(tl.int32), axis=0) - 1
+    rank1 = tl.cumsum(unique1.to(tl.int32), axis=0) - 1
+    count0 = tl.sum(valid0.to(tl.int32), axis=0)
+    count1 = tl.sum(unique1.to(tl.int32), axis=0)
+
+    safe0 = tl.maximum(logical0, 0)
+    safe1 = tl.maximum(logical1, 0)
+    bt_row = block_table_ptr + pid_b * stride_bt_b
+    page0 = tl.load(
+        bt_row + safe0 * stride_bt_k, mask=valid0, other=0
+    ).to(tl.int32)
+    page1 = tl.load(
+        bt_row + safe1 * stride_bt_k, mask=unique1, other=0
+    ).to(tl.int32)
+    mask0 = 1 + shared0.to(tl.int32) * 2
+
+    schedule_base = (
+        pid_b * stride_sb + pid_h * stride_sh + pid_pair * stride_sp
+    )
+    tl.store(
+        logical_ptr + schedule_base + rank0 * stride_su,
+        logical0,
+        mask=valid0,
+    )
+    tl.store(
+        page_mask_ptr + schedule_base + rank0 * stride_su,
+        page0 * 4 + mask0,
+        mask=valid0,
+    )
+    tl.store(
+        logical_ptr + schedule_base + (count0 + rank1) * stride_su,
+        logical1,
+        mask=unique1,
+    )
+    tl.store(
+        page_mask_ptr + schedule_base + (count0 + rank1) * stride_su,
+        page1 * 4 + 2,
+        mask=unique1,
+    )
+    tl.store(
+        count_ptr + pid_b * stride_cb + pid_h * stride_ch + pid_pair * stride_cp,
+        count0 + count1,
+    )
+
+
+@triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
+def _gqa_sparse_fwd_hygon_query_pair(
+    q_ptr,
+    kv_cache_ptr,
+    logical_ptr,
+    page_mask_ptr,
+    count_ptr,
+    o_ptr,
+    cu_seqlens_q,
+    seq_lens,
+    prefix_lens,
+    gqa_group_size,
+    head_dim,
+    sm_scale,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_kv_blk,
+    stride_kv_h,
+    stride_kv_pos,
+    stride_kv_d,
+    stride_on,
+    stride_oh,
+    stride_od,
+    stride_sb,
+    stride_sh,
+    stride_sp,
+    stride_su,
+    stride_cb,
+    stride_ch,
+    stride_cp,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_QH: tl.constexpr,
+    USE_TRANSPOSED_K: tl.constexpr,
+):
+    """Hygon BF16 GQA=6 kernel packing two queries into one M=16 tile."""
+
+    sm_scale_log2e = sm_scale * 1.4426950409
+    pid_pair = tl.program_id(0)
+    pid_kh = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    q_start = tl.load(cu_seqlens_q + pid_b)
+    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
+    q_local = pid_pair * 2
+    if q_local >= q_len:
+        return
+
+    seq_len = tl.load(seq_lens + pid_b)
+    prefix_len = tl.load(prefix_lens + pid_b)
+    q_ptrs = tl.make_block_ptr(
+        base=q_ptr + q_start * stride_qn + pid_kh * gqa_group_size * stride_qh,
+        shape=(q_len, gqa_group_size, head_dim),
+        strides=(stride_qn, stride_qh, stride_qd),
+        offsets=(q_local, 0, 0),
+        block_shape=(2, BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(2, 1, 0),
+    )
+    q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
+    q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
+
+    off_k = tl.arange(0, BLOCK_SIZE_K)
+    num_sub_tiles = 2 if BLOCK_SIZE_K == 64 else 1
+    m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_SIZE_QH,), dtype=tl.float32)
+    acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
+
+    schedule_base = (
+        pid_b * stride_sb + pid_kh * stride_sh + pid_pair * stride_sp
+    )
+    union_count = tl.load(
+        count_ptr + pid_b * stride_cb + pid_kh * stride_ch + pid_pair * stride_cp
+    ).to(tl.int32)
+    for iter_idx in range(union_count * num_sub_tiles):
+        union_idx = iter_idx // num_sub_tiles
+        tile_idx = iter_idx % num_sub_tiles
+        logical = tl.load(
+            logical_ptr + schedule_base + union_idx * stride_su
+        ).to(tl.int32)
+        encoded = tl.load(
+            page_mask_ptr + schedule_base + union_idx * stride_su
+        ).to(tl.int32)
+        page = encoded >> 2
+        query_mask = encoded & 3
+        tile_offset = tile_idx * BLOCK_SIZE_K
+        c = logical * 128 + tile_offset
+        pos = c + off_k
+        pos_mask = pos < seq_len
+        off_q = (
+            q_local
+            + prefix_len
+            + tl.arange(0, 2)[:, None]
+            - tile_offset
+            - off_k[None, :]
+        )
+
+        k_base_ptr = (
+            kv_cache_ptr + page * stride_kv_blk + pid_kh * stride_kv_h
+        )
+        if USE_TRANSPOSED_K:
+            k_ptrs = tl.make_block_ptr(
+                base=k_base_ptr,
+                shape=(head_dim, BLOCK_SIZE_K),
+                strides=(stride_kv_d, stride_kv_pos),
+                offsets=(0, tile_offset),
+                block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_K),
+                order=(1, 0),
+            )
+        else:
+            k_ptrs = tl.make_block_ptr(
+                base=k_base_ptr,
+                shape=(BLOCK_SIZE_K, head_dim),
+                strides=(stride_kv_pos, stride_kv_d),
+                offsets=(tile_offset, 0),
+                block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
+                order=(1, 0),
+            )
+        k = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero")
+        if USE_TRANSPOSED_K:
+            qk_dot = tl.dot(q, k)
+        else:
+            qk_dot = tl.dot(q, tl.trans(k))
+
+        qk = tl.zeros((2, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
+        first_q_abs = q_local + prefix_len
+        if not ((c + BLOCK_SIZE_K) <= first_q_abs):
+            qk += tl.where(off_q[:, None, :] >= c, 0.0, float("-inf"))
+        active_query = (
+            (query_mask >> tl.arange(0, 2)) & 1
+        ) != 0
+        qk += tl.where(
+            active_query[:, None, None], 0.0, float("-inf")
+        )
+        qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
+        qk += qk_dot * sm_scale_log2e
+        if not ((c + BLOCK_SIZE_K) <= seq_len):
+            qk += tl.where(pos_mask[None, :], 0.0, float("-inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        p = tl.exp2(qk - m_ij[:, None])
+        l_ij = tl.sum(p, axis=1)
+        alpha = tl.exp2(m_i - m_ij)
+        acc_o = acc_o * alpha[:, None]
+        l_i = l_i * alpha + l_ij
+
+        v_ptrs = tl.make_block_ptr(
+            base=k_base_ptr + head_dim * stride_kv_d,
+            shape=(BLOCK_SIZE_K, head_dim),
+            strides=(stride_kv_pos, stride_kv_d),
+            offsets=(tile_offset, 0),
+            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
+            order=(1, 0),
+        )
+        v = tl.load(v_ptrs, boundary_check=(0, 1), padding_option="zero")
+        acc_o += tl.dot(p.to(v.dtype), v)
+        m_i = m_ij
+
+    inv_l = tl.where(l_i > 0, 1.0 / l_i, 0.0)
+    acc_o = tl.reshape(acc_o * inv_l[:, None], 2, BLOCK_SIZE_H, BLOCK_SIZE_D)
+    o_ptrs = tl.make_block_ptr(
+        base=o_ptr + q_start * stride_on + pid_kh * gqa_group_size * stride_oh,
+        shape=(q_len, gqa_group_size, head_dim),
+        strides=(stride_on, stride_oh, stride_od),
+        offsets=(q_local, 0, 0),
+        block_shape=(2, BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(2, 1, 0),
+    )
+    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
 
 
 @triton.heuristics(
@@ -396,6 +769,7 @@ def _gqa_sparse_fwd_kernel(
             BLOCK_SIZE_QH,
             USE_FP8,
             KV_SCALE_MODE,
+            False,
         )
         return
 
@@ -741,8 +1115,7 @@ def _gqa_sparse_fwd_kernel(
 @triton.heuristics(
     {
         "BLOCK_SIZE_H": lambda args: max(
-            8 if torch.version.hip is not None else 16,
-            triton.next_power_of_2(args["gqa_group_size"]),
+            16, triton.next_power_of_2(args["gqa_group_size"])
         ),
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
     }
@@ -1076,23 +1449,153 @@ def minimax_m3_sparse_attn(
     # Keep cases that cannot form a legal WGMMA result out of the TLE kernel:
     # FP8 KV has a dtype mismatch with BF16 Q, and a GQA tile below eight heads
     # has an illegal WGMMA N dimension.
-    is_hip_backend = torch.version.hip is not None
-    force_tle = os.environ.get(
-        "FLAG_ATTN_FORCE_TLE",
-        "0",
-    ).lower() in {"1", "true", "yes", "on"}
-
-    if (is_hip_backend and not force_tle) or use_fp8 or block_size_h < 8:
-        direct_num_q_loop = int(
-            os.environ.get("FLAG_ATTN_HYGON_Q_LOOP", "4")
+    # TLE's Tensor Memory Accelerator path is NVIDIA-only.  Hygon exposes a
+    # HIP-compatible torch build, so route it through the portable Triton
+    # kernel instead of compiling ``tle.gpu.copy``/completion barriers.
+    use_non_nvidia_backend = torch.version.hip is not None
+    # Hygon's BF16 dot lowering does not emit MMOP for the natural M=8 GQA
+    # family (observed first with GQA=6): it falls back to VALU and spills.
+    # Pad the configured family to M=16; block-pointer boundary checks mask
+    # inactive heads, while extra rows are zero and never reach output.
+    use_hygon_mfma_pad = (
+        use_non_nvidia_backend
+        and not use_fp8
+        and head_dim == 128
+        and gqa_group_size in _HYGON_MFMA_PAD_GQA_GROUPS
+    )
+    if use_hygon_mfma_pad:
+        block_size_h = 16
+    use_hygon_query_pair = (
+        use_non_nvidia_backend
+        and not use_fp8
+        and head_dim == 128
+        and gqa_group_size in _HYGON_QUERY_PAIR_GQA_GROUPS
+        and _HYGON_ADAPTIVE_QUERY_REUSE_ENABLED
+        and max_query_len <= _HYGON_QUERY_PAIR_MAX_Q
+        and (
+            gqa_group_size != 24
+            or num_kv_heads >= _HYGON_QUERY_PAIR_GQA24_MIN_KV_HEADS
+            or max_query_len <= _HYGON_QUERY_PAIR_GQA24_MAX_SHORT_Q
         )
-        direct_num_warps = 2 if block_size_h <= 8 else 4
+    )
+    if use_hygon_query_pair:
+        max_pairs = triton.cdiv(max_query_len, 2)
+        max_union = 2 * topk
+        schedule_shape = (batch, num_kv_heads, max_pairs, max_union)
+        schedule_logical = torch.empty(
+            schedule_shape, device=q.device, dtype=torch.int32
+        )
+        schedule_page_mask = torch.empty_like(schedule_logical)
+        schedule_count = torch.empty(
+            (batch, num_kv_heads, max_pairs),
+            device=q.device,
+            dtype=torch.int32,
+        )
+        pair_grid = (max_pairs, num_kv_heads, batch)
+        _build_hygon_query_pair_schedule[pair_grid](
+            topk_idx,
+            block_table,
+            cu_seqlens_q,
+            schedule_logical,
+            schedule_page_mask,
+            schedule_count,
+            max_pairs,
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            block_table.stride(0),
+            block_table.stride(1),
+            schedule_logical.stride(0),
+            schedule_logical.stride(1),
+            schedule_logical.stride(2),
+            schedule_logical.stride(3),
+            schedule_count.stride(0),
+            schedule_count.stride(1),
+            schedule_count.stride(2),
+            TOPK=topk,
+            BLOCK_TOPK=triton.next_power_of_2(topk),
+            num_warps=1,
+            num_stages=1,
+        )
+        pair_block_k = (
+            SPARSE_BLOCK_SIZE // 2
+            if (
+                _HYGON_HALF_KV_DIRECT_ENABLED
+                and max_query_len >= _HYGON_HALF_KV_MIN_Q
+            )
+            else SPARSE_BLOCK_SIZE
+        )
+        _gqa_sparse_fwd_hygon_query_pair[pair_grid](
+            q,
+            kv_cache,
+            schedule_logical,
+            schedule_page_mask,
+            schedule_count,
+            output,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            gqa_group_size,
+            head_dim,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            kv_cache.stride(3),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            schedule_logical.stride(0),
+            schedule_logical.stride(1),
+            schedule_logical.stride(2),
+            schedule_logical.stride(3),
+            schedule_count.stride(0),
+            schedule_count.stride(1),
+            schedule_count.stride(2),
+            BLOCK_SIZE_K=pair_block_k,
+            BLOCK_SIZE_D=128,
+            BLOCK_SIZE_H=triton.next_power_of_2(gqa_group_size),
+            BLOCK_SIZE_QH=2 * triton.next_power_of_2(gqa_group_size),
+            # The validated layout is BF16-only; keep the FP8 path on its
+            # original load/transpose sequence until it has a separate A/B.
+            USE_TRANSPOSED_K=_HYGON_TRANSPOSED_K_ENABLED and not use_fp8,
+            num_warps=4,
+            num_stages=1,
+        )
+        return
+    if use_fp8 or block_size_h < 8 or use_non_nvidia_backend:
+        # Query-loop coarsening helps only the very long M=16 family. Keep it
+        # restricted to that work-set regime so shorter and multi-request
+        # shapes retain their higher workgroup-level parallelism.
+        direct_q_loop = (
+            _HYGON_LONG_Q_LOOP
+            if (
+                use_hygon_mfma_pad
+                and _HYGON_ADAPTIVE_QUERY_REUSE_ENABLED
+                and max_query_len >= 32768
+            )
+            else 1
+        )
         direct_grid = (
-            triton.cdiv(max_query_len, direct_num_q_loop),
+            triton.cdiv(max_query_len, direct_q_loop),
             num_kv_heads,
             batch,
         )
-
+        direct_block_k = (
+            SPARSE_BLOCK_SIZE // 2
+            if (
+                _HYGON_HALF_KV_DIRECT_ENABLED
+                and use_non_nvidia_backend
+                and not use_fp8
+                and head_dim == 128
+                and gqa_group_size in _HYGON_HALF_KV_DIRECT_GQA_GROUPS
+                and max_query_len >= _HYGON_HALF_KV_MIN_Q
+            )
+            else SPARSE_BLOCK_SIZE
+        )
         _gqa_sparse_fwd_direct[direct_grid](
             q,
             kv_cache,
@@ -1109,7 +1612,7 @@ def minimax_m3_sparse_attn(
             gqa_group_size,
             head_dim,
             topk,
-            direct_num_q_loop,
+            direct_q_loop,
             sm_scale,
             q.stride(0),
             q.stride(1),
@@ -1130,22 +1633,17 @@ def minimax_m3_sparse_attn(
             output.stride(2),
             block_table.stride(0),
             BLOCK_SIZE_Q=1,
-            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            BLOCK_SIZE_K=direct_block_k,
             BLOCK_SIZE_D=triton.next_power_of_2(head_dim),
             BLOCK_SIZE_H=block_size_h,
             BLOCK_SIZE_QH=block_size_h,
             USE_FP8=use_fp8,
             KV_SCALE_MODE=kv_scale_mode,
-            num_warps=(
-                int(os.environ.get("FLAG_ATTN_HYGON_WARPS", "4"))
-                if is_hip_backend
-                else 4
-            ),
-            num_stages=(
-                int(os.environ.get("FLAG_ATTN_HYGON_STAGES", "1"))
-                if is_hip_backend
-                else 3
-            ),
+            USE_TRANSPOSED_K=_HYGON_TRANSPOSED_K_ENABLED,
+            num_warps=4,
+            # BW exposes 64 KiB shared memory per block; keep the portable
+            # path to one stage for the 128-wide BF16 tile.
+            num_stages=1 if use_non_nvidia_backend else 3,
         )
         return
 
@@ -1237,6 +1735,7 @@ def minimax_m3_sparse_attn_decode(
     max_topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
     use_fp8 = kv_cache.dtype in _FP8_DTYPES
+    use_non_nvidia_backend = torch.version.hip is not None
     (
         k_scale_arg,
         v_scale_arg,
@@ -1258,17 +1757,128 @@ def minimax_m3_sparse_attn_decode(
             _KV_SCALE_NONE,
         )
     )
+    # Speculative decode has multiple adjacent query rows belonging to the
+    # same request. Build the existing page-union schedule for each pair and
+    # use it only when the measured logical/physical page overlap is high
+    # enough; otherwise fall through to the proven query-outer split-K path.
+    # qlen=1 (the regular serving benchmark) never pays this schedule cost.
+    use_decode_pair = (
+        use_non_nvidia_backend
+        and not use_fp8
+        and head_dim == 128
+        and decode_query_len >= 2
+        # The page-union schedule needs enough query/head parallelism to
+        # amortize its schedule build and scalar overlap decision.  Small
+        # batches stay on the split-K query-outer fallback even when pages
+        # overlap, because they otherwise lose to launch/scheduling overhead.
+        and total_q * num_kv_heads >= 256
+        and gqa_group_size in _HYGON_QUERY_PAIR_GQA_GROUPS
+        # GQA=24 was validated for the Prefill M=32 tile only.  Keep the
+        # decode schedule on the previously validated GQA families until a
+        # separate speculative-decode resource sweep is available.
+        and gqa_group_size != 24
+        and _HYGON_ADAPTIVE_QUERY_REUSE_ENABLED
+    )
+    if use_decode_pair:
+        batch = seq_lens.shape[0]
+        max_pairs = triton.cdiv(decode_query_len, 2)
+        max_union = 2 * max_topk
+        cu_q = torch.arange(
+            0,
+            (batch + 1) * decode_query_len,
+            decode_query_len,
+            device=q.device,
+            dtype=torch.int32,
+        )
+        prefix_lens = seq_lens - decode_query_len
+        schedule_logical = torch.empty(
+            (batch, num_kv_heads, max_pairs, max_union),
+            device=q.device,
+            dtype=torch.int32,
+        )
+        schedule_page_mask = torch.empty_like(schedule_logical)
+        schedule_count = torch.empty(
+            (batch, num_kv_heads, max_pairs),
+            device=q.device,
+            dtype=torch.int32,
+        )
+        pair_grid = (max_pairs, num_kv_heads, batch)
+        _build_hygon_query_pair_schedule[pair_grid](
+            topk_idx,
+            block_table,
+            cu_q,
+            schedule_logical,
+            schedule_page_mask,
+            schedule_count,
+            max_pairs,
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            block_table.stride(0),
+            block_table.stride(1),
+            schedule_logical.stride(0),
+            schedule_logical.stride(1),
+            schedule_logical.stride(2),
+            schedule_logical.stride(3),
+            schedule_count.stride(0),
+            schedule_count.stride(1),
+            schedule_count.stride(2),
+            TOPK=max_topk,
+            BLOCK_TOPK=triton.next_power_of_2(max_topk),
+            num_warps=1,
+            num_stages=1,
+        )
+        # A union of 2*TOPK entries has no reuse. The scalar readback is only
+        # used for speculative decode (qlen>=2), where it is cheaper than
+        # launching a page-major attention kernel for a low-overlap schedule.
+        union_mean = schedule_count.float().mean().item()
+        overlap_ratio = max(0.0, (2.0 * max_topk - union_mean) / max_topk)
+        if overlap_ratio >= _HYGON_DECODE_PAIR_MIN_OVERLAP:
+            _gqa_sparse_fwd_hygon_query_pair[pair_grid](
+                q,
+                kv_cache,
+                schedule_logical,
+                schedule_page_mask,
+                schedule_count,
+                output,
+                cu_q,
+                seq_lens,
+                prefix_lens,
+                gqa_group_size,
+                head_dim,
+                sm_scale,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                kv_cache.stride(2),
+                kv_cache.stride(3),
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                schedule_logical.stride(0),
+                schedule_logical.stride(1),
+                schedule_logical.stride(2),
+                schedule_logical.stride(3),
+                schedule_count.stride(0),
+                schedule_count.stride(1),
+                schedule_count.stride(2),
+                BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+                BLOCK_SIZE_D=128,
+                BLOCK_SIZE_H=triton.next_power_of_2(gqa_group_size),
+                BLOCK_SIZE_QH=2 * triton.next_power_of_2(gqa_group_size),
+                USE_TRANSPOSED_K=_HYGON_TRANSPOSED_K_ENABLED,
+                num_warps=4,
+                num_stages=1,
+            )
+            return
     use_pdl = current_platform.is_arch_support_pdl()
     # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
     # SM9+); this ROCm Triton rejects it even when False ("Keyword argument
     # launch_pdl was specified but unrecognised"). Only pass it when PDL is
     # actually supported -- on ROCm use_pdl is always False, so it's omitted.
     pdl_launch = {"launch_pdl": True} if use_pdl else {}
-    decode_launch = (
-        {"num_warps": 2, "num_stages": 1}
-        if torch.version.hip is not None
-        else {}
-    )
     # split-K over the selected blocks; chunk count is shape-constant (cuda graph).
     TARGET_GRID = 256
     target = max(1, min(max_topk, TARGET_GRID // max(1, total_q * num_kv_heads)))
@@ -1323,7 +1933,10 @@ def minimax_m3_sparse_attn_decode(
         USE_FP8=use_fp8,
         KV_SCALE_MODE=kv_scale_mode,
         USE_PDL=use_pdl,
-        **decode_launch,
+        num_warps=4,
+        # BW exposes 64 KiB shared memory per block; one stage is required
+        # for the decode tile on the portable HIP path.
+        num_stages=1 if use_non_nvidia_backend else 3,
         **pdl_launch,
     )
     merge_grid = (total_q, num_heads)

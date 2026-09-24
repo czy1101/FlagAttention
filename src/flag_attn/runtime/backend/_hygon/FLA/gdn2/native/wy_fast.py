@@ -71,6 +71,8 @@ def recompute_w_u_fwd_gdn2_kernel(
     BV: tl.constexpr,
     STORE_QG: tl.constexpr,
     STORE_KG: tl.constexpr,
+    KG_HEAD_MAJOR: tl.constexpr,
+    A_HEAD_MAJOR: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
@@ -86,10 +88,16 @@ def recompute_w_u_fwd_gdn2_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
+    if A_HEAD_MAJOR:
+        a_base = (i_b * H + i_h) * T * BT
+        a_stride = BT
+    else:
+        a_base = (bos * H + i_h) * BT
+        a_stride = H * BT
     p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT,
+        A + a_base,
         (T, BT),
-        (H * BT, 1),
+        (a_stride, 1),
         (i_t * BT, 0),
         (BT, BT),
         (1, 0),
@@ -98,29 +106,29 @@ def recompute_w_u_fwd_gdn2_kernel(
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(
-            v + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
+                v + (bos * H + i_h) * V,
+                (T, V),
+                (H * V, 1),
+                (i_t * BT, i_v * BV),
+                (BT, BV),
+                (1, 0),
+            )
         p_u = tl.make_block_ptr(
-            u + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
+                u + (bos * H + i_h) * V,
+                (T, V),
+                (H * V, 1),
+                (i_t * BT, i_v * BV),
+                (BT, BV),
+                (1, 0),
+            )
         p_wg = tl.make_block_ptr(
-            w_gate + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
+                w_gate + (bos * H + i_h) * V,
+                (T, V),
+                (H * V, 1),
+                (i_t * BT, i_v * BV),
+                (BT, BV),
+                (1, 0),
+            )
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_wg = tl.load(p_wg, boundary_check=(0, 1))
         b_vb = (b_v * b_wg).to(b_v.dtype)
@@ -202,14 +210,24 @@ def recompute_w_u_fwd_gdn2_kernel(
                 exp2(b_gn[None, :] - b_gk),
                 0,
             )
-            p_kg = tl.make_block_ptr(
-                kg + (bos * H + i_h) * K,
-                (T, K),
-                (H * K, 1),
-                (i_t * BT, i_k * BK),
-                (BT, BK),
-                (1, 0),
-            )
+            if KG_HEAD_MAJOR:
+                p_kg = tl.make_block_ptr(
+                    kg + (i_b * H + i_h) * T * K,
+                    (T, K),
+                    (K, 1),
+                    (i_t * BT, i_k * BK),
+                    (BT, BK),
+                    (1, 0),
+                )
+            else:
+                p_kg = tl.make_block_ptr(
+                    kg + (bos * H + i_h) * K,
+                    (T, K),
+                    (H * K, 1),
+                    (i_t * BT, i_k * BK),
+                    (BT, BK),
+                    (1, 0),
+                )
             tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty), boundary_check=(0, 1))
 
         b_w = tl.dot(b_A, b_kb.to(b_k.dtype))
@@ -226,6 +244,8 @@ def recompute_w_u_fwd_gdn2(
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    kg_head_major: bool = False,
+    a_head_major: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Produce GDN-2 WY auxiliaries from the solved chunk inverse ``A``.
 
@@ -244,7 +264,14 @@ def recompute_w_u_fwd_gdn2(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     qg = torch.empty_like(q) if q is not None else None
-    kg = torch.empty_like(k) if gk is not None else None
+    if gk is not None and kg_head_major:
+        kg_storage = torch.empty((B, H, T, K), device=k.device, dtype=k.dtype)
+        kg = kg_storage.as_strided(
+            (B, T, H, K),
+            (H * T * K, K, T * K, 1),
+        )
+    else:
+        kg = torch.empty_like(k) if gk is not None else None
     recompute_w_u_fwd_gdn2_kernel[(NT, B * H)](
         q=q,
         k=k,
@@ -266,5 +293,7 @@ def recompute_w_u_fwd_gdn2(
         BT=BT,
         BK=BK,
         BV=BV,
+        KG_HEAD_MAJOR=kg_head_major,
+        A_HEAD_MAJOR=a_head_major,
     )
     return w, u, qg, kg

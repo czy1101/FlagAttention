@@ -54,6 +54,85 @@ else:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
 
 
+@triton.jit
+def _build_safe_diag_in_registers(
+    q,
+    k,
+    g,
+    b,
+    Aqk,
+    scale,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    BK: tl.constexpr,
+    i_ti,
+    i_col: tl.constexpr,
+):
+    """Build one 16-token diagonal tile and keep its inverse in FP32 registers.
+
+    This is the producer half of the safe-gate fused path.  It deliberately
+    matches ``chunk_gdn2_fwd_kernel_intra_sub_chunk``: dot operands retain the
+    input dtype, while the triangular inverse stays FP32 until the enclosing
+    inter-subchunk solve consumes it.  Consequently no FP32 ``Akkd`` tile is
+    materialized in global memory and no early BF16 truncation is introduced.
+    """
+    o_i = tl.arange(0, BC)
+    m_c = (i_ti + o_i) < T
+    b_Aqk = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Akk = tl.zeros([BC, BC], dtype=tl.float32)
+
+    for i_k in range(tl.cdiv(K, BK)):
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+        p_q = tl.make_block_ptr(
+            q, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0)
+        )
+        p_k = tl.make_block_ptr(
+            k, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0)
+        )
+        p_g = tl.make_block_ptr(
+            g, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0)
+        )
+        p_b = tl.make_block_ptr(
+            b, (T, K), (H * K, 1), (i_ti, i_k * BK), (BC, BK), (1, 0)
+        )
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_g = tl.load(p_g, boundary_check=(0, 1))
+        b_b = tl.load(p_b, boundary_check=(0, 1))
+        i_mid = i_ti + min(BC // 2, T - i_ti - 1)
+        b_gn = tl.load(g + i_mid * H * K + o_k, mask=m_k, other=0.0)[None, :]
+        b_gm = (b_g - b_gn).to(tl.float32)
+        b_gq = tl.where(m_c[:, None], exp2(b_gm), 0.0)
+        b_gk = tl.where(m_c[:, None], exp2(-b_gm), 0.0)
+        b_kgt = tl.trans(b_k * b_gk)
+        b_bk = (b_b.to(tl.float32) * b_k.to(tl.float32)).to(b_k.dtype)
+        b_Aqk += tl.dot(b_q * b_gq, b_kgt)
+        b_Akk += tl.dot(b_bk * b_gq, b_kgt)
+
+    m_Aqk = o_i[:, None] >= o_i[None, :]
+    m_Akk = o_i[:, None] > o_i[None, :]
+    m_I = o_i[:, None] == o_i[None, :]
+    b_Aqk = tl.where(m_Aqk, b_Aqk, 0.0)
+    b_Akk = tl.where(m_Akk, b_Akk, 0.0)
+    p_Aqk = tl.make_block_ptr(
+        Aqk, (T, BT), (H * BT, 1), (i_ti, i_col), (BC, BC), (1, 0)
+    )
+    tl.store(p_Aqk, (b_Aqk * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+
+    b_Ai = -b_Akk
+    for i in range(2, BC):
+        # Select row i without spilling the FP32 tile to global memory.
+        b_a = -tl.sum(tl.where((o_i == i)[:, None], b_Akk, 0.0), axis=0)
+        b_a = tl.where(o_i < i, b_a, 0.0)
+        b_a += tl.sum(b_a[:, None] * b_Ai, axis=0)
+        b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
+    return b_Ai + m_I
+
+
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -207,6 +286,8 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_SAFE_GATE: tl.constexpr,
+    FUSE_SAFE_DIAG: tl.constexpr,
+    AKK_HEAD_MAJOR: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -235,13 +316,40 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
     g += (bos * H + i_h) * K
     b += (bos * H + i_h) * K
     Aqk += (bos * H + i_h) * BT
-    Akk += (bos * H + i_h) * BT
+    if AKK_HEAD_MAJOR:
+        AKK_STRIDE = BT
+        akk_base = (i_b * H + i_h) * T * BT
+    else:
+        AKK_STRIDE = H * BT
+        akk_base = (bos * H + i_h) * BT
+    Akk += akk_base
     Akkd += (bos * H + i_h) * BC
 
     o_i = tl.arange(0, BC)
     m_tc1 = (i_tc1 + o_i) < T
     m_tc2 = (i_tc2 + o_i) < T
     m_tc3 = (i_tc3 + o_i) < T
+
+    if FUSE_SAFE_DIAG:
+        m_I = (o_i[:, None] == o_i[None, :]).to(tl.float32)
+        b_Ai00 = _build_safe_diag_in_registers(
+            q, k, g, b, Aqk, scale, T, H, K, BT, BC, BK, i_tc0, 0
+        )
+        b_Ai11 = m_I
+        b_Ai22 = m_I
+        b_Ai33 = m_I
+        if i_tc1 < T:
+            b_Ai11 = _build_safe_diag_in_registers(
+                q, k, g, b, Aqk, scale, T, H, K, BT, BC, BK, i_tc1, BC
+            )
+        if i_tc2 < T:
+            b_Ai22 = _build_safe_diag_in_registers(
+                q, k, g, b, Aqk, scale, T, H, K, BT, BC, BK, i_tc2, 2 * BC
+            )
+        if i_tc3 < T:
+            b_Ai33 = _build_safe_diag_in_registers(
+                q, k, g, b, Aqk, scale, T, H, K, BT, BC, BK, i_tc3, 3 * BC
+            )
 
     b_Aqk10 = tl.zeros([BC, BC], dtype=tl.float32)
     b_Akk10 = tl.zeros([BC, BC], dtype=tl.float32)
@@ -398,57 +506,58 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
             p_Aqk32, (b_Aqk32 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1)
         )
 
-    p_Akk00 = tl.make_block_ptr(
-        Akkd, (T, BC), (H * BC, 1), (i_tc0, 0), (BC, BC), (1, 0)
-    )
-    p_Akk11 = tl.make_block_ptr(
-        Akkd, (T, BC), (H * BC, 1), (i_tc1, 0), (BC, BC), (1, 0)
-    )
-    p_Akk22 = tl.make_block_ptr(
-        Akkd, (T, BC), (H * BC, 1), (i_tc2, 0), (BC, BC), (1, 0)
-    )
-    p_Akk33 = tl.make_block_ptr(
-        Akkd, (T, BC), (H * BC, 1), (i_tc3, 0), (BC, BC), (1, 0)
-    )
-    b_Ai00 = tl.load(p_Akk00, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai11 = tl.load(p_Akk11, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai22 = tl.load(p_Akk22, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai33 = tl.load(p_Akk33, boundary_check=(0, 1)).to(tl.float32)
+    if not FUSE_SAFE_DIAG:
+        p_Akk00 = tl.make_block_ptr(
+            Akkd, (T, BC), (H * BC, 1), (i_tc0, 0), (BC, BC), (1, 0)
+        )
+        p_Akk11 = tl.make_block_ptr(
+            Akkd, (T, BC), (H * BC, 1), (i_tc1, 0), (BC, BC), (1, 0)
+        )
+        p_Akk22 = tl.make_block_ptr(
+            Akkd, (T, BC), (H * BC, 1), (i_tc2, 0), (BC, BC), (1, 0)
+        )
+        p_Akk33 = tl.make_block_ptr(
+            Akkd, (T, BC), (H * BC, 1), (i_tc3, 0), (BC, BC), (1, 0)
+        )
+        b_Ai00 = tl.load(p_Akk00, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai11 = tl.load(p_Akk11, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai22 = tl.load(p_Akk22, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai33 = tl.load(p_Akk33, boundary_check=(0, 1)).to(tl.float32)
 
-    if not USE_SAFE_GATE:
-        m_A = o_i[:, None] > o_i[None, :]
-        m_I = o_i[:, None] == o_i[None, :]
+        if not USE_SAFE_GATE:
+            m_A = o_i[:, None] > o_i[None, :]
+            m_I = o_i[:, None] == o_i[None, :]
 
-        b_Ai00 = -tl.where(m_A, b_Ai00, 0)
-        b_Ai11 = -tl.where(m_A, b_Ai11, 0)
-        b_Ai22 = -tl.where(m_A, b_Ai22, 0)
-        b_Ai33 = -tl.where(m_A, b_Ai33, 0)
+            b_Ai00 = -tl.where(m_A, b_Ai00, 0)
+            b_Ai11 = -tl.where(m_A, b_Ai11, 0)
+            b_Ai22 = -tl.where(m_A, b_Ai22, 0)
+            b_Ai33 = -tl.where(m_A, b_Ai33, 0)
 
-        for i in range(2, min(BC, T - i_tc0)):
-            b_a00 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
-            b_a00 = tl.where(o_i < i, b_a00, 0.0)
-            b_a00 += tl.sum(b_a00[:, None] * b_Ai00, 0)
-            b_Ai00 = tl.where((o_i == i)[:, None], b_a00, b_Ai00)
-        for i in range(BC + 2, min(2 * BC, T - i_tc0)):
-            b_a11 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
-            b_a11 = tl.where(o_i < i - BC, b_a11, 0.0)
-            b_a11 += tl.sum(b_a11[:, None] * b_Ai11, 0)
-            b_Ai11 = tl.where((o_i == i - BC)[:, None], b_a11, b_Ai11)
-        for i in range(2 * BC + 2, min(3 * BC, T - i_tc0)):
-            b_a22 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
-            b_a22 = tl.where(o_i < i - 2 * BC, b_a22, 0.0)
-            b_a22 += tl.sum(b_a22[:, None] * b_Ai22, 0)
-            b_Ai22 = tl.where((o_i == i - 2 * BC)[:, None], b_a22, b_Ai22)
-        for i in range(3 * BC + 2, min(4 * BC, T - i_tc0)):
-            b_a33 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
-            b_a33 = tl.where(o_i < i - 3 * BC, b_a33, 0.0)
-            b_a33 += tl.sum(b_a33[:, None] * b_Ai33, 0)
-            b_Ai33 = tl.where((o_i == i - 3 * BC)[:, None], b_a33, b_Ai33)
+            for i in range(2, min(BC, T - i_tc0)):
+                b_a00 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
+                b_a00 = tl.where(o_i < i, b_a00, 0.0)
+                b_a00 += tl.sum(b_a00[:, None] * b_Ai00, 0)
+                b_Ai00 = tl.where((o_i == i)[:, None], b_a00, b_Ai00)
+            for i in range(BC + 2, min(2 * BC, T - i_tc0)):
+                b_a11 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
+                b_a11 = tl.where(o_i < i - BC, b_a11, 0.0)
+                b_a11 += tl.sum(b_a11[:, None] * b_Ai11, 0)
+                b_Ai11 = tl.where((o_i == i - BC)[:, None], b_a11, b_Ai11)
+            for i in range(2 * BC + 2, min(3 * BC, T - i_tc0)):
+                b_a22 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
+                b_a22 = tl.where(o_i < i - 2 * BC, b_a22, 0.0)
+                b_a22 += tl.sum(b_a22[:, None] * b_Ai22, 0)
+                b_Ai22 = tl.where((o_i == i - 2 * BC)[:, None], b_a22, b_Ai22)
+            for i in range(3 * BC + 2, min(4 * BC, T - i_tc0)):
+                b_a33 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
+                b_a33 = tl.where(o_i < i - 3 * BC, b_a33, 0.0)
+                b_a33 += tl.sum(b_a33[:, None] * b_Ai33, 0)
+                b_Ai33 = tl.where((o_i == i - 3 * BC)[:, None], b_a33, b_Ai33)
 
-        b_Ai00 += m_I
-        b_Ai11 += m_I
-        b_Ai22 += m_I
-        b_Ai33 += m_I
+            b_Ai00 += m_I
+            b_Ai11 += m_I
+            b_Ai22 += m_I
+            b_Ai33 += m_I
 
     b_Ai10 = -tl.dot(
         tl.dot(b_Ai11, b_Akk10, input_precision=SOLVE_TRIL_DOT_PRECISION),
@@ -486,27 +595,27 @@ def chunk_gdn2_fwd_kernel_inter_solve_fused(
         input_precision=SOLVE_TRIL_DOT_PRECISION,
     )
 
-    p_Akk00 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc0, 0), (BC, BC), (1, 0))
-    p_Akk10 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc1, 0), (BC, BC), (1, 0))
+    p_Akk00 = tl.make_block_ptr(Akk, (T, BT), (AKK_STRIDE, 1), (i_tc0, 0), (BC, BC), (1, 0))
+    p_Akk10 = tl.make_block_ptr(Akk, (T, BT), (AKK_STRIDE, 1), (i_tc1, 0), (BC, BC), (1, 0))
     p_Akk11 = tl.make_block_ptr(
-        Akk, (T, BT), (H * BT, 1), (i_tc1, BC), (BC, BC), (1, 0)
+        Akk, (T, BT), (AKK_STRIDE, 1), (i_tc1, BC), (BC, BC), (1, 0)
     )
-    p_Akk20 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc2, 0), (BC, BC), (1, 0))
+    p_Akk20 = tl.make_block_ptr(Akk, (T, BT), (AKK_STRIDE, 1), (i_tc2, 0), (BC, BC), (1, 0))
     p_Akk21 = tl.make_block_ptr(
-        Akk, (T, BT), (H * BT, 1), (i_tc2, BC), (BC, BC), (1, 0)
+        Akk, (T, BT), (AKK_STRIDE, 1), (i_tc2, BC), (BC, BC), (1, 0)
     )
     p_Akk22 = tl.make_block_ptr(
-        Akk, (T, BT), (H * BT, 1), (i_tc2, 2 * BC), (BC, BC), (1, 0)
+        Akk, (T, BT), (AKK_STRIDE, 1), (i_tc2, 2 * BC), (BC, BC), (1, 0)
     )
-    p_Akk30 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc3, 0), (BC, BC), (1, 0))
+    p_Akk30 = tl.make_block_ptr(Akk, (T, BT), (AKK_STRIDE, 1), (i_tc3, 0), (BC, BC), (1, 0))
     p_Akk31 = tl.make_block_ptr(
-        Akk, (T, BT), (H * BT, 1), (i_tc3, BC), (BC, BC), (1, 0)
+        Akk, (T, BT), (AKK_STRIDE, 1), (i_tc3, BC), (BC, BC), (1, 0)
     )
     p_Akk32 = tl.make_block_ptr(
-        Akk, (T, BT), (H * BT, 1), (i_tc3, 2 * BC), (BC, BC), (1, 0)
+        Akk, (T, BT), (AKK_STRIDE, 1), (i_tc3, 2 * BC), (BC, BC), (1, 0)
     )
     p_Akk33 = tl.make_block_ptr(
-        Akk, (T, BT), (H * BT, 1), (i_tc3, 3 * BC), (BC, BC), (1, 0)
+        Akk, (T, BT), (AKK_STRIDE, 1), (i_tc3, 3 * BC), (BC, BC), (1, 0)
     )
 
     tl.store(p_Akk00, b_Ai00.to(Akk.dtype.element_ty), boundary_check=(0, 1))
@@ -863,6 +972,8 @@ def chunk_gdn2_fwd_intra(
     chunk_indices: torch.LongTensor | None = None,
     safe_gate: bool = False,
     disable_recompute: bool = False,
+    store_kg_head_major: bool = False,
+    store_akk_head_major: bool = False,
 ):
     """Intra-chunk forward: build Aqk, Akk_inv, and the WY auxiliaries (w, u)."""
     B, T, H, K = k.shape
@@ -873,32 +984,22 @@ def chunk_gdn2_fwd_intra(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
-    # Akk must be zero-initialized - kernel only writes lower triangular.
-    Akk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
-    Akkd = torch.empty(B, T, H, BC, device=k.device, dtype=torch.float32)
-
-    if safe_gate:
-        grid = (NT, triton.cdiv(BT, BC), B * H)
-        BK = triton.next_power_of_2(K)
-        chunk_gdn2_fwd_kernel_intra_sub_chunk[grid](
-            q=q,
-            k=k,
-            g=gk,
-            b=b,
-            Aqk=Aqk,
-            Akk=Akkd,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            T=T,
-            H=H,
-            K=K,
-            BT=BT,
-            BC=BC,
-            BK=BK,
-            USE_GATHER=IS_GATHER_SUPPORTED,
+    akk_head_major = store_akk_head_major and cu_seqlens is None
+    if akk_head_major:
+        Akk_storage = torch.zeros(B, H, T, BT, device=k.device, dtype=k.dtype)
+        Akk = Akk_storage.as_strided(
+            (B, T, H, BT), (H * T * BT, BT, T * BT, 1)
         )
+        Akk_kernel = Akk_storage
     else:
+        # Akk must be zero-initialized - the kernel only writes its lower triangle.
+        Akk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
+        Akk_kernel = Akk
+    # The safe path produces diagonal inverses inside the inter-solve kernel,
+    # so it does not need the B*T*H*BC FP32 global workspace.
+    Akkd = None if safe_gate else torch.empty(B, T, H, BC, device=k.device, dtype=torch.float32)
+
+    if not safe_gate:
         chunk_gdn2_fwd_intra_token_parallel(
             q=q,
             k=k,
@@ -920,8 +1021,10 @@ def chunk_gdn2_fwd_intra(
         g=gk,
         b=b,
         Aqk=Aqk,
-        Akkd=Akkd,
-        Akk=Akk,
+        # Pointer arguments cannot be None; the safe specialization removes
+        # every Akkd access at compile time, so Akk is a harmless placeholder.
+        Akkd=Akk if Akkd is None else Akkd,
+        Akk=Akk_kernel,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -931,6 +1034,8 @@ def chunk_gdn2_fwd_intra(
         BT=BT,
         BC=BC,
         USE_SAFE_GATE=safe_gate,
+        FUSE_SAFE_DIAG=safe_gate,
+        AKK_HEAD_MAJOR=akk_head_major,
     )
 
     w, u, qg, kg = recompute_w_u_fwd_gdn2(
@@ -938,11 +1043,13 @@ def chunk_gdn2_fwd_intra(
         v=v,
         b=b,
         w_gate=w_gate,
-        A=Akk,
+        A=Akk_kernel,
         q=q if disable_recompute else None,
         gk=gk,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        kg_head_major=store_kg_head_major,
+        a_head_major=akk_head_major,
     )
     return w, u, qg, kg, Aqk, Akk
 

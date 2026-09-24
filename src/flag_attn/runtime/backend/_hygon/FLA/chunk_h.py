@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -12,7 +14,21 @@ import triton.language as tl
 from .index import prepare_chunk_offsets
 from .utils import check_shared_mem
 
-BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
+_bkv_override = os.environ.get("FLAG_ATTN_GLA_H_BKV")
+if _bkv_override:
+    BKV_LIST = [int(x) for x in _bkv_override.split(",")]
+else:
+    # The Hygon BW runtime does not expose shared-memory properties through
+    # PyTorch, so check_shared_mem() conservatively returns False there.  BW
+    # has sufficient SRAM for the larger state tiles; using them halves the
+    # number of K/V tile programs in the recurrent state scan.
+    _is_hygon_bw = False
+    if torch.cuda.is_available():
+        try:
+            _is_hygon_bw = torch.cuda.get_device_name(torch.cuda.current_device()) == "BW"
+        except (AssertionError, RuntimeError):
+            pass
+    BKV_LIST = [32, 64] if check_shared_mem() or _is_hygon_bw else [16, 32]
 
 
 @triton.jit
@@ -234,6 +250,181 @@ def chunk_fwd_kernel_h(
             )
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
+
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["T"])
+def chunk_fwd_kernel_h_v2(
+    k,
+    v,
+    gk,
+    h,
+    cu_seqlens,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    V_GROUP_OFFSET: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Forward-only H scan processing two adjacent V tiles per program.
+
+    The K tile and its gate decay are shared by both V tiles.  This removes
+    one K/gate load and halves the program count for wide states.  The
+    specialized path is used only for the common no-initial/final-state,
+    fixed-length GLA forward call; the general kernel above remains the
+    fallback for backward and variable-length APIs.
+    """
+    i_k, i_vg, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+    i_v = (i_vg + V_GROUP_OFFSET) * 2
+    NT = tl.cdiv(T, BT)
+    bos = i_b * T
+
+    b_h0 = tl.zeros([BK, BV], dtype=tl.float32)
+    b_h1 = tl.zeros([BK, BV], dtype=tl.float32)
+
+    for i_t in range(NT):
+        o_h = ((i_b * NT + i_t) * H + i_h).to(tl.int64) * K * V
+        p_h0 = tl.make_block_ptr(
+            h + o_h,
+            (K, V),
+            (V, 1),
+            (i_k * BK, i_v * BV),
+            (BK, BV),
+            (1, 0),
+        )
+        p_h1 = tl.make_block_ptr(
+            h + o_h,
+            (K, V),
+            (V, 1),
+            (i_k * BK, (i_v + 1) * BV),
+            (BK, BV),
+            (1, 0),
+        )
+        tl.store(p_h0, b_h0.to(p_h0.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
+
+        p_k = tl.make_block_ptr(
+            k + (bos * H + i_h) * K,
+            (K, T),
+            (1, H * K),
+            (i_k * BK, i_t * BT),
+            (BK, BT),
+            (0, 1),
+        )
+        p_gk = tl.make_block_ptr(
+            gk + (bos * H + i_h) * K,
+            (K, T),
+            (1, H * K),
+            (i_k * BK, i_t * BT),
+            (BK, BT),
+            (0, 1),
+        )
+        p_v0 = tl.make_block_ptr(
+            v + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        p_v1 = tl.make_block_ptr(
+            v + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, (i_v + 1) * BV),
+            (BT, BV),
+            (1, 0),
+        )
+
+        last_idx = min((i_t + 1) * BT, T) - 1
+        p_gk_last = (
+            gk
+            + (bos + last_idx) * H * K
+            + i_h * K
+            + i_k * BK
+            + tl.arange(0, BK)
+        )
+        b_gk_last = tl.load(
+            p_gk_last, mask=(i_k * BK + tl.arange(0, BK) < K), other=0.0
+        )
+        b_gk = tl.load(p_gk, boundary_check=(0, 1))
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_k = (b_k * exp2(b_gk_last[:, None] - b_gk)).to(b_k.dtype)
+        decay = exp2(b_gk_last)[:, None]
+        b_h0 *= decay
+        b_h1 *= decay
+        b_v0 = tl.load(p_v0, boundary_check=(0, 1))
+        b_v1 = tl.load(p_v1, boundary_check=(0, 1))
+        b_h0 += tl.dot(b_k, b_v0)
+        b_h1 += tl.dot(b_k, b_v1)
+
+
+@triton.jit(do_not_specialize=["T"])
+def chunk_fwd_kernel_h_v2_cumsum(
+    k,
+    v,
+    g,
+    gk_out,
+    h,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    """H state scan for V-group zero; computes and publishes local gk."""
+    i_k, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    NT = tl.cdiv(T, BT)
+    bos = i_b * T
+    i_v = 0
+    b_h0 = tl.zeros([BK, BV], dtype=tl.float32)
+    b_h1 = tl.zeros([BK, BV], dtype=tl.float32)
+    for i_t in range(NT):
+        o_h = ((i_b * NT + i_t) * H + i_h).to(tl.int64) * K * V
+        p_h0 = tl.make_block_ptr(h + o_h, (K, V), (V, 1), (i_k * BK, 0), (BK, BV), (1, 0))
+        p_h1 = tl.make_block_ptr(h + o_h, (K, V), (V, 1), (i_k * BK, BV), (BK, BV), (1, 0))
+        tl.store(p_h0, b_h0.to(p_h0.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
+
+        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
+        p_g = tl.make_block_ptr(g + (bos * H + i_h) * K, (K, T), (1, H * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
+        p_gk_out = tl.make_block_ptr(gk_out + (bos * H + i_h) * K, (K, T), (1, H * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
+        p_v0 = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, 0), (BT, BV), (1, 0))
+        p_v1 = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, BV), (BT, BV), (1, 0))
+
+        b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+        b_gk = tl.cumsum(b_g, axis=1) * 1.4426950216
+        tl.store(p_gk_out, b_gk.to(p_gk_out.dtype.element_ty), boundary_check=(0, 1))
+        last_idx = min((i_t + 1) * BT, T) - 1
+        # Make the producer/consumer dependency explicit before reading the
+        # freshly published chunk-end decay.  Without the barrier, Hygon can
+        # legally expose a stale gk_out value when T spans multiple chunks.
+        tl.debug_barrier()
+        b_gk_last = tl.load(
+            gk_out + (bos + last_idx) * H * K + i_h * K + i_k * BK + tl.arange(0, BK),
+            mask=(i_k * BK + tl.arange(0, BK) < K),
+            other=0.0,
+        )
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_k = (b_k * exp2(b_gk_last[:, None] - b_gk)).to(b_k.dtype)
+        decay = exp2(b_gk_last)[:, None]
+        b_h0 *= decay
+        b_h1 *= decay
+        b_v0 = tl.load(p_v0, boundary_check=(0, 1))
+        b_v1 = tl.load(p_v1, boundary_check=(0, 1))
+        b_h0 += tl.dot(b_k, b_v0)
+        b_h1 += tl.dot(b_k, b_v1)
 
 @triton.heuristics(
     {
@@ -490,6 +681,46 @@ def chunk_fwd_h(
         else None
     )
 
+    # For the forward-only GLA path, process two adjacent V tiles together.
+    # The shared K/gate tile is loaded once, reducing state-scan program count
+    # and global traffic for the wide states that dominate Hygon latency.
+    use_v2 = (
+        g is None
+        and g_gamma is None
+        and gk is not None
+        and gv is None
+        and h0 is None
+        and not output_final_state
+        and not state_v_first
+        and not states_in_fp32
+        and cu_seqlens is None
+        and V >= 256
+        and os.environ.get("FLAG_ATTN_GLA_H_V2", "1") != "0"
+    )
+
+    if use_v2:
+        grid_v2 = lambda meta: (
+            triton.cdiv(K, meta["BK"]),
+            triton.cdiv(V, 2 * meta["BV"]),
+            N * H,
+        )
+        chunk_fwd_kernel_h_v2[grid_v2](
+            k=k,
+            v=v,
+            gk=gk,
+            h=h,
+            cu_seqlens=cu_seqlens,
+            T=T,
+            H=H,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=32,
+            BV=64,
+            V_GROUP_OFFSET=0,
+        )
+        return h, ht
+
     def grid(meta):
         return (triton.cdiv(K, meta["BK"]), triton.cdiv(V, meta["BV"]), N * H)
 
@@ -518,6 +749,71 @@ def chunk_fwd_h(
         STATE_V_FIRST=state_v_first,
     )
     return h, ht
+
+def chunk_fwd_h_fused_cumsum(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute local gk and the wide-state H scan in one forward pipeline."""
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    BT = chunk_size
+    # The fused path is register-sensitive. Keep the conservative Stage 6
+    # tile for V=128/256. For very wide states, use the same BK tile with
+    # more warps: this parallelizes the long K reduction without the register
+    # pressure observed with BK=64. Environment overrides support Hygon
+    # micro-tuning without changing the default dispatch policy.
+    if V >= 512:
+        # On BW, BK=32 with eight warps is faster than widening BK to 64:
+        # it preserves occupancy while parallelizing the long K reduction.
+        BK, BV, num_warps = 32, 64, 8
+    else:
+        BK, BV, num_warps = 32, 64, 4
+    if os.environ.get("FLAG_ATTN_GLA_H_FUSED_BK"):
+        BK = int(os.environ["FLAG_ATTN_GLA_H_FUSED_BK"])
+    if os.environ.get("FLAG_ATTN_GLA_H_FUSED_BV"):
+        BV = int(os.environ["FLAG_ATTN_GLA_H_FUSED_BV"])
+    if os.environ.get("FLAG_ATTN_GLA_H_FUSED_WARPS"):
+        num_warps = int(os.environ["FLAG_ATTN_GLA_H_FUSED_WARPS"])
+    NT = triton.cdiv(T, BT)
+    h = k.new_empty(B, NT, H, K, V)
+    gk_out = torch.empty_like(g, dtype=torch.float)
+    chunk_fwd_kernel_h_v2_cumsum[(triton.cdiv(K, BK), B * H)](
+        k=k,
+        v=v,
+        g=g,
+        gk_out=gk_out,
+        h=h,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
+        BT=BT,
+        BK=BK,
+        BV=BV,
+        num_warps=num_warps,
+    )
+    n_groups = triton.cdiv(V, 2 * BV)
+    if n_groups > 1:
+        chunk_fwd_kernel_h_v2[(triton.cdiv(K, BK), n_groups - 1, B * H)](
+            k=k,
+            v=v,
+            gk=gk_out,
+            h=h,
+            cu_seqlens=None,
+            T=T,
+            H=H,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=BK,
+            BV=BV,
+            num_warps=num_warps,
+            V_GROUP_OFFSET=1,
+        )
+    return gk_out, h
+
 
 
 def chunk_bwd_dh(

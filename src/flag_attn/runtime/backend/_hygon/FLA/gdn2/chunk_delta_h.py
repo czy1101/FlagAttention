@@ -9,9 +9,9 @@ import triton
 import triton.language as tl
 
 from ..index import prepare_chunk_indices, prepare_chunk_offsets
-from ..triton_ops_helper import exp
+from ..triton_ops_helper import exp, exp2
 from ..utils import use_cuda_graph
-from flag_attn.gated_delta_rule.compat import libentry, libtuner
+from flag_attn.FLA.compat import libentry, libtuner
 from flag_attn.runtime.backend._hygon import device
 
 NUM_WARPS = [2, 4, 8, 16]
@@ -46,6 +46,8 @@ H_KERNEL_NUM_STAGES = [1,2,3] if IS_HIP_BACKEND else [2, 3, 4]
         "IS_VARLEN",
         "USE_INITIAL_STATE",
         "STORE_FINAL_STATE",
+        "GK_IS_BASE2",
+        "KG_HEAD_MAJOR",
     ],
     use_cuda_graph=use_cuda_graph,
 )
@@ -60,6 +62,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     h0,
     ht,
+    q,
+    A,
+    o,
+    scale,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -71,10 +77,13 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     USE_GK: tl.constexpr,
+    GK_IS_BASE2: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    FUSE_O: tl.constexpr,
+    KG_HEAD_MAJOR: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -103,13 +112,21 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     # calculate offset
     h += ((boh * H + i_h) * K * V).to(tl.int64)
     v += ((bos * H + i_h) * V).to(tl.int64)
-    k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
+    if KG_HEAD_MAJOR:
+        k += ((i_n * H + i_h) * T * K).to(tl.int64)
+    else:
+        k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
     w += ((bos * H + i_h) * K).to(tl.int64)
+    if FUSE_O:
+        q += ((bos * H + i_h) * K).to(tl.int64)
+        gq = gk + ((bos * H + i_h) * K).to(tl.int64)
+        A += ((bos * H + i_h) * BT).to(tl.int64)
+        o += ((bos * H + i_h) * V).to(tl.int64)
     if SAVE_NEW_VALUE:
         v_new += ((bos * H + i_h) * V).to(tl.int64)
     stride_v = H * V
     stride_h = H * K * V
-    stride_k = Hg * K
+    stride_k = K if KG_HEAD_MAJOR else Hg * K
     stride_w = H * K
     if USE_INITIAL_STATE:
         h0 = h0 + i_nh * K * V
@@ -138,40 +155,41 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # main recurrence
     for i_t in range(NT):
-        p_h1 = tl.make_block_ptr(
-            h + i_t * stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
-        )
-        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
-        if K > 64:
-            p_h2 = tl.make_block_ptr(
-                h + i_t * stride_h,
-                (K, V),
-                (V, 1),
-                (64, i_v * BV),
-                (64, BV),
-                (1, 0),
+        if not FUSE_O:
+            p_h1 = tl.make_block_ptr(
+                h + i_t * stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
             )
-            tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
-        if K > 128:
-            p_h3 = tl.make_block_ptr(
-                h + i_t * stride_h,
-                (K, V),
-                (V, 1),
-                (128, i_v * BV),
-                (64, BV),
-                (1, 0),
-            )
-            tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
-        if K > 192:
-            p_h4 = tl.make_block_ptr(
-                h + i_t * stride_h,
-                (K, V),
-                (V, 1),
-                (192, i_v * BV),
-                (64, BV),
-                (1, 0),
-            )
-            tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
+            if K > 64:
+                p_h2 = tl.make_block_ptr(
+                    h + i_t * stride_h,
+                    (K, V),
+                    (V, 1),
+                    (64, i_v * BV),
+                    (64, BV),
+                    (1, 0),
+                )
+                tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
+            if K > 128:
+                p_h3 = tl.make_block_ptr(
+                    h + i_t * stride_h,
+                    (K, V),
+                    (V, 1),
+                    (128, i_v * BV),
+                    (64, BV),
+                    (1, 0),
+                )
+                tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
+            if K > 192:
+                p_h4 = tl.make_block_ptr(
+                    h + i_t * stride_h,
+                    (K, V),
+                    (V, 1),
+                    (192, i_v * BV),
+                    (64, BV),
+                    (1, 0),
+                )
+                tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
 
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
@@ -200,6 +218,62 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             v, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
         )
         b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
+
+        if FUSE_O:
+            # The state in b_h* is the state at the beginning of this chunk,
+            # which is exactly the state consumed by the regular O kernel.
+            # Compute q*exp2(g) @ h and Aqk @ v_new before advancing the
+            # recurrence, avoiding the materialized h and v_new tensors.
+            b_o = tl.zeros([BT, BV], dtype=tl.float32)
+            p_q = tl.make_block_ptr(
+                q, (T, K), (H * K, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+            )
+            p_gq = tl.make_block_ptr(
+                gq,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, 0),
+                (BT, 64),
+                (1, 0),
+            )
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            b_gq = tl.load(p_gq, boundary_check=(0, 1)).to(tl.float32)
+            b_o += tl.dot((b_q * exp2(b_gq)).to(b_q.dtype), b_h1.to(b_q.dtype))
+            if K > 64:
+                p_q = tl.make_block_ptr(
+                    q, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0)
+                )
+                p_gq = tl.make_block_ptr(
+                    gq,
+                    (T, K),
+                    (H * K, 1),
+                    (i_t * BT, 64),
+                    (BT, 64),
+                    (1, 0),
+                )
+                b_q = tl.load(p_q, boundary_check=(0, 1))
+                b_gq = tl.load(p_gq, boundary_check=(0, 1)).to(tl.float32)
+                b_o += tl.dot((b_q * exp2(b_gq)).to(b_q.dtype), b_h2.to(b_q.dtype))
+            p_A = tl.make_block_ptr(
+                A,
+                (T, BT),
+                (H * BT, 1),
+                (i_t * BT, 0),
+                (BT, BT),
+                (1, 0),
+            )
+            m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
+            b_A = tl.where(m_s, tl.load(p_A, boundary_check=(0, 1)), 0.0)
+            b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v)
+            p_o = tl.make_block_ptr(
+                o,
+                (T, V),
+                (H * V, 1),
+                (i_t * BT, i_v * BV),
+                (BT, BV),
+                (1, 0),
+            )
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
         if SAVE_NEW_VALUE:
             p_v = tl.make_block_ptr(
@@ -237,7 +311,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 mask=(o_k1 < K),
                 other=0.0,
             ).to(tl.float32)
-            b_h1 *= exp(b_gk_last1)[:, None]
+            if GK_IS_BASE2:
+                b_h1 *= exp2(b_gk_last1)[:, None]
+            else:
+                b_h1 *= exp(b_gk_last1)[:, None]
             if K > 64:
                 o_k2 = 64 + o_k1
                 b_gk_last2 = tl.load(
@@ -245,7 +322,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k2 < K),
                     other=0.0,
                 ).to(tl.float32)
-                b_h2 *= exp(b_gk_last2)[:, None]
+                if GK_IS_BASE2:
+                    b_h2 *= exp2(b_gk_last2)[:, None]
+                else:
+                    b_h2 *= exp(b_gk_last2)[:, None]
             if K > 128:
                 o_k3 = 128 + o_k1
                 b_gk_last3 = tl.load(
@@ -253,7 +333,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k3 < K),
                     other=0.0,
                 ).to(tl.float32)
-                b_h3 *= exp(b_gk_last3)[:, None]
+                if GK_IS_BASE2:
+                    b_h3 *= exp2(b_gk_last3)[:, None]
+                else:
+                    b_h3 *= exp(b_gk_last3)[:, None]
             if K > 192:
                 o_k4 = 192 + o_k1
                 b_gk_last4 = tl.load(
@@ -261,7 +344,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k4 < K),
                     other=0.0,
                 ).to(tl.float32)
-                b_h4 *= exp(b_gk_last4)[:, None]
+                if GK_IS_BASE2:
+                    b_h4 *= exp2(b_gk_last4)[:, None]
+                else:
+                    b_h4 *= exp(b_gk_last4)[:, None]
         b_v = b_v.to(k.dtype.element_ty)
 
         p_k = tl.make_block_ptr(
@@ -319,6 +405,13 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
+    gk_base2: bool = False,
+    scale: float = 1.0,
+    q: torch.Tensor | None = None,
+    A: torch.Tensor | None = None,
+    o: torch.Tensor | None = None,
+    fuse_o: bool = False,
+    kg_head_major: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -342,12 +435,21 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, K, V)
+    if fuse_o:
+        if q is None or A is None or o is None or gk is None:
+            raise ValueError("fuse_o requires q, A, o and gk tensors")
+    # The fused O kernel does not materialize the per-chunk state history.
+    # A one-element placeholder keeps the pointer ABI valid; the FUSE_O
+    # specialization removes all h stores.
+    if fuse_o:
+        h = k.new_empty(1)
+    else:
+        h = k.new_empty(B, NT, H, K, V)
     final_state = (
         k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
     )
 
-    v_new = torch.empty_like(u) if save_new_value else None
+    v_new = torch.empty_like(u) if save_new_value and not fuse_o else None
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
@@ -359,9 +461,14 @@ def chunk_gated_delta_rule_fwd_h(
         v_new=v_new,
         g=g,
         gk=gk,
+        GK_IS_BASE2=gk_base2,
         h=h,
         h0=initial_state,
         ht=final_state,
+        q=q,
+        A=A,
+        o=o,
+        scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
@@ -370,5 +477,7 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
+        FUSE_O=fuse_o,
+        KG_HEAD_MAJOR=kg_head_major,
     )
     return h, v_new, final_state

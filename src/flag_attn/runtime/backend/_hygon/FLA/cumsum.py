@@ -11,7 +11,7 @@ import triton.language as tl
 
 from .index import prepare_chunk_indices
 from .utils import check_shared_mem, input_guard
-from flag_attn.gated_delta_rule.compat import libentry, libtuner
+from flag_attn.FLA.compat import libentry, libtuner
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -29,6 +29,7 @@ def chunk_local_cumsum_scalar_kernel(
     cu_seqlens,
     chunk_indices,
     T,
+    scale,
     B: tl.constexpr,
     H: tl.constexpr,
     BT: tl.constexpr,
@@ -63,6 +64,7 @@ def chunk_local_cumsum_scalar_kernel(
         p_o = tl.make_block_ptr(o + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     # [BT]
     b_s = tl.load(p_s, boundary_check=(0,)).to(tl.float32)
+    b_s *= scale
     b_o = tl.cumsum(b_s, axis=0)
     if REVERSE:
         b_z = tl.sum(b_s, axis=0)
@@ -86,6 +88,7 @@ def chunk_local_cumsum_vector_kernel(
     cu_seqlens,
     chunk_indices,
     T,
+    scale,
     B: tl.constexpr,
     H: tl.constexpr,
     S: tl.constexpr,
@@ -152,6 +155,7 @@ def chunk_local_cumsum_vector_kernel(
         )
     # [BT, BS]
     b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+    b_s *= scale
     b_o = tl.dot(m_s, b_s, allow_tf32=False)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
@@ -163,6 +167,7 @@ def chunk_local_cumsum_scalar(
     cu_seqlens: torch.Tensor | None = None,
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
+    scale: float = 1.0,
 ) -> torch.Tensor:
     if head_first:
         B, H, T = g.shape
@@ -184,6 +189,7 @@ def chunk_local_cumsum_scalar(
         cu_seqlens,
         chunk_indices,
         T=T,
+        scale=scale,
         B=B,
         H=H,
         BT=BT,
@@ -200,6 +206,7 @@ def chunk_local_cumsum_vector(
     cu_seqlens: torch.Tensor | None = None,
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
+    scale: float = 1.0,
 ) -> torch.Tensor:
     if head_first:
         B, H, T, S = g.shape
@@ -230,6 +237,7 @@ def chunk_local_cumsum_vector(
         cu_seqlens,
         chunk_indices,
         T=T,
+        scale=scale,
         B=B,
         H=H,
         S=S,
@@ -248,6 +256,7 @@ def chunk_local_cumsum(
     cu_seqlens: torch.Tensor | None = None,
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
+    scale: float = 1.0,
     **kwargs,
 ) -> torch.Tensor:
     if not head_first and g.shape[1] < g.shape[2]:
@@ -265,11 +274,11 @@ def chunk_local_cumsum(
         ), "Only batch size 1 is supported when cu_seqlens are provided"
     if len(g.shape) == 3:
         return chunk_local_cumsum_scalar(
-            g, chunk_size, reverse, cu_seqlens, head_first, output_dtype
+            g, chunk_size, reverse, cu_seqlens, head_first, output_dtype, scale
         )
     elif len(g.shape) == 4:
         return chunk_local_cumsum_vector(
-            g, chunk_size, reverse, cu_seqlens, head_first, output_dtype
+            g, chunk_size, reverse, cu_seqlens, head_first, output_dtype, scale
         )
     else:
         raise ValueError(
