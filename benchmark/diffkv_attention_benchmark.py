@@ -6,11 +6,12 @@
 
 Run from the FlagAttention repository root with::
 
-    pytest -q -s benchmark/diffkv_attention_benchmark.py
+    pytest -q -s -m diffkv_attention \\
+        benchmark/diffkv_attention_benchmark.py
 
-The same benchmark is also available as a script::
+The same named benchmark adapter can also be invoked explicitly::
 
-    python benchmark/diffkv_attention_benchmark.py
+    python -c "from benchmark.diffkv_attention_benchmark import DiffKVBenchmark; DiffKVBenchmark(op_name='diffkv_attention').run()"
 
 The benchmark follows the GLA benchmark convention: edit the constants in
 ``DEFAULT_BENCHMARK_CONFIG`` below instead of passing command-line options.
@@ -74,6 +75,7 @@ if str(ROOT / "src") not in sys.path:
 from flag_attn.diffkv_attention.api import (  # noqa: E402
     DEFAULT_LAYOUT,
     LAUNCH,
+    OP_NAME,
     SUPPORTED_PATHS,
 )
 
@@ -94,6 +96,7 @@ class BenchmarkConfig:
     inputs are still validated in ``diffkv_attention.api``.
     """
 
+    op_name: str = OP_NAME
     mode: str = "both"
     paths: tuple[str, ...] = ("2d", "3d")
     batches: tuple[int, ...] = (1, 8, 16, 32)
@@ -603,9 +606,13 @@ def load_diffkv_backend(name: str):
 
 def run_benchmark(config: BenchmarkConfig | None = None):
     # The default path is intentionally fixed, like the MSA/GLA benchmarks.
-    # An explicit config remains useful for local diagnostics, but it is not
-    # part of the normal pytest/script interface.
+    # An explicit config remains useful for local diagnostics, while the
+    # named adapter and pytest entry point keep the public op_name stable.
     config = DEFAULT_BENCHMARK_CONFIG if config is None else config
+    if config.op_name != OP_NAME:
+        raise ValueError(
+            f"unsupported benchmark op_name={config.op_name!r}; expected {OP_NAME!r}"
+        )
     if not torch.cuda.is_available():
         raise RuntimeError("DiffKV benchmark requires CUDA")
     torch_device = torch.device(config.device)
@@ -670,6 +677,7 @@ def run_benchmark(config: BenchmarkConfig | None = None):
             f"Reason: {diffkv_impl.get_diffkv_backend_info()['tle_error']}"
         )
     print(
+        f"Operator: {config.op_name}\n"
         "Timing: triton.testing.do_bench around preallocated operators; "
         "adaptive per-call CUDA events and cache clear"
     )
@@ -767,6 +775,7 @@ def run_benchmark(config: BenchmarkConfig | None = None):
                 )
                 for path, measurement in measurements.items():
                     rows.append({
+                        "op_name": config.op_name,
                         "mode": mode,
                         "batch": batch,
                         "seq_len": seq_len,
@@ -842,6 +851,7 @@ def run_benchmark(config: BenchmarkConfig | None = None):
 DEFAULT_BENCHMARK_CONFIG = BenchmarkConfig(
     # Edit this object to change the default benchmark, following the GLA
     # benchmark convention instead of passing command-line arguments.
+    op_name=OP_NAME,
     mode="both",
     paths=("2d", "3d"),
     batches=(1, 8, 16, 32),
@@ -869,14 +879,45 @@ DEFAULT_BENCHMARK_CONFIG = BenchmarkConfig(
 )
 
 
+class DiffKVBenchmark:
+    """Named benchmark adapter following the repository benchmark pattern.
+
+    The DiffKV benchmark compares multiple providers and launch paths, so it
+    cannot use the unary ``Benchmark`` harness directly.  It still exposes
+    the same explicit ``op_name`` contract used by the standard benchmarks.
+    """
+
+    def __init__(
+        self,
+        op_name: str = OP_NAME,
+        config: BenchmarkConfig = DEFAULT_BENCHMARK_CONFIG,
+    ) -> None:
+        if op_name != OP_NAME:
+            raise ValueError(
+                f"unsupported benchmark op_name={op_name!r}; expected {OP_NAME!r}"
+            )
+        if config.op_name != op_name:
+            raise ValueError(
+                f"BenchmarkConfig.op_name={config.op_name!r} does not match "
+                f"{op_name!r}"
+            )
+        self.op_name = op_name
+        self.config = config
+
+    def run(self):
+        return run_benchmark(self.config)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="DiffKV benchmark requires CUDA",
 )
+@pytest.mark.diffkv_attention
 def test_perf_diffkv_attention():
     """Run the default DiffKV benchmark under pytest."""
-    run_benchmark(DEFAULT_BENCHMARK_CONFIG)
+    bench = DiffKVBenchmark(op_name=OP_NAME)
+    bench.run()
 
 
 if __name__ == "__main__":
-    run_benchmark(DEFAULT_BENCHMARK_CONFIG)
+    DiffKVBenchmark(op_name=OP_NAME).run()

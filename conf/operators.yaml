@@ -50,6 +50,22 @@ ops:
       - tests/flag_attn/test_chunk_gla.py::test_chunk_state_v_first
       - tests/flag_attn/test_chunk_gla.py::test_chunk_varlen
     benchmark: benchmark/chunk_gla_benchmark.py
+  - id: diffkv_attention
+    description: Run the Triton/TLE DiffKV Attention decode operator and benchmark.
+    for:
+      - diffkv_attention
+    labels:
+      - fused
+      - Attention
+      - DiffKV
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_diffkv_attention.py
+    benchmark: benchmark/diffkv_attention_benchmark.py
   - id: flash_attention
     description: Run FlashAttention forward, including its auxiliary-output path.
     for:

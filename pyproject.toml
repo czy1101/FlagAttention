@@ -66,6 +66,9 @@ pythonpath = [
     "src",
     "tests/flag_attn",
 ]
+markers = [
+    "diffkv_attention: DiffKV Attention correctness and performance tests",
+]
 
 [tool.ruff]
 ignore = ["E741"]

@@ -66,15 +66,6 @@ from .api import (
     SUPPORTED_BACKENDS as _SUPPORTED_BACKENDS,
 )
 
-# ---------------------------------------------------------------------------
-# Optional TLE backend
-# ---------------------------------------------------------------------------
-# Follow the operator convention used by the other FlagAttention kernels:
-# detect the optional extension once, enable the TLE path only when the
-# requested Triton API is available, and keep a standard Triton fallback.
-# ``FLAG_ATTN_DIFFKV_TLE=0`` disables TLE for controlled comparisons.
-# ``FLAG_ATTN_DIFFKV_BACKEND`` is retained as a compatibility override for
-# existing benchmark scripts (``auto``, ``tle`` or ``triton``).
 DiffKVPath = Literal["2d", "3d"]
 DiffKVBackend = Literal["auto", "tle", "triton"]
 

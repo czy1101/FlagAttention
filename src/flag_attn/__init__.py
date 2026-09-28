@@ -24,7 +24,10 @@ from flag_attn.piecewise import attention as piecewise_attention # noqa: F401
 from flag_attn.flash import attention as flash_attention # noqa: F401
 from flag_attn.split_kv import attention as flash_attention_split_kv # noqa: F401
 from flag_attn.paged import attention as paged_attention # noqa: F401
-from flag_attn.diffkv_attention.api import diffkv_attention # noqa: F401
+from flag_attn.diffkv_attention.api import ( # noqa: F401
+    OP_NAME,
+    diffkv_attention,
+)
 import importlib
 from flag_attn.minimax_sparse_attention import (
     minimax_m3_index_decode as minimax_m3_index_decode,
@@ -74,6 +77,7 @@ __all__ = [
     "flash_attention_split_kv",
     "paged_attention",
     "diffkv_attention",
+    "OP_NAME",
     "chunk_gated_delta_rule",
     "chunk_gla",
     "unified_attention_diffkv",

@@ -18,6 +18,7 @@
 from .api import (
     DEFAULT_LAYOUT,
     DiffKVLayout,
+    OP_NAME,
     diffkv_attention,
     unified_attention_diffkv,
     unified_attention_diffkv_fallback,
@@ -25,6 +26,7 @@ from .api import (
 )
 
 __all__ = [
+    "OP_NAME",
     "diffkv_attention",
     "unified_attention_diffkv",
     "unified_attention_diffkv_tle",

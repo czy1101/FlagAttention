@@ -16,7 +16,8 @@
 from __future__ import annotations
 
 # Run the DiffKV correctness tests from the repository root:
-#   pytest -q tests/flag_attn/test_diffkv_attention.py
+#   pytest -q -m diffkv_attention \\
+#     tests/flag_attn/test_diffkv_attention.py
 
 import importlib
 import pathlib
@@ -28,12 +29,17 @@ import torch
 
 triton = pytest.importorskip("triton")
 
+# Keep the pytest marker aligned with ``OP_NAME`` and the ``id``/``for`` entry
+# in ``conf/operators.yaml``.
+pytestmark = pytest.mark.diffkv_attention
+
 # Keep the test runnable directly from a source checkout.
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from flag_attn.diffkv_attention.api import (
+    OP_NAME,
     diffkv_attention,
     unified_attention_diffkv,
 )
@@ -52,6 +58,14 @@ NUM_QUERY_HEADS = 64
 HEAD_SIZE_QK = 192
 HEAD_SIZE_V = 128
 BLOCK_SIZE = 16
+
+
+def test_diffkv_op_name_export():
+    """The public operator is addressable by its standard benchmark name."""
+    import flag_attn
+
+    assert OP_NAME == "diffkv_attention"
+    assert getattr(flag_attn, OP_NAME) is diffkv_attention
 
 
 def _reference(query, key_cache, value_cache, context_lens, block_tables,

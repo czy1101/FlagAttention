@@ -33,6 +33,12 @@ DiffKVMode = Literal["full", "swa"]
 DiffKVBackend = Literal["auto", "tle", "triton"]
 DiffKVPath = Literal["2d", "3d"]
 
+# Stable operator identifier shared by the public API, pytest marker,
+# benchmark adapter, and ``conf/operators.yaml`` inventory.  Keep this
+# separate from Triton kernel function names so callers do not depend on
+# implementation details.
+OP_NAME: Final = "diffkv_attention"
+
 
 @dataclass(frozen=True)
 class DiffKVLayout:
@@ -416,6 +422,7 @@ def diffkv_attention(
 
 
 __all__ = [
+    "OP_NAME",
     "diffkv_attention",
     "unified_attention_diffkv",
     "unified_attention_diffkv_tle",
