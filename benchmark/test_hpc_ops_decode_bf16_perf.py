@@ -45,7 +45,7 @@ from flag_attn.hpc_ops_attention.decode.static.bf16_static import (  # noqa: E40
     HEAD_DIM,
     OFFICIAL_CASES,
     StaticBF16Inputs,
-    attention_decode_bf16_tle,
+    attention_decode_bf16_static,
     prepare_static_bf16_workspace,
 )
 
@@ -321,6 +321,8 @@ def report_performance_results():
     _print_performance_table()
 
 
+@pytest.mark.attention_decode_bf16_static
+@pytest.mark.attention_decode_bf16_dynamic
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("mtp", BENCH_MTP, ids=lambda value: f"mtp{value}")
 @pytest.mark.parametrize("case", BENCH_CASES)
@@ -351,7 +353,7 @@ def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
                 output=cuda_out,
             )
         )
-        tle_call = lambda: attention_decode_bf16_tle(inputs, workspace)
+        tle_call = lambda: attention_decode_bf16_static(inputs, workspace)
     else:
         inputs = DynamicBF16Inputs(
             panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens, layout,

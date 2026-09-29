@@ -393,6 +393,7 @@ def report_performance_results():
     _print_performance_table()
 
 
+@pytest.mark.attention_decode_fp8
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("mtp", BENCH_MTP, ids=lambda value: f"mtp{value}")
 @pytest.mark.parametrize("quant_type", BENCH_QUANT_TYPES)

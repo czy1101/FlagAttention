@@ -68,7 +68,7 @@ _IMPLEMENTATIONS = {
     "static": _DecodeImplementation(
         bf16_static.StaticBF16Inputs,
         bf16_static.prepare_static_bf16_workspace,
-        bf16_static.attention_decode_bf16_tle,
+        bf16_static.attention_decode_bf16_static,
     ),
     "dynamic": _DecodeImplementation(
         bf16_dynamic.DynamicBF16Inputs,
@@ -226,6 +226,8 @@ def _pytorch_reference(panel: _Panel, num_seq_q: int) -> torch.Tensor:
     return output.reshape_as(panel.q)
 
 
+@pytest.mark.attention_decode_bf16_static
+@pytest.mark.attention_decode_bf16_dynamic
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability()[0] < 9,

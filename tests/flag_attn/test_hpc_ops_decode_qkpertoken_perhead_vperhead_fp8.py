@@ -375,6 +375,7 @@ def _pytorch_reference(panel, mtp: int, quant_type: str) -> torch.Tensor:
     )
 
 
+@pytest.mark.attention_decode_fp8
 @pytest.mark.skipif(
     not _supports_sm90_fp8_backend(), reason="requires SM90 FP8 support"
 )

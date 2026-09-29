@@ -27,6 +27,7 @@ Q_HEADS = 8
 KV_HEADS = 2
 
 
+@pytest.mark.attention_with_kvcache_blocksparse_prefill_fp8
 def test_attention_blocksparse_prefill_fp8_rejects_cpu():
     q = torch.empty(1, 1, HEAD_DIM)
     cache = torch.empty(1, 32, 1, HEAD_DIM)
@@ -211,6 +212,7 @@ def _reference(args):
     return output
 
 
+@pytest.mark.attention_with_kvcache_blocksparse_prefill_fp8
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("quant_type", [0, 1])
 @pytest.mark.parametrize("kv_layout", ["nhd", "hnd"])

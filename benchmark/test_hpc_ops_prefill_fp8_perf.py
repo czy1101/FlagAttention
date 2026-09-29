@@ -339,6 +339,7 @@ def _bench_cuda_graph(call_fn, warmup, repetitions):
     return float(median(start.elapsed_time(end) for start, end in events))
 
 
+@pytest.mark.attention_with_kvcache_blocksparse_prefill_fp8
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("q_len,kv_len", CASES)
 @pytest.mark.parametrize("quant_type", [0, 1])

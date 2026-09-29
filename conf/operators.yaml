@@ -13,6 +13,68 @@
 # limitations under the License.
 
 ops:
+  - id: attention_with_kvcache_blocksparse_prefill_fp8
+    description: Triton-TLE FP8 block-sparse prefill attention implementation compatible with Tencent Hy3 HPC-Ops Attention Operator. Supports paged KV cache, NHD/HND KV-cache layouts, multiple quantization modes, and optional block masking. Its tests and benchmarks require PyTorch 2.7.0.
+    for:
+      - attention_with_kvcache_blocksparse_prefill_fp8
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_hpc_ops_prefill_fp8.py::test_attention_blocksparse_prefill_fp8_rejects_cpu
+      - tests/flag_attn/test_hpc_ops_prefill_fp8.py::test_attention_blocksparse_prefill_fp8
+    benchmark: benchmark/test_hpc_ops_prefill_fp8_perf.py
+  - id: attention_decode_bf16_static
+    description: Triton-TLE BF16 static Split-K decode attention implementation compatible with Tencent Hy3 HPC-Ops Attention Operator. Supports paged KV cache, MTP decoding (MTP=1/2/3), and NHD/HND KV-cache layouts. Its tests and benchmarks require PyTorch 2.7.0.
+    for:
+      - attention_decode_bf16_static
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_hpc_ops_decode_bf16.py::test_attn_bf16_sm90
+    benchmark: benchmark/test_hpc_ops_decode_bf16_perf.py
+  - id: attention_decode_bf16_dynamic
+    description: Triton-TLE BF16 dynamic decode attention implementation compatible with Tencent Hy3 HPC-Ops Attention Operator. Uses workload-aware task scheduling for variable-length KV-cache workloads and supports MTP decoding (MTP=1/2/3) with NHD/HND KV-cache layouts. Its tests and benchmarks require PyTorch 2.7.0.
+    for:
+      - attention_decode_bf16_dynamic
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_hpc_ops_decode_bf16.py::test_attn_bf16_sm90
+    benchmark: benchmark/test_hpc_ops_decode_bf16_perf.py
+  - id: attention_decode_fp8
+    description: Triton-TLE FP8 decode attention implementation compatible with Tencent Hy3 HPC-Ops Attention Operator. Supports paged KV cache, static and dynamic scheduling, MTP decoding (MTP=1/2/4), multiple quantization modes, and NHD/HND KV-cache layouts. Its tests and benchmarks require PyTorch 2.7.0.
+    for:
+      - attention_decode_fp8
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_hpc_ops_decode_qkpertoken_perhead_vperhead_fp8.py::test_attn_fp8_sm90
+      - tests/flag_attn/test_hpc_ops_decode_qpertoken_perhead_kvpertensor_fp8.py::test_attn_fp8_sm90
+    benchmark: benchmark/test_hpc_ops_decode_fp8_perf.py
   - id: chunk_gated_delta_rule_fwd
     description: Run the forward path for chunked gated delta rule attention.
     for:

@@ -1696,13 +1696,12 @@ def prepare_static_bf16_workspace(inputs):
     return _bf16_entry__prepare_static_bf16_workspace(inputs)
 
 
-def attention_decode_bf16_tle(inputs, workspace):
+def attention_decode_bf16_static(inputs, workspace):
     if isinstance(workspace, PureTritonMTP1Workspace):
         return attention_decode_pure_triton_mtp1(inputs, workspace)
     if isinstance(workspace, PureTritonMTPWorkspace):
         return attention_decode_pure_triton_mtp(inputs, workspace)
     return _bf16_entry__attention_decode_bf16_tle(inputs, workspace)
-
 
 select_static_bf16_policy = _bf16_entry__select_static_bf16_policy
 __all__ = [
@@ -1712,7 +1711,7 @@ __all__ = [
     "StaticBF16Inputs",
     "StaticBF16Policy",
     "StaticBF16Workspace",
-    "attention_decode_bf16_tle",
+    "attention_decode_bf16_static",
     "prepare_static_bf16_workspace",
     "select_static_bf16_policy",
 ]
