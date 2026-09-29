@@ -15,6 +15,8 @@
 import inspect
 import os
 
+# torch before triton: triton's Ascend backend imports torch, and torch_npu's autoload fails there
+import torch  # noqa: F401
 import triton
 
 from .backend import DeviceDetector
