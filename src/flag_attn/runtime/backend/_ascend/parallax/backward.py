@@ -8,18 +8,22 @@ import torch
 
 
 @triton.jit
-def _preprocess_kernel(o, barv, grad_o, delta_t, delta_b, T: tl.constexpr, HQ: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
-    row = tl.program_id(0)
+def _preprocess_kernel(o, barv, grad_o, delta_t, delta_b, T: tl.constexpr, HQ: tl.constexpr,
+                       D: tl.constexpr, BD: tl.constexpr, BT: tl.constexpr):
+    tiles_per_batch = tl.cdiv(T, BT)
+    tile = tl.program_id(0) % tiles_per_batch
+    batch = tl.program_id(0) // tiles_per_batch
     h = tl.program_id(1)
+    rows = tile * BT + tl.arange(0, BT)
     d = tl.arange(0, BD)
-    x = row * HQ + h
-    offsets = x * D + d
-    mask = d < D
+    x = batch * T * HQ + rows * HQ + h
+    offsets = x[:, None] * D + d[None, :]
+    mask = (rows[:, None] < T) & (d[None, :] < D)
     go = tl.load(grad_o + offsets, mask, 0).to(tl.float32)
     out = tl.load(o + offsets, mask, 0).to(tl.float32)
     bv = tl.load(barv + offsets, mask, 0).to(tl.float32)
-    tl.store(delta_t + x, tl.sum(go * out, axis=0))
-    tl.store(delta_b + x, tl.sum(go * bv, axis=0))
+    tl.store(delta_t + x, tl.sum(go * out, axis=1), rows < T)
+    tl.store(delta_b + x, tl.sum(go * bv, axis=1), rows < T)
 
 
 @triton.jit
@@ -65,16 +69,16 @@ def _dqr_kernel(q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_
         if WINDOW >= 0:
             allowed = allowed & (ks[None, :] >= rows[:, None] - WINDOW + 1)
         scores = tl.dot(qv, tl.trans(kv), out_dtype=tl.float32) * (scale * 1.4426950408889634)
-        scores = tl.where(allowed & rowmask[:, None], scores, float("-inf"))
-        p = tl.where(allowed & rowmask[:, None], tl.math.exp2(scores - maxv) / safe_norm, 0.0)
+        if WINDOW < 0 and block < tile:
+            p = tl.math.exp2(scores - maxv) / safe_norm
+            p = tl.where(rowmask[:, None], p, 0.0)
+        else:
+            p = tl.where(allowed & rowmask[:, None], tl.math.exp2(scores - maxv) / safe_norm, 0.0)
         a = tl.dot(go, tl.trans(vv), out_dtype=tl.float32)
-        a = tl.where(allowed & rowmask[:, None], a, 0.0)
         delta = a - db
         gr += tl.dot((-p * delta).to(kv.dtype), kv, out_dtype=tl.float32)
         rk = tl.dot(rv, tl.trans(kv), out_dtype=tl.float32)
-        rk = tl.where(allowed & rowmask[:, None], rk, 0.0)
         gl = p * (a - dt + (bt - rk) * delta)
-        gl = tl.where(allowed & rowmask[:, None], gl, 0.0)
         gq += tl.dot(gl.to(kv.dtype), kv, out_dtype=tl.float32)
     gq *= scale
     tl.store(grad_q + qoff, gq, rowmask[:, None] & (ds[None, :] < D))
@@ -108,40 +112,102 @@ def _dkv_kernel(q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_k, grad_
     if WINDOW >= 0:
         last_query = tl.minimum((tile + 1) * BS + WINDOW - 1, T)
     last_query_block = tl.cdiv(last_query, BT)
-    for block in range(first_query_block, last_query_block):
-        qs = block * BT + rows
-        rowmask = qs < T
-        qoff = bos_q + qs[:, None] * HQ * D + ds[None, :]
-        qv = tl.load(q + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
-        rv = tl.load(r + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
-        go = tl.load(grad_o + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
-        dt = tl.load(delta_t + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
-        db = tl.load(delta_b + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
-        norm = tl.load(d1 + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
-        maxv = tl.load(m + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
-        bt = tl.load(bart + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
-        allowed = (qs[:, None] >= cols[None, :]) & rowmask[:, None] & colmask[None, :]
-        if WINDOW >= 0:
+    if WINDOW < 0:
+        # Only the first query block intersects the causal diagonal. Later blocks
+        # see every key in this tile and can skip the pairwise causal mask.
+        causal_end = tl.minimum(tl.cdiv((tile + 1) * BS, BT), last_query_block)
+        for block in range(first_query_block, causal_end):
+            qs = block * BT + rows
+            rowmask = qs < T
+            qoff = bos_q + qs[:, None] * HQ * D + ds[None, :]
+            qv = tl.load(q + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
+            rv = tl.load(r + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
+            go = tl.load(grad_o + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
+            dt = tl.load(delta_t + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            db = tl.load(delta_b + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            norm = tl.load(d1 + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            maxv = tl.load(m + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            bt = tl.load(bart + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            allowed = (qs[:, None] >= cols[None, :]) & rowmask[:, None] & colmask[None, :]
+            scores = tl.dot(qv, tl.trans(kv), out_dtype=tl.float32) * (scale * 1.4426950408889634)
+            scores = tl.where(allowed, scores, float("-inf"))
+            safe_norm = tl.where(norm > 0.0, norm, 1.0)
+            p = tl.where(allowed, tl.math.exp2(scores - maxv) / safe_norm, 0.0)
+            rk = tl.dot(rv, tl.trans(kv), out_dtype=tl.float32)
+            a = tl.dot(go, tl.trans(vv), out_dtype=tl.float32)
+            rk = tl.where(allowed, rk, 0.0)
+            a = tl.where(allowed, a, 0.0)
+            delta = a - db
+            correction = bt - rk
+            gl = p * (a - dt + correction * delta) * scale
+            gu = -p * delta
+            weights = p * (1.0 + correction)
+            gl = tl.where(allowed, gl, 0.0)
+            gu = tl.where(allowed, gu, 0.0)
+            weights = tl.where(allowed, weights, 0.0)
+            gk += tl.dot(tl.trans(gl).to(qv.dtype), qv, out_dtype=tl.float32)
+            gk += tl.dot(tl.trans(gu).to(rv.dtype), rv, out_dtype=tl.float32)
+            gv += tl.dot(tl.trans(weights).to(go.dtype), go, out_dtype=tl.float32)
+        for block in range(causal_end, last_query_block):
+            qs = block * BT + rows
+            rowmask = qs < T
+            qoff = bos_q + qs[:, None] * HQ * D + ds[None, :]
+            qv = tl.load(q + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
+            rv = tl.load(r + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
+            go = tl.load(grad_o + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
+            dt = tl.load(delta_t + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            db = tl.load(delta_b + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            norm = tl.load(d1 + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            maxv = tl.load(m + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            bt = tl.load(bart + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            scores = tl.dot(qv, tl.trans(kv), out_dtype=tl.float32) * (scale * 1.4426950408889634)
+            safe_norm = tl.where(norm > 0.0, norm, 1.0)
+            p = tl.math.exp2(scores - maxv) / safe_norm
+            p = tl.where(rowmask[:, None], p, 0.0)
+            rk = tl.dot(rv, tl.trans(kv), out_dtype=tl.float32)
+            a = tl.dot(go, tl.trans(vv), out_dtype=tl.float32)
+            delta = a - db
+            correction = bt - rk
+            gl = p * (a - dt + correction * delta) * scale
+            gu = -p * delta
+            weights = p * (1.0 + correction)
+            gk += tl.dot(tl.trans(gl).to(qv.dtype), qv, out_dtype=tl.float32)
+            gk += tl.dot(tl.trans(gu).to(rv.dtype), rv, out_dtype=tl.float32)
+            gv += tl.dot(tl.trans(weights).to(go.dtype), go, out_dtype=tl.float32)
+    else:
+        for block in range(first_query_block, last_query_block):
+            qs = block * BT + rows
+            rowmask = qs < T
+            qoff = bos_q + qs[:, None] * HQ * D + ds[None, :]
+            qv = tl.load(q + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
+            rv = tl.load(r + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
+            go = tl.load(grad_o + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
+            dt = tl.load(delta_t + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            db = tl.load(delta_b + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            norm = tl.load(d1 + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            maxv = tl.load(m + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            bt = tl.load(bart + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            allowed = (qs[:, None] >= cols[None, :]) & rowmask[:, None] & colmask[None, :]
             allowed = allowed & (cols[None, :] >= qs[:, None] - WINDOW + 1)
-        scores = tl.dot(qv, tl.trans(kv), out_dtype=tl.float32) * (scale * 1.4426950408889634)
-        scores = tl.where(allowed, scores, float("-inf"))
-        safe_norm = tl.where(norm > 0.0, norm, 1.0)
-        p = tl.where(allowed, tl.math.exp2(scores - maxv) / safe_norm, 0.0)
-        rk = tl.dot(rv, tl.trans(kv), out_dtype=tl.float32)
-        a = tl.dot(go, tl.trans(vv), out_dtype=tl.float32)
-        rk = tl.where(allowed, rk, 0.0)
-        a = tl.where(allowed, a, 0.0)
-        delta = a - db
-        correction = bt - rk
-        gl = p * (a - dt + correction * delta) * scale
-        gu = -p * delta
-        weights = p * (1.0 + correction)
-        gl = tl.where(allowed, gl, 0.0)
-        gu = tl.where(allowed, gu, 0.0)
-        weights = tl.where(allowed, weights, 0.0)
-        gk += tl.dot(tl.trans(gl).to(qv.dtype), qv, out_dtype=tl.float32)
-        gk += tl.dot(tl.trans(gu).to(rv.dtype), rv, out_dtype=tl.float32)
-        gv += tl.dot(tl.trans(weights).to(go.dtype), go, out_dtype=tl.float32)
+            scores = tl.dot(qv, tl.trans(kv), out_dtype=tl.float32) * (scale * 1.4426950408889634)
+            scores = tl.where(allowed, scores, float("-inf"))
+            safe_norm = tl.where(norm > 0.0, norm, 1.0)
+            p = tl.where(allowed, tl.math.exp2(scores - maxv) / safe_norm, 0.0)
+            rk = tl.dot(rv, tl.trans(kv), out_dtype=tl.float32)
+            a = tl.dot(go, tl.trans(vv), out_dtype=tl.float32)
+            rk = tl.where(allowed, rk, 0.0)
+            a = tl.where(allowed, a, 0.0)
+            delta = a - db
+            correction = bt - rk
+            gl = p * (a - dt + correction * delta) * scale
+            gu = -p * delta
+            weights = p * (1.0 + correction)
+            gl = tl.where(allowed, gl, 0.0)
+            gu = tl.where(allowed, gu, 0.0)
+            weights = tl.where(allowed, weights, 0.0)
+            gk += tl.dot(tl.trans(gl).to(qv.dtype), qv, out_dtype=tl.float32)
+            gk += tl.dot(tl.trans(gu).to(rv.dtype), rv, out_dtype=tl.float32)
+            gv += tl.dot(tl.trans(weights).to(go.dtype), go, out_dtype=tl.float32)
     # Per-query-head scratch has HQ in its token/head stride.
     outoff = (b * T * HQ + cols[:, None] * HQ + hq) * D + ds[None, :]
     tl.store(grad_k + outoff, gk, colmask[:, None] & (ds[None, :] < D))
@@ -184,53 +250,91 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
 
     G = hq // hkv
     bd = triton.next_power_of_2(dim)
-    bt = bs = 32
+    bt = bs = 64
+    preprocess_bt = 64
     delta_t = torch.empty((bsz, total_t, hq), device=q.device, dtype=torch.float32)
     delta_b = torch.empty_like(delta_t)
     grad_q = torch.empty_like(q)
     grad_r = torch.empty_like(r)
-    grad_k_buf = torch.empty((bsz, total_t, hq, dim), device=q.device, dtype=torch.float32)
+    grad_k_buf = torch.empty((bsz, total_t, hq, dim), device=q.device, dtype=q.dtype)
     grad_v_buf = torch.empty_like(grad_k_buf)
 
     if cu_seqlens is None:
-        segments = [(0, total_t, bi) for bi in range(bsz)]
+        segments = None
     else:
         if bsz != 1:
             raise ValueError("packed varlen backward requires B == 1")
         offsets = cu_seqlens.detach().cpu().tolist()
         segments = [(int(start), int(end - start), 0) for start, end in zip(offsets[:-1], offsets[1:])]
 
-    _preprocess_kernel[(bsz * total_t, hq)](
-        o, barv, grad_o, delta_t, delta_b, bsz * total_t, hq, dim, bd,
+    _preprocess_kernel[(bsz * triton.cdiv(total_t, preprocess_bt), hq)](
+        o, barv, grad_o, delta_t, delta_b, total_t, hq, dim, bd, preprocess_bt,
         num_warps=4,
     )
-    for bos, t, bi in segments:
-        if t == 0:
-            continue
-        # Kernels index from each batch/sequence's absolute token offset. Pass views
-        # based at the segment, and use local row/head statistics similarly.
-        _dqr_kernel[(triton.cdiv(t, bt), hq)](
-            q[bi, bos:], r[bi, bos:], k[bi, bos:], v[bi, bos:],
-            d1[bi, bos:], bart[bi, bos:], m[bi, bos:],
-            delta_t[bi, bos:], delta_b[bi, bos:], grad_o[bi, bos:],
-            grad_q[bi, bos:], grad_r[bi, bos:], scale, t, hq, hkv, G, dim, bd,
-            window_size_left, bt, bs, num_warps=4,
-        )
-        _dkv_kernel[(triton.cdiv(t, bs), hq)](
-            q[bi, bos:], r[bi, bos:], k[bi, bos:], v[bi, bos:],
-            d1[bi, bos:], bart[bi, bos:], m[bi, bos:],
-            delta_t[bi, bos:], delta_b[bi, bos:], grad_o[bi, bos:],
-            grad_k_buf[bi, bos:], grad_v_buf[bi, bos:], scale, t, hq, hkv, G, dim, bd,
-            window_size_left, bt, bs, num_warps=4,
-        )
+    if segments is None:
+        # Keep the batch dimension in the grid so each derivative kernel launches once.
+        dqr_grid = (triton.cdiv(total_t, bt), bsz * hq)
+        dkv_grid = (triton.cdiv(total_t, bs), bsz * hq)
+        if total_t >= 256:
+            current_stream = torch.npu.current_stream(q.device)
+            dqr_stream = torch.npu.Stream(device=q.device)
+            dkv_stream = torch.npu.Stream(device=q.device)
+            dqr_stream.wait_stream(current_stream)
+            dkv_stream.wait_stream(current_stream)
+            with torch.npu.stream(dqr_stream):
+                _dqr_kernel[dqr_grid](
+                    q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
+                    scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, bs,
+                    num_warps=4,
+                )
+            with torch.npu.stream(dkv_stream):
+                _dkv_kernel[dkv_grid](
+                    q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_k_buf, grad_v_buf,
+                    scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, bs,
+                    num_warps=4,
+                )
+            current_stream.wait_stream(dqr_stream)
+            current_stream.wait_stream(dkv_stream)
+        else:
+            _dqr_kernel[(triton.cdiv(total_t, bt), bsz * hq)](
+                q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
+                scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, bs,
+                num_warps=4,
+            )
+            _dkv_kernel[(triton.cdiv(total_t, bs), bsz * hq)](
+                q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_k_buf, grad_v_buf,
+                scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, bs,
+                num_warps=4,
+            )
+    else:
+        for bos, t, bi in segments:
+            if t == 0:
+                continue
+            # Packed segments are isolated in their respective tensor views.
+            _dqr_kernel[(triton.cdiv(t, bt), hq)](
+                q[bi, bos:], r[bi, bos:], k[bi, bos:], v[bi, bos:],
+                d1[bi, bos:], bart[bi, bos:], m[bi, bos:],
+                delta_t[bi, bos:], delta_b[bi, bos:], grad_o[bi, bos:],
+                grad_q[bi, bos:], grad_r[bi, bos:], scale, t, hq, hkv, G, dim, bd,
+                window_size_left, bt, bs, num_warps=4,
+            )
+            _dkv_kernel[(triton.cdiv(t, bs), hq)](
+                q[bi, bos:], r[bi, bos:], k[bi, bos:], v[bi, bos:],
+                d1[bi, bos:], bart[bi, bos:], m[bi, bos:],
+                delta_t[bi, bos:], delta_b[bi, bos:], grad_o[bi, bos:],
+                grad_k_buf[bi, bos:], grad_v_buf[bi, bos:], scale, t, hq, hkv, G, dim, bd,
+                window_size_left, bt, bs, num_warps=4,
+            )
 
-    grad_k = torch.empty_like(k)
-    grad_v = torch.empty_like(v)
     if G == 1:
         # DKV already holds one contribution per query head in token-major storage.
+        grad_k = torch.empty_like(k)
+        grad_v = torch.empty_like(v)
         grad_k.copy_(grad_k_buf)
         grad_v.copy_(grad_v_buf)
     else:
+        grad_k = torch.empty_like(k)
+        grad_v = torch.empty_like(v)
         n = bsz * total_t * hkv * dim
         _reduce_gqa_kernel[(triton.cdiv(n, 128),)](
             grad_k_buf, grad_v_buf, grad_k, grad_v, n, hq, hkv, G, dim, 128,

@@ -14,6 +14,24 @@ def _exp2(x):
     return tl.math.exp2(x.to(tl.float32))
 
 
+@triton.jit
+def _parallax_update(score, br, bk, bv, max_score, denom, correction_sum, value_sum, correction_value_sum):
+    new_max = tl.maximum(max_score, tl.max(score, axis=1, keep_dims=True))
+    safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+    alpha = _exp2(max_score - safe_max)
+    weight = _exp2(score - safe_max)
+
+    denom = alpha * denom + tl.sum(weight, axis=1, keep_dims=True)
+    value_sum = alpha * value_sum
+    value_sum = tl.dot(weight.to(bv.dtype), bv, out_dtype=tl.float32, acc=value_sum)
+    rk = tl.dot(br, tl.trans(bk), out_dtype=tl.float32)
+    weighted_rk = weight * rk
+    correction_sum = alpha * correction_sum + tl.sum(weighted_rk, axis=1, keep_dims=True)
+    correction_value_sum = alpha * correction_value_sum
+    correction_value_sum = tl.dot(weighted_rk.to(bv.dtype), bv, out_dtype=tl.float32, acc=correction_value_sum)
+    return new_max, denom, correction_sum, value_sum, correction_value_sum
+
+
 @triton.jit(do_not_specialize=["T"])
 def _parallax_forward_kernel(
     q,
@@ -83,32 +101,48 @@ def _parallax_forward_kernel(
         begin_col = tl.maximum(row_start - WINDOW_SIZE_LEFT + 1, 0)
         begin_col = (begin_col // BS) * BS
 
-    for col_start in range(begin_col, end_col, BS):
-        cols = col_start + tl.arange(0, BS).to(tl.int64)
-        kv_offsets = ((global_start + cols[:, None]) * H + hk) * D + d[None, :]
-        kv_mask = (cols[:, None] < seq_len) & feature_mask[None, :]
-        bk = tl.load(k + kv_offsets, kv_mask, other=0.0)
-        bv = tl.load(v + kv_offsets, kv_mask, other=0.0)
+    if WINDOW_SIZE_LEFT < 0:
+        # Fully safe blocks are separated from the causal boundary block. This
+        # keeps the common middle scan free of causal-mask instructions and
+        # avoids a per-iteration branch in the loop.
+        safe_end = (row_start // BS) * BS
+        for col_start in range(begin_col, safe_end, BS):
+            cols = col_start + tl.arange(0, BS).to(tl.int64)
+            kv_offsets = ((global_start + cols[:, None]) * H + hk) * D + d[None, :]
+            kv_mask = (cols[:, None] < seq_len) & feature_mask[None, :]
+            bk = tl.load(k + kv_offsets, kv_mask, other=0.0)
+            bv = tl.load(v + kv_offsets, kv_mask, other=0.0)
+            score = tl.dot(bq, tl.trans(bk), out_dtype=tl.float32) * scale_log2
+            max_score, denom, correction_sum, value_sum, correction_value_sum = _parallax_update(
+                score, br, bk, bv, max_score, denom, correction_sum, value_sum, correction_value_sum
+            )
 
-        attn_mask = (rows[:, None] >= cols[None, :]) & row_mask[:, None] & (cols[None, :] < seq_len)
-        if WINDOW_SIZE_LEFT >= 0:
+        for col_start in range(safe_end, end_col, BS):
+            cols = col_start + tl.arange(0, BS).to(tl.int64)
+            kv_offsets = ((global_start + cols[:, None]) * H + hk) * D + d[None, :]
+            kv_mask = (cols[:, None] < seq_len) & feature_mask[None, :]
+            bk = tl.load(k + kv_offsets, kv_mask, other=0.0)
+            bv = tl.load(v + kv_offsets, kv_mask, other=0.0)
+            attn_mask = (rows[:, None] >= cols[None, :]) & row_mask[:, None] & (cols[None, :] < seq_len)
+            score = tl.dot(bq, tl.trans(bk), out_dtype=tl.float32) * scale_log2
+            score = tl.where(attn_mask, score, -float("inf"))
+            max_score, denom, correction_sum, value_sum, correction_value_sum = _parallax_update(
+                score, br, bk, bv, max_score, denom, correction_sum, value_sum, correction_value_sum
+            )
+    else:
+        for col_start in range(begin_col, end_col, BS):
+            cols = col_start + tl.arange(0, BS).to(tl.int64)
+            kv_offsets = ((global_start + cols[:, None]) * H + hk) * D + d[None, :]
+            kv_mask = (cols[:, None] < seq_len) & feature_mask[None, :]
+            bk = tl.load(k + kv_offsets, kv_mask, other=0.0)
+            bv = tl.load(v + kv_offsets, kv_mask, other=0.0)
+            attn_mask = (rows[:, None] >= cols[None, :]) & row_mask[:, None] & (cols[None, :] < seq_len)
             attn_mask = attn_mask & (cols[None, :] >= rows[:, None] - WINDOW_SIZE_LEFT + 1)
-        score = tl.dot(bq, tl.trans(bk), out_dtype=tl.float32) * scale_log2
-        score = tl.where(attn_mask, score, -float("inf"))
-        new_max = tl.maximum(max_score, tl.max(score, axis=1, keep_dims=True))
-        safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
-        alpha = _exp2(max_score - safe_max)
-        weight = _exp2(score - safe_max)
-
-        denom = alpha * denom + tl.sum(weight, axis=1, keep_dims=True)
-        value_sum = alpha * value_sum
-        value_sum = tl.dot(weight.to(bv.dtype), bv, out_dtype=tl.float32, acc=value_sum)
-        rk = tl.dot(br, tl.trans(bk), out_dtype=tl.float32)
-        weighted_rk = weight * rk
-        correction_sum = alpha * correction_sum + tl.sum(weighted_rk, axis=1, keep_dims=True)
-        correction_value_sum = alpha * correction_value_sum
-        correction_value_sum = tl.dot(weighted_rk.to(bv.dtype), bv, out_dtype=tl.float32, acc=correction_value_sum)
-        max_score = new_max
+            score = tl.dot(bq, tl.trans(bk), out_dtype=tl.float32) * scale_log2
+            score = tl.where(attn_mask, score, -float("inf"))
+            max_score, denom, correction_sum, value_sum, correction_value_sum = _parallax_update(
+                score, br, bk, bv, max_score, denom, correction_sum, value_sum, correction_value_sum
+            )
 
     inv_denom = tl.where(row_mask[:, None], 1.0 / denom, 0.0)
     mean_value = value_sum * inv_denom
@@ -175,7 +209,7 @@ def parallax_forward(
 
     group_size = hq // h
     block_d = triton.next_power_of_2(dim)
-    block_t = 16
+    block_t = 64 if window_size_left < 0 and dim <= 64 else 16
     # Full causal attention amortizes the two score contractions and two PV
     # products better with a wider key tile. Windowed attention keeps BS=32:
     # BS=64 loads too many keys around each short-window boundary.
