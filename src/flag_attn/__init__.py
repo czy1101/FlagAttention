@@ -48,6 +48,18 @@ _OPERATOR_EXPORTS = {
     ),
     "chunk_gdn2": ("flag_attn.gdn2", "chunk_gdn2"),
     "chunk_kda": ("flag_attn.FLA.chunk_kda", "chunk_kda_fwd_infer"),
+    "InfLLMV2Config": (
+        "flag_attn.infllmv2",
+        "InfLLMV2Config",
+    ),
+    "infllmv2_attention": (
+        "flag_attn.infllmv2",
+        "infllmv2_attention",
+    ),
+    "infllmv2_decode": (
+        "flag_attn.infllmv2",
+        "infllmv2_decode",
+    ),
 }
 
 for _name in (
@@ -92,6 +104,9 @@ __all__ = [
     "chunk_gla",
     "chunk_gdn2",
     "chunk_kda",
+    "InfLLMV2Config",
+    "infllmv2_attention",
+    "infllmv2_decode",
     "minimax_m3_index_decode",
     "minimax_m3_index_decode_score",
     "minimax_m3_index_score",
