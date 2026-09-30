@@ -74,8 +74,16 @@ def _parallax_forward_kernel(
     correction_value_sum = tl.zeros((BT, BD), tl.float32)
     scale_log2 = scale * 1.4426950216
     end_col = tl.minimum(row_start + BT, seq_len)
+    begin_col = 0
+    if WINDOW_SIZE_LEFT >= 0:
+        # Every row in this query tile is left of ``row_start + BT``.  Keys
+        # before the first row's window cannot contribute to any row, so skip
+        # those tiles instead of loading and masking them.  Align down to BS
+        # so the first retained tile still covers the exact window boundary.
+        begin_col = tl.maximum(row_start - WINDOW_SIZE_LEFT + 1, 0)
+        begin_col = (begin_col // BS) * BS
 
-    for col_start in range(0, end_col, BS):
+    for col_start in range(begin_col, end_col, BS):
         cols = col_start + tl.arange(0, BS).to(tl.int64)
         kv_offsets = ((global_start + cols[:, None]) * H + hk) * D + d[None, :]
         kv_mask = (cols[:, None] < seq_len) & feature_mask[None, :]
@@ -168,7 +176,10 @@ def parallax_forward(
     group_size = hq // h
     block_d = triton.next_power_of_2(dim)
     block_t = 16
-    block_s = 32
+    # Full causal attention amortizes the two score contractions and two PV
+    # products better with a wider key tile. Windowed attention keeps BS=32:
+    # BS=64 loads too many keys around each short-window boundary.
+    block_s = 32 if window_size_left >= 0 else 64
     output = torch.empty_like(q)
     barv = torch.empty_like(q)
     d1 = torch.empty((batch, time, hq), dtype=torch.float32, device=q.device)

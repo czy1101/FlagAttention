@@ -332,7 +332,9 @@ def parallax_attn_with_kvcache(
     )
     result = torch.empty_like(q) if out is None else out
     block_k = triton.next_power_of_2(dim)
-    block_n = _BLOCK_N
+    # Bound the UB working set for the wider D=128 vector reductions. Keep
+    # the D=64 selection unchanged: BN=128 won on longer caches there.
+    block_n = 64 if dim > 64 or length <= 64 else _BLOCK_N
     batch_heads = batch * query_heads
     num_splits = 1
     if seqused_k is None and window_left < 0:

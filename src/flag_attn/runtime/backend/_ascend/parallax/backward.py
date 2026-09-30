@@ -49,7 +49,13 @@ def _dqr_kernel(q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_
     gr = tl.zeros((BT, BD), tl.float32)
     safe_norm = tl.where(norm > 0.0, norm, 1.0)
     cols = tl.arange(0, BS)
-    for block in range(tl.cdiv(T, BS)):
+    first_key = 0
+    if WINDOW >= 0:
+        first_key = tl.maximum(tile * BT - WINDOW + 1, 0)
+    first_key_block = first_key // BS
+    last_key = tl.minimum((tile + 1) * BT, T)
+    last_key_block = tl.cdiv(last_key, BS)
+    for block in range(first_key_block, last_key_block):
         ks = block * BS + cols
         kmask = (ks < T)[:, None] & (ds[None, :] < D)
         koff = bos_k + ks[:, None] * H * D + ds[None, :]
@@ -95,7 +101,14 @@ def _dkv_kernel(q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_k, grad_
     gk = tl.zeros((BS, BD), tl.float32)
     gv = tl.zeros((BS, BD), tl.float32)
     rows = tl.arange(0, BT)
-    for block in range(tl.cdiv(T, BT)):
+    # Causality excludes queries before this key tile. A finite left window
+    # also excludes queries after the last key in the tile leaves the window.
+    first_query_block = (tile * BS) // BT
+    last_query = T
+    if WINDOW >= 0:
+        last_query = tl.minimum((tile + 1) * BS + WINDOW - 1, T)
+    last_query_block = tl.cdiv(last_query, BT)
+    for block in range(first_query_block, last_query_block):
         qs = block * BT + rows
         rowmask = qs < T
         qoff = bos_q + qs[:, None] * HQ * D + ds[None, :]
