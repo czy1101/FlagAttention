@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ascend HY3 FP8 block-sparse prefill."""
+
 import importlib
 
-
+# name -> (module relative to this package, attribute; None binds the module)
 _OPERATOR_EXPORTS = {
-    "forward": (".attn_qk_int8_per_block", "forward"),
-    "quant_per_block_int8": (".ops", "quant_per_block_int8"),
-    "per_block_int8": (".ops", "quant_per_block_int8"),
+    "AscendFP8PrefillWorkspace": (".attention_blocksparse_prefill_fp8", "AscendFP8PrefillWorkspace"),
+    "attention_with_kvcache_blocksparse_prefill_fp8": (
+        ".attention_blocksparse_prefill_fp8", "attention_with_kvcache_blocksparse_prefill_fp8"),
+    "prepare_attention_blocksparse_prefill_fp8_workspace": (
+        ".attention_blocksparse_prefill_fp8", "prepare_attention_blocksparse_prefill_fp8_workspace"),
 }
 
 __all__ = sorted(_OPERATOR_EXPORTS)
@@ -29,6 +33,7 @@ def __getattr__(name):
         module_name, attribute_name = _OPERATOR_EXPORTS[name]
     except KeyError as exc:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
-    value = getattr(importlib.import_module(module_name, __name__), attribute_name)
+    module = importlib.import_module(module_name, __name__)
+    value = module if attribute_name is None else getattr(module, attribute_name)
     globals()[name] = value
     return value
