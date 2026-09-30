@@ -217,24 +217,18 @@ def _decode_merge_kernel(
     tl.store(out + i_bh * K + offs_d, result, mask=mask_d)
 
 
-_SPLIT_WORKSPACE: dict[tuple, tuple[torch.Tensor, ...]] = {}
-
-
 def _split_workspace(device: torch.device, batch_heads: int, splits: int, dim: int):
-    key = (device.type, device.index, batch_heads, splits, dim)
-    workspace = _SPLIT_WORKSPACE.get(key)
-    if workspace is None:
-        scalar_shape = (batch_heads, splits)
-        vector_shape = (batch_heads, splits, dim)
-        workspace = (
-            torch.empty(scalar_shape, device=device, dtype=torch.float32),
-            torch.empty(scalar_shape, device=device, dtype=torch.float32),
-            torch.empty(scalar_shape, device=device, dtype=torch.float32),
-            torch.empty(vector_shape, device=device, dtype=torch.float32),
-            torch.empty(vector_shape, device=device, dtype=torch.float32),
-        )
-        _SPLIT_WORKSPACE[key] = workspace
-    return workspace
+    scalar_shape = (batch_heads, splits)
+    vector_shape = (batch_heads, splits, dim)
+    # Keep scratch invocation-local. A global shape cache aliases concurrent
+    # calls on distinct NPU streams and can corrupt another call's merge state.
+    return (
+        torch.empty(scalar_shape, device=device, dtype=torch.float32),
+        torch.empty(scalar_shape, device=device, dtype=torch.float32),
+        torch.empty(scalar_shape, device=device, dtype=torch.float32),
+        torch.empty(vector_shape, device=device, dtype=torch.float32),
+        torch.empty(vector_shape, device=device, dtype=torch.float32),
+    )
 
 
 def _validate_inputs(q, r, k, v, seqused_k, out):
@@ -266,16 +260,19 @@ def _validate_inputs(q, r, k, v, seqused_k, out):
             raise ValueError(f"seqused_k must be int32 with shape ({batch},)")
         if seqused_k.device != q.device:
             raise ValueError("seqused_k must be on the same NPU device as q")
-        lengths = seqused_k
-        if not lengths.is_contiguous():
-            lengths = lengths.contiguous()
-        min_length = int(lengths.min().item())
-        max_length = int(lengths.max().item())
-        if min_length < 0 or max_length > length:
-            raise ValueError(
-                f"seqused_k values must be in [0, {length}], got [{min_length}, {max_length}]"
-            )
-        seqused_k = lengths
+        if not seqused_k.is_contiguous():
+            seqused_k = seqused_k.contiguous()
+        # Reading a device scalar with .item() synchronizes the host and makes
+        # this runtime-length path impossible to capture in an NPUGraph. As in
+        # the upstream CUDA implementation, retain eager value validation and
+        # let the kernel clamp lengths during graph capture.
+        if not torch.npu.is_current_stream_capturing():
+            min_length = int(seqused_k.min().item())
+            max_length = int(seqused_k.max().item())
+            if min_length < 0 or max_length > length:
+                raise ValueError(
+                    f"seqused_k values must be in [0, {length}], got [{min_length}, {max_length}]"
+                )
     if out is not None:
         if out.shape != q.shape or out.dtype != q.dtype or out.device != q.device:
             raise ValueError("out must match q's shape, dtype, and device")
