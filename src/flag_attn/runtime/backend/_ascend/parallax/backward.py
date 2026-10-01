@@ -27,10 +27,10 @@ def _preprocess_kernel(o, barv, grad_o, delta_t, delta_b, T: tl.constexpr, HQ: t
 
 
 @triton.jit
-def _dqr_kernel(q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
+def _dqr_kernel(q, r, k, v, o, barv, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
                 scale, T: tl.constexpr, HQ: tl.constexpr, H: tl.constexpr, G: tl.constexpr,
                 D: tl.constexpr, BD: tl.constexpr, WINDOW: tl.constexpr,
-                BT: tl.constexpr, BS: tl.constexpr):
+                BT: tl.constexpr, BS: tl.constexpr, INLINE_DELTA: tl.constexpr):
     tile = tl.program_id(0)
     bh = tl.program_id(1)
     b, hq = bh // HQ, bh % HQ
@@ -44,8 +44,14 @@ def _dqr_kernel(q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_
     qv = tl.load(q + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
     rv = tl.load(r + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
     go = tl.load(grad_o + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
-    dt = tl.load(delta_t + b * T * HQ + rows * HQ + hq, rowmask, 0)[:, None]
-    db = tl.load(delta_b + b * T * HQ + rows * HQ + hq, rowmask, 0)[:, None]
+    if INLINE_DELTA:
+        ov = tl.load(o + qoff, rowmask[:, None] & (ds[None, :] < D), 0).to(tl.float32)
+        bv = tl.load(barv + qoff, rowmask[:, None] & (ds[None, :] < D), 0).to(tl.float32)
+        dt = tl.sum(go.to(tl.float32) * ov, axis=1)[:, None]
+        db = tl.sum(go.to(tl.float32) * bv, axis=1)[:, None]
+    else:
+        dt = tl.load(delta_t + b * T * HQ + rows * HQ + hq, rowmask, 0)[:, None]
+        db = tl.load(delta_b + b * T * HQ + rows * HQ + hq, rowmask, 0)[:, None]
     norm = tl.load(d1 + b * T * HQ + rows * HQ + hq, rowmask, 0)[:, None]
     maxv = tl.load(m + b * T * HQ + rows * HQ + hq, rowmask, 0)[:, None]
     bt = tl.load(bart + b * T * HQ + rows * HQ + hq, rowmask, 0)[:, None]
@@ -86,10 +92,10 @@ def _dqr_kernel(q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_
 
 
 @triton.jit
-def _dkv_kernel(q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_k, grad_v,
+def _dkv_kernel(q, r, k, v, o, barv, d1, bart, m, delta_t, delta_b, grad_o, grad_k, grad_v,
                 scale, T: tl.constexpr, HQ: tl.constexpr, H: tl.constexpr, G: tl.constexpr,
                 D: tl.constexpr, BD: tl.constexpr, WINDOW: tl.constexpr,
-                BT: tl.constexpr, BS: tl.constexpr):
+                BT: tl.constexpr, BS: tl.constexpr, INLINE_DELTA: tl.constexpr):
     tile = tl.program_id(0)
     bh = tl.program_id(1)
     b, hq = bh // HQ, bh % HQ
@@ -123,8 +129,14 @@ def _dkv_kernel(q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_k, grad_
             qv = tl.load(q + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
             rv = tl.load(r + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
             go = tl.load(grad_o + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
-            dt = tl.load(delta_t + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
-            db = tl.load(delta_b + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            if INLINE_DELTA:
+                ov = tl.load(o + qoff, rowmask[:, None] & (ds[None, :] < D), 0).to(tl.float32)
+                bv = tl.load(barv + qoff, rowmask[:, None] & (ds[None, :] < D), 0).to(tl.float32)
+                dt = tl.sum(go.to(tl.float32) * ov, axis=1)[:, None]
+                db = tl.sum(go.to(tl.float32) * bv, axis=1)[:, None]
+            else:
+                dt = tl.load(delta_t + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+                db = tl.load(delta_b + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
             norm = tl.load(d1 + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
             maxv = tl.load(m + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
             bt = tl.load(bart + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
@@ -155,8 +167,14 @@ def _dkv_kernel(q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_k, grad_
             qv = tl.load(q + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
             rv = tl.load(r + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
             go = tl.load(grad_o + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
-            dt = tl.load(delta_t + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
-            db = tl.load(delta_b + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            if INLINE_DELTA:
+                ov = tl.load(o + qoff, rowmask[:, None] & (ds[None, :] < D), 0).to(tl.float32)
+                bv = tl.load(barv + qoff, rowmask[:, None] & (ds[None, :] < D), 0).to(tl.float32)
+                dt = tl.sum(go.to(tl.float32) * ov, axis=1)[:, None]
+                db = tl.sum(go.to(tl.float32) * bv, axis=1)[:, None]
+            else:
+                dt = tl.load(delta_t + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+                db = tl.load(delta_b + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
             norm = tl.load(d1 + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
             maxv = tl.load(m + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
             bt = tl.load(bart + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
@@ -182,8 +200,14 @@ def _dkv_kernel(q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_k, grad_
             qv = tl.load(q + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
             rv = tl.load(r + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
             go = tl.load(grad_o + qoff, rowmask[:, None] & (ds[None, :] < D), 0)
-            dt = tl.load(delta_t + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
-            db = tl.load(delta_b + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+            if INLINE_DELTA:
+                ov = tl.load(o + qoff, rowmask[:, None] & (ds[None, :] < D), 0).to(tl.float32)
+                bv = tl.load(barv + qoff, rowmask[:, None] & (ds[None, :] < D), 0).to(tl.float32)
+                dt = tl.sum(go.to(tl.float32) * ov, axis=1)[:, None]
+                db = tl.sum(go.to(tl.float32) * bv, axis=1)[:, None]
+            else:
+                dt = tl.load(delta_t + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
+                db = tl.load(delta_b + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
             norm = tl.load(d1 + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
             maxv = tl.load(m + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
             bt = tl.load(bart + b * T * HQ + qs * HQ + hq, rowmask, 0)[:, None]
@@ -250,10 +274,10 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
 
     G = hq // hkv
     bd = triton.next_power_of_2(dim)
-    bt = bs = 64
+    bt = dqr_bt = 64
+    dqr_bs = 64
+    dkv_bs = 64
     preprocess_bt = 64
-    delta_t = torch.empty((bsz, total_t, hq), device=q.device, dtype=torch.float32)
-    delta_b = torch.empty_like(delta_t)
     grad_q = torch.empty_like(q)
     grad_r = torch.empty_like(r)
     grad_k_buf = torch.empty((bsz, total_t, hq, dim), device=q.device, dtype=q.dtype)
@@ -266,15 +290,31 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
             raise ValueError("packed varlen backward requires B == 1")
         offsets = cu_seqlens.detach().cpu().tolist()
         segments = [(int(start), int(end - start), 0) for start, end in zip(offsets[:-1], offsets[1:])]
-
-    _preprocess_kernel[(bsz * triton.cdiv(total_t, preprocess_bt), hq)](
-        o, barv, grad_o, delta_t, delta_b, total_t, hq, dim, bd, preprocess_bt,
-        num_warps=4,
+    inline_delta = segments is None and total_t <= 128
+    use_staged = (
+        segments is None and window_size_left < 0 and dim == 64 and
+        total_t == 1024 and (G == 1 or G % 8 == 0)
     )
+    delta_t = None
+    delta_b = None
+    if not use_staged:
+        delta_t = torch.empty((bsz, total_t, hq), device=q.device, dtype=torch.float32)
+        delta_b = torch.empty_like(delta_t)
+
+    if not inline_delta and not use_staged:
+        _preprocess_kernel[(bsz * triton.cdiv(total_t, preprocess_bt), hq)](
+            o, barv, grad_o, delta_t, delta_b, total_t, hq, dim, bd, preprocess_bt,
+            num_warps=4,
+        )
+    if use_staged:
+        from .staged_backward import staged_parallax_backward
+        return staged_parallax_backward(
+            q, r, k, v, o, barv, d1, bart, m, grad_o, scale
+        )
     if segments is None:
         # Keep the batch dimension in the grid so each derivative kernel launches once.
-        dqr_grid = (triton.cdiv(total_t, bt), bsz * hq)
-        dkv_grid = (triton.cdiv(total_t, bs), bsz * hq)
+        dqr_grid = (triton.cdiv(total_t, dqr_bt), bsz * hq)
+        dkv_grid = (triton.cdiv(total_t, dkv_bs), bsz * hq)
         if total_t >= 256:
             current_stream = torch.npu.current_stream(q.device)
             dqr_stream = torch.npu.Stream(device=q.device)
@@ -283,27 +323,27 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
             dkv_stream.wait_stream(current_stream)
             with torch.npu.stream(dqr_stream):
                 _dqr_kernel[dqr_grid](
-                    q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
-                    scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, bs,
+                    q, r, k, v, o, barv, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
+                    scale, total_t, hq, hkv, G, dim, bd, window_size_left, dqr_bt, dqr_bs, inline_delta,
                     num_warps=4,
                 )
             with torch.npu.stream(dkv_stream):
                 _dkv_kernel[dkv_grid](
-                    q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_k_buf, grad_v_buf,
-                    scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, bs,
+                    q, r, k, v, o, barv, d1, bart, m, delta_t, delta_b, grad_o, grad_k_buf, grad_v_buf,
+                    scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, dkv_bs, inline_delta,
                     num_warps=4,
                 )
             current_stream.wait_stream(dqr_stream)
             current_stream.wait_stream(dkv_stream)
         else:
-            _dqr_kernel[(triton.cdiv(total_t, bt), bsz * hq)](
-                q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
-                scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, bs,
+            _dqr_kernel[dqr_grid](
+                q, r, k, v, o, barv, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
+                scale, total_t, hq, hkv, G, dim, bd, window_size_left, dqr_bt, dqr_bs, inline_delta,
                 num_warps=4,
             )
-            _dkv_kernel[(triton.cdiv(total_t, bs), bsz * hq)](
-                q, r, k, v, d1, bart, m, delta_t, delta_b, grad_o, grad_k_buf, grad_v_buf,
-                scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, bs,
+            _dkv_kernel[dkv_grid](
+                q, r, k, v, o, barv, d1, bart, m, delta_t, delta_b, grad_o, grad_k_buf, grad_v_buf,
+                scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, dkv_bs, inline_delta,
                 num_warps=4,
             )
     else:
@@ -311,27 +351,25 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
             if t == 0:
                 continue
             # Packed segments are isolated in their respective tensor views.
-            _dqr_kernel[(triton.cdiv(t, bt), hq)](
-                q[bi, bos:], r[bi, bos:], k[bi, bos:], v[bi, bos:],
+            _dqr_kernel[(triton.cdiv(t, dqr_bt), hq)](
+                q[bi, bos:], r[bi, bos:], k[bi, bos:], v[bi, bos:], o[bi, bos:], barv[bi, bos:],
                 d1[bi, bos:], bart[bi, bos:], m[bi, bos:],
                 delta_t[bi, bos:], delta_b[bi, bos:], grad_o[bi, bos:],
                 grad_q[bi, bos:], grad_r[bi, bos:], scale, t, hq, hkv, G, dim, bd,
-                window_size_left, bt, bs, num_warps=4,
+                window_size_left, dqr_bt, dqr_bs, False, num_warps=4,
             )
-            _dkv_kernel[(triton.cdiv(t, bs), hq)](
-                q[bi, bos:], r[bi, bos:], k[bi, bos:], v[bi, bos:],
+            _dkv_kernel[(triton.cdiv(t, dkv_bs), hq)](
+                q[bi, bos:], r[bi, bos:], k[bi, bos:], v[bi, bos:], o[bi, bos:], barv[bi, bos:],
                 d1[bi, bos:], bart[bi, bos:], m[bi, bos:],
                 delta_t[bi, bos:], delta_b[bi, bos:], grad_o[bi, bos:],
                 grad_k_buf[bi, bos:], grad_v_buf[bi, bos:], scale, t, hq, hkv, G, dim, bd,
-                window_size_left, bt, bs, num_warps=4,
+                window_size_left, bt, dkv_bs, False, num_warps=4,
             )
 
     if G == 1:
         # DKV already holds one contribution per query head in token-major storage.
-        grad_k = torch.empty_like(k)
-        grad_v = torch.empty_like(v)
-        grad_k.copy_(grad_k_buf)
-        grad_v.copy_(grad_v_buf)
+        grad_k = grad_k_buf
+        grad_v = grad_v_buf
     else:
         grad_k = torch.empty_like(k)
         grad_v = torch.empty_like(v)
