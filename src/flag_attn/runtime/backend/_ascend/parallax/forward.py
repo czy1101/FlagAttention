@@ -303,6 +303,16 @@ def parallax_forward(
 
         return staged_parallax_forward(q, r, k, v, float(scale))
 
+    if (
+        cu_seqlens is None
+        and dim == 128
+        and time in (512, 1024)
+        and q.dtype == torch.bfloat16
+    ):
+        from .staged_forward import staged_parallax_forward_d128
+
+        return staged_parallax_forward_d128(q, r, k, v, float(scale), window_size_left)
+
     group_size = hq // h
     block_d = triton.next_power_of_2(dim)
     block_t = 64 if window_size_left < 0 and dim <= 64 else 16
