@@ -8,6 +8,68 @@ import triton.language as tl
 
 
 @triton.jit
+def _parallax_fused_short_kernel(
+    q,
+    r,
+    k,
+    v,
+    o,
+    barv,
+    d1,
+    bart,
+    m,
+    scale_log2,
+    HQ: tl.constexpr,
+    H: tl.constexpr,
+    G: tl.constexpr,
+    D: tl.constexpr,
+    BM: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """Fuse full-length T=128 causal Parallax forward for tiny head counts."""
+    pid_m = tl.program_id(0)
+    bh = tl.program_id(1)
+    batch = bh // HQ
+    hq = bh % HQ
+    hk = hq // G
+    rows = pid_m * BM + tl.arange(0, BM)
+    cols = tl.arange(0, 128)
+    ds = tl.arange(0, BD)
+    row_mask = rows < 128
+    feature_mask = ds < D
+
+    q_offsets = ((batch * 128 + rows[:, None]) * HQ + hq) * D + ds[None, :]
+    k_offsets = ((batch * 128 + cols[:, None]) * H + hk) * D + ds[None, :]
+    qv = tl.load(q + q_offsets, row_mask[:, None] & feature_mask[None, :], other=0.0)
+    rv = tl.load(r + q_offsets, row_mask[:, None] & feature_mask[None, :], other=0.0)
+    kv = tl.load(k + k_offsets, feature_mask[None, :], other=0.0)
+    vv = tl.load(v + k_offsets, feature_mask[None, :], other=0.0)
+
+    scores = tl.dot(qv, tl.trans(kv), out_dtype=tl.float32) * scale_log2
+    rk = tl.dot(rv, tl.trans(kv), out_dtype=tl.float32)
+    causal = (rows[:, None] >= cols[None, :]) & row_mask[:, None]
+    scores = tl.where(causal, scores, -float("inf"))
+    rk = tl.where(causal, rk, 0.0)
+    row_max = tl.max(scores, axis=1, keep_dims=True)
+    weights = tl.exp2(scores - row_max)
+    denom = tl.sum(weights, axis=1, keep_dims=True)
+    normalized = weights / denom
+    correction_mean = tl.sum(weights * rk, axis=1, keep_dims=True) / denom
+
+    mean_value = tl.dot(normalized.to(vv.dtype), vv, out_dtype=tl.float32)
+    correction_value = tl.dot((normalized * rk).to(vv.dtype), vv, out_dtype=tl.float32)
+    output = mean_value * (1.0 + correction_mean) - correction_value
+
+    out_offsets = ((batch * 128 + rows[:, None]) * HQ + hq) * D + ds[None, :]
+    scalar_offsets = (batch * 128 + rows) * HQ + hq
+    tl.store(o + out_offsets, output, row_mask[:, None] & feature_mask[None, :])
+    tl.store(barv + out_offsets, mean_value, row_mask[:, None] & feature_mask[None, :])
+    tl.store(d1 + scalar_offsets, tl.sum(weights, axis=1), row_mask)
+    tl.store(bart + scalar_offsets, tl.sum(correction_mean, axis=1), row_mask)
+    tl.store(m + scalar_offsets, tl.sum(row_max, axis=1), row_mask)
+
+
+@triton.jit
 def _score_tiles(
     q,
     r,
@@ -408,6 +470,41 @@ def staged_parallax_forward(q, r, k, v, scale):
         BD=bd_pv,
         SKIP_FUTURE=True,
         num_warps=8,
+        num_stages=1,
+    )
+    return output, barv, d1, bart, m
+
+
+def staged_parallax_forward_short(q, r, k, v, scale):
+    """Single-kernel forward for the official short T128 training shapes."""
+    batch, time, hq, dim = q.shape
+    h = k.shape[2]
+    group_size = hq // h
+    output = torch.empty_like(q)
+    barv = torch.empty_like(q)
+    scalar_shape = (batch, time, hq)
+    d1 = torch.empty(scalar_shape, device=q.device, dtype=torch.float32)
+    bart = torch.empty_like(d1)
+    m = torch.empty_like(d1)
+    bm = 16 if dim == 64 else 32
+    _parallax_fused_short_kernel[(triton.cdiv(time, bm), batch * hq)](
+        q,
+        r,
+        k,
+        v,
+        output,
+        barv,
+        d1,
+        bart,
+        m,
+        float(scale) * 1.4426950216,
+        HQ=hq,
+        H=h,
+        G=group_size,
+        D=dim,
+        BM=bm,
+        BD=triton.next_power_of_2(dim),
+        num_warps=4,
         num_stages=1,
     )
     return output, barv, d1, bart, m

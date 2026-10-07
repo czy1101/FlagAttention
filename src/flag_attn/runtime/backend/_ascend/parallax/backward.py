@@ -272,6 +272,21 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
     if grad_o.shape != q.shape:
         raise ValueError("grad_o must have the same shape as q")
 
+    if (
+        cu_seqlens is None
+        and window_size_left < 0
+        and bsz == 1
+        and total_t == 128
+        and hq == 1
+        and hkv == 1
+        and dim == 128
+        and q.dtype == torch.bfloat16
+        and all(x.is_contiguous() for x in (q, r, k, v, o, barv, d1, bart, m, grad_o))
+    ):
+        from .short_backward import short_parallax_backward
+
+        return short_parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale)
+
     G = hq // hkv
     bd = triton.next_power_of_2(dim)
     bt = dqr_bt = 64
@@ -292,8 +307,12 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
         segments = [(int(start), int(end - start), 0) for start, end in zip(offsets[:-1], offsets[1:])]
     inline_delta = segments is None and total_t <= 128
     use_staged = (
-        segments is None and window_size_left < 0 and dim == 64 and
-        total_t == 1024 and (G == 1 or G % 8 == 0)
+        segments is None and (
+            (dim == 64 and window_size_left < 0 and total_t == 1024 and
+             (G == 1 or G % 8 == 0)) or
+            (dim == 128 and q.dtype == torch.bfloat16 and total_t in (512, 1024) and
+             G in (1, 4, 8, 16, 32))
+        )
     )
     delta_t = None
     delta_b = None
@@ -309,7 +328,7 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
     if use_staged:
         from .staged_backward import staged_parallax_backward
         return staged_parallax_backward(
-            q, r, k, v, o, barv, d1, bart, m, grad_o, scale
+            q, r, k, v, o, barv, d1, bart, m, grad_o, scale, window_size_left
         )
     if segments is None:
         # Keep the batch dimension in the grid so each derivative kernel launches once.

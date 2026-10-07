@@ -295,6 +295,20 @@ def parallax_forward(
     if (
         cu_seqlens is None
         and window_size_left < 0
+        and time == 128
+        and batch == 1
+        and hq == 1
+        and h == 1
+        and dim in (64, 128)
+        and q.dtype == torch.bfloat16
+    ):
+        from .staged_forward import staged_parallax_forward_short
+
+        return staged_parallax_forward_short(q, r, k, v, float(scale))
+
+    if (
+        cu_seqlens is None
+        and window_size_left < 0
         and time == 1024
         and dim == 64
         and q.dtype == torch.bfloat16
