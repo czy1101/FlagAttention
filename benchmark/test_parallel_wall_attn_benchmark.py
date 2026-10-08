@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import math
 import statistics
+import subprocess
 from collections.abc import Callable
 from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
 import pytest
 import torch
@@ -28,6 +31,56 @@ SHAPE_FAMILIES = (("mha", 8), ("gqa", 2))
 WARMUP_CALLS = 30
 MEASUREMENT_MS = 200
 REPEATS = 7
+
+
+def _source_revision(directory: Path) -> str | None:
+    """Record a Git revision when running from a checkout, without requiring Git."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _environment():
+    try:
+        fla_version = version("flash-linear-attention")
+    except PackageNotFoundError:
+        fla_version = None
+    import fla
+
+    # Installed wheels may have no Git metadata. Keep the package version and
+    # report an absent revision explicitly rather than guessing a source SHA.
+    fla_directory = Path(fla.__file__).resolve().parent.parent
+    device = torch.cuda.current_device()
+    try:
+        driver = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        driver_version = driver.stdout.splitlines()[0] if driver.returncode == 0 and driver.stdout else None
+    except (OSError, subprocess.TimeoutExpired):
+        driver_version = None
+    return {
+        "gpu_model": torch.cuda.get_device_name(device),
+        "compute_capability": list(torch.cuda.get_device_capability(device)),
+        "torch_version": str(torch.__version__),
+        "cuda_version": torch.version.cuda,
+        "triton_version": str(triton.__version__),
+        "driver_version": driver_version,
+        "fla_version": fla_version,
+        "fla_revision": _source_revision(fla_directory),
+        "candidate_revision": _source_revision(Path(__file__).resolve().parent.parent),
+    }
 
 
 @lru_cache(maxsize=1)
@@ -74,6 +127,7 @@ def _summary(samples: list[float]) -> dict[str, float | list[float]]:
 @torch.inference_mode()
 def _run_benchmark(dtype_name, dtype, record_property=None):
     fla_wall_attn = _load_fla_provider()
+    environment = _environment()
     metrics = []
     speedups = []
 
@@ -86,7 +140,7 @@ def _run_benchmark(dtype_name, dtype, record_property=None):
                 "fla": lambda: fla_wall_attn(*inputs, scale=scale),
                 "optimized": lambda: parallel_wall_attn(*inputs, scale=scale),
             }
-            expected_route = "tle_bf16" if dtype is torch.bfloat16 else "tle_fp16"
+            expected_route = "hopper_bf16" if dtype is torch.bfloat16 else "hopper_fp16"
             assert select_route(*inputs, scale=scale) == expected_route
 
             outputs = {name: fn() for name, fn in providers.items()}
@@ -161,6 +215,7 @@ def _run_benchmark(dtype_name, dtype, record_property=None):
         measurement_ms=MEASUREMENT_MS,
         repeats=REPEATS,
         geomean_speedup_vs_fla=geomean_speedup,
+        environment=environment,
     )
 
 

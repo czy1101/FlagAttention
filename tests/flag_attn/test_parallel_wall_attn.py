@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from flag_attn import parallel_wall_attn
-from flag_attn.FLA import wall_attn as provider
+from flag_attn.FLA.wall_attn import parallel as provider
 from flag_attn.utils import has_triton_tle
 
 SEQUENCE_LENGTHS = (512, 1024, 2048, 4096)
@@ -55,7 +55,7 @@ def test_parallel_wall_attn_is_public_api():
 def test_parallel_wall_attn_fast_matrix_matches_fla(family, h, t, dtype_name, dtype, seed):
     del family
     inputs = _make_inputs(t, h, 64, dtype, seed)
-    expected_route = "tle_bf16" if dtype is torch.bfloat16 else "tle_fp16"
+    expected_route = "hopper_bf16" if dtype is torch.bfloat16 else "hopper_fp16"
     assert provider.select_route(*inputs, scale=64**-0.5) == expected_route
 
     expected = _fla_reference()(*inputs, scale=64**-0.5).float()
@@ -76,7 +76,7 @@ def test_parallel_wall_attn_fast_matrix_matches_fla(family, h, t, dtype_name, dt
 @torch.inference_mode()
 def test_parallel_wall_attn_bf16_d128_matches_fla(h, t):
     inputs = _make_inputs(t, h, 128, torch.bfloat16, seed=0)
-    assert provider.select_route(*inputs) == "tle_bf16"
+    assert provider.select_route(*inputs) == "hopper_bf16"
     expected = _fla_reference()(*inputs).float()
     actual = parallel_wall_attn(*inputs).float()
     assert torch.isfinite(actual).all()
@@ -120,7 +120,7 @@ def test_parallel_wall_attn_unsupported_contract_routes_to_fallback(change, monk
 
     assert provider.select_route(q, k, v, g, **kwargs) == "official_fallback"
     sentinel = torch.empty(0, device="cuda")
-    monkeypatch.setattr(provider, "_official_wall_attn", lambda *args, **kw: sentinel)
+    monkeypatch.setattr(provider, "_parallel_wall_attn_default", lambda *args, **kw: sentinel)
     assert provider.parallel_wall_attn(q, k, v, g, **kwargs) is sentinel
 
 
@@ -146,6 +146,22 @@ def test_parallel_wall_attn_constant_gate_uses_safe_fallback(dtype, t, gate):
     assert torch.isfinite(actual).all()
     # All value rows are one, so any finite normalized causal attention is one.
     torch.testing.assert_close(actual, torch.ones_like(actual), atol=0.01, rtol=0.01)
+
+
+@pytest.mark.parallel_wall_attn
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("t", (512, 4096))
+@pytest.mark.skipif(not _has_h100_tle(), reason="weak-gate fast path requires H100/SM90 with TLE")
+@torch.inference_mode()
+def test_parallel_wall_attn_weak_gate_executes_hopper(dtype, t):
+    q, k, v, g = _make_inputs(t, 2, 64, dtype, seed=0)
+    g = g * 0.2
+    expected = _fla_reference()(q, k, v, g)
+    actual = parallel_wall_attn(q, k, v, g)
+    route = "hopper_bf16" if dtype is torch.bfloat16 else "hopper_fp16"
+    assert provider.get_last_route() == route
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
 
 
 @pytest.mark.parallel_wall_attn
