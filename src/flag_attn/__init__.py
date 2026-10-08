@@ -48,6 +48,7 @@ _OPERATOR_EXPORTS = {
     ),
     "chunk_gdn2": ("flag_attn.gdn2", "chunk_gdn2"),
     "chunk_kda": ("flag_attn.FLA.chunk_kda", "chunk_kda_fwd_infer"),
+    "parallel_wall_attn": ("flag_attn.FLA.wall_attn", "parallel_wall_attn"),
 }
 
 for _name in (
@@ -92,6 +93,7 @@ __all__ = [
     "chunk_gla",
     "chunk_gdn2",
     "chunk_kda",
+    "parallel_wall_attn",
     "minimax_m3_index_decode",
     "minimax_m3_index_decode_score",
     "minimax_m3_index_score",
