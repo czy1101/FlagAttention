@@ -31,10 +31,10 @@ except ImportError:
     version_tuple = (0, 0, 0)
 
 
-from flag_attn.piecewise import attention as piecewise_attention # noqa: F401
-from flag_attn.flash import attention as flash_attention # noqa: F401
-from flag_attn.split_kv import attention as flash_attention_split_kv # noqa: F401
-from flag_attn.paged import attention as paged_attention # noqa: F401
+from flag_attn.piecewise import attention as piecewise_attention  # noqa: F401
+from flag_attn.flash import attention as flash_attention  # noqa: F401
+from flag_attn.split_kv import attention as flash_attention_split_kv  # noqa: F401
+from flag_attn.paged import attention as paged_attention  # noqa: F401
 from flag_attn.gated_delta_rule import chunk_gated_delta_rule # noqa: F401
 from flag_attn.gated_linear_attention import chunk_gla as chunk_gla
 from flag_attn.minimax_sparse_attention import (
@@ -46,6 +46,90 @@ from flag_attn.minimax_sparse_attention import (
     minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode,
 )
 
-from flag_attn import testing # noqa: F401
+from flag_attn import testing  # noqa: F401
 
-from flag_attn.inkling_fa4 import inkling_fa4_rel_attention as inkling_fa4_rel_attention
+_FLA_EXPORTS = {
+    "chunk_log_linear_attn": (
+        "flag_attn.FLA.log_linear_attn",
+        "chunk_log_linear_attn",
+    ),
+_OPERATOR_EXPORTS = {
+    "chunk_gated_delta_rule": (
+        "flag_attn.FLA.gated_delta_rule",
+        "chunk_gated_delta_rule",
+    ),
+    "chunk_gla": (
+        "flag_attn.FLA.gated_linear_attention",
+        "chunk_gla",
+    ),
+    "chunk_gdn2": ("flag_attn.gdn2", "chunk_gdn2"),
+    "chunk_kda": ("flag_attn.FLA.chunk_kda", "chunk_kda_fwd_infer"),
+    "parallel_wall_attn": ("flag_attn.FLA.wall_attn", "parallel_wall_attn"),
+    "InfLLMV2Config": (
+        "flag_attn.infllmv2",
+        "InfLLMV2Config",
+    ),
+    "infllmv2_attention": (
+        "flag_attn.infllmv2",
+        "infllmv2_attention",
+    ),
+    "infllmv2_decode": (
+        "flag_attn.infllmv2",
+        "infllmv2_decode",
+    ),
+}
+
+for _name in (
+    "minimax_m3_index_decode",
+    "minimax_m3_index_decode_score",
+    "minimax_m3_index_score",
+    "minimax_m3_index_topk",
+    "minimax_m3_sparse_attn",
+    "minimax_m3_sparse_attn_decode",
+):
+    _OPERATOR_EXPORTS[_name] = ("flag_attn.minimax_sparse_attention", _name)
+
+if vendor_name in {"enflame", "metax", "mthreads"}:
+    for _name in ("chunk_gdn2", "chunk_kda"):
+        _OPERATOR_EXPORTS[_name] = (
+            f"flag_attn.runtime.backend._{vendor_name}.FLA.{_name.removeprefix('chunk_')}",
+            _name,
+        )
+
+
+def __getattr__(name: str):
+    """Load optional attention kernels only when their public API is used."""
+    try:
+        module_name, attribute_name = _OPERATOR_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(importlib.import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value
+
+
+__all__ = [
+    "device",
+    "vendor",
+    "vendor_name",
+    "backend_info",
+    "piecewise_attention",
+    "flash_attention",
+    "flash_attention_split_kv",
+    "paged_attention",
+    "chunk_log_linear_attn",
+    "chunk_gated_delta_rule",
+    "chunk_gla",
+    "chunk_gdn2",
+    "chunk_kda",
+    "InfLLMV2Config",
+    "infllmv2_attention",
+    "infllmv2_decode",
+    "minimax_m3_index_decode",
+    "minimax_m3_index_decode_score",
+    "minimax_m3_index_score",
+    "minimax_m3_index_topk",
+    "minimax_m3_sparse_attn",
+    "minimax_m3_sparse_attn_decode",
+    "parallel_wall_attn",
+]
