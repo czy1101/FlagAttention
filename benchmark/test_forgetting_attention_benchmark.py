@@ -1,6 +1,9 @@
 """Official ACP vs V7.6 TLE. Full-call CUDA Event latency, never CUDA Graph.
 
-Supports pytest discovery (PR #69) and direct CLI execution. Latencies are in ms.
+Supports pytest discovery and direct CLI execution. Latencies are in ms.
+Run this file with --full for all 90 shapes, or --ids S011,S024 for a subset.
+The original reference adapters and input generation live in the single
+correctness test file; no JSON manifest or custom pytest markers are needed.
 """
 from __future__ import annotations
 
@@ -21,15 +24,13 @@ import torch
 import triton
 
 from flag_attn.forgetting_attention import has_tle
-from forgetting_attention_support import (
+from test_forgetting_attention import (
     CASES, DEFAULT_CASES, OFFICIAL_COMMIT, case_id, make_inputs,
     call_optimized, call_official, assert_bitwise,
 )
 
 CUDA_SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
 pytestmark = [
-    pytest.mark.forgetting_attention,
-    pytest.mark.acp,
     pytest.mark.skipif(not CUDA_SM90, reason="ACP benchmark requires Hopper SM90 CUDA"),
     pytest.mark.skipif(not has_tle(), reason="ACP benchmark requires Triton 3.6 TLE"),
 ]

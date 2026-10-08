@@ -1,8 +1,4 @@
-"""V7.6 Forgetting Attention / Adaptive Computation Pruning, SM90 inference.
-
-Importing this package does not require a TLE compiler. Calling the operator does.
-The public entry is cached after first resolution, preserving the V7.6 hot path.
-"""
+"""Forgetting Attention / ACP: reference and H100 TLE implementations."""
 import importlib
 import importlib.util
 
@@ -15,13 +11,19 @@ def has_tle():
 
 
 def __getattr__(name):
-    if name != "forgetting_attention":
+    if name == "forgetting_attention":
+        if not has_tle():
+            raise RuntimeError(
+                "Forgetting Attention requires Triton 3.6 with compatible FlagTree/TLE"
+            )
+        module = ".parallel"
+    elif name == "naive_forgetting_attention":
+        module = ".naive"
+    else:
         raise AttributeError(name)
-    if not has_tle():
-        raise RuntimeError("Forgetting Attention V7.6 requires Triton 3.6 with compatible FlagTree/TLE")
-    value = importlib.import_module(".tle", __name__).forgetting_attention
+    value = importlib.import_module(module, __name__).forgetting_attention
     globals()[name] = value
     return value
 
 
-__all__ = ["forgetting_attention", "has_tle"]
+__all__ = ["forgetting_attention", "naive_forgetting_attention", "has_tle"]
