@@ -65,6 +65,10 @@ pythonpath = [
     "src",
     "tests/flag_attn",
 ]
+markers = [
+    "forgetting_attention: Forgetting Attention / ACP tests and benchmarks",
+    "acp: alias for Forgetting Attention adaptive computation pruning",
+]
 
 [tool.ruff]
 ignore = ["E741"]
