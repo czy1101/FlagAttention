@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from flag_attn import parallel_wall_attn
+from flag_attn.FLA import wall_attn
+from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.wall_attn import parallel as provider
 from flag_attn.utils import has_triton_tle
 
@@ -43,6 +45,76 @@ def _make_inputs(t: int, h: int, d: int, dtype: torch.dtype, seed: int):
 @pytest.mark.parallel_wall_attn
 def test_parallel_wall_attn_is_public_api():
     assert parallel_wall_attn is provider.parallel_wall_attn
+
+
+@pytest.mark.parallel_wall_attn
+def test_parallel_wall_attn_official_helpers_are_exported():
+    from flag_attn.FLA.wall_attn.decode import build_wall_kv_cache, parallel_wall_attn_decode
+    from flag_attn.FLA.wall_attn.naive import naive_wall_attn
+
+    assert wall_attn.build_wall_kv_cache is build_wall_kv_cache
+    assert wall_attn.parallel_wall_attn_decode is parallel_wall_attn_decode
+    assert wall_attn.naive_wall_attn is naive_wall_attn
+    assert {"build_wall_kv_cache", "parallel_wall_attn_decode", "naive_wall_attn"} <= set(wall_attn.__all__)
+
+
+@pytest.mark.parallel_wall_attn
+@pytest.mark.parametrize("h", (2, 8), ids=("gqa", "mha"))
+@pytest.mark.parametrize("option", ("default", "window", "varlen", "sink_scalar"))
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="naive reference comparison requires CUDA cumsum")
+@torch.inference_mode()
+def test_parallel_wall_attn_naive_matches_fla(h, option):
+    q, k, v, g = _make_inputs(17, h, 16, torch.float32, seed=7)
+    kwargs = {"scale": 16**-0.5}
+    if option == "window":
+        kwargs["window_size"] = 5
+    elif option == "varlen":
+        kwargs["cu_seqlens"] = torch.tensor([0, 5, 17], device=q.device, dtype=torch.long)
+    elif option == "sink_scalar":
+        kwargs["sink_bias"] = torch.randn(8, device=q.device) * 0.1
+        kwargs["g_scalar"] = -torch.rand(1, 17, 8, device=q.device) * 0.01
+    expected = _fla_reference()(q, k, v, g, **kwargs).float()
+    actual = wall_attn.naive_wall_attn(q, k, v, g, **kwargs)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.parallel_wall_attn
+@pytest.mark.parametrize("h", (2, 8), ids=("gqa", "mha"))
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("use_extra_gates", (False, True), ids=("default", "sink_scalar"))
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="decode comparison requires CUDA")
+@torch.inference_mode()
+def test_parallel_wall_attn_decode_matches_naive(h, dtype, use_extra_gates):
+    # One tail query, three cache chunks, including a partial final chunk.
+    q, k, v, g = _make_inputs(129, h, 32, dtype, seed=1)
+    prefix = chunk_global_cumsum(g, scale=provider.RCP_LN2)
+    k_tilde, anchors = wall_attn.build_wall_kv_cache(k, prefix, chunk_size=64)
+    kwargs = {"scale": 32**-0.5}
+    scalar_prefix = None
+    if use_extra_gates:
+        kwargs["sink_bias"] = torch.randn(8, device=q.device) * 0.1
+        kwargs["g_scalar"] = -torch.rand(1, 129, 8, device=q.device) * 0.01
+        scalar_prefix = chunk_global_cumsum(kwargs["g_scalar"], scale=provider.RCP_LN2)
+    expected = wall_attn.naive_wall_attn(q, k, v, g, **kwargs)[:, -1:].contiguous()
+    actual, lse = wall_attn.parallel_wall_attn_decode(
+        q=q[:, -1:].contiguous(),
+        v=v,
+        p_curr=prefix[:, -1:].contiguous(),
+        k_tilde=k_tilde,
+        r_cache=anchors,
+        sink_bias=kwargs.get("sink_bias"),
+        scale=kwargs["scale"],
+        cache_chunk_size=64,
+        g_scalar_cumsum=scalar_prefix,
+    )
+    assert k_tilde.shape == (1, 129, 8, 32)
+    assert anchors.shape == (1, 3, 8, 32)
+    assert k_tilde.dtype == dtype
+    assert actual.shape == (1, 1, 8, 32)
+    assert lse.shape == (1, 1, 8)
+    assert torch.isfinite(actual).all() and torch.isfinite(lse).all()
+    torch.testing.assert_close(actual.float(), expected, atol=0.05, rtol=0.05)
 
 
 @pytest.mark.parallel_wall_attn

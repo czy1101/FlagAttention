@@ -1017,9 +1017,9 @@ def get_last_route() -> str | None:
 
 
 @lru_cache(maxsize=1)
-def _load_hopper_module():
+def _load_fwd_module():
     """Load Hopper-only kernels after metadata dispatch accepts an inference call."""
-    module = import_module(f"{__package__}.parallel_hopper")
+    module = import_module(f"{__package__}.parallel_fwd")
     triton.set_allocator(module.allocate_descriptor)
     return module
 
@@ -1093,7 +1093,7 @@ def select_route(
     return "official_fallback"
 
 
-def _parallel_wall_attn_hopper(
+def _parallel_wall_attn_fast_path(
     route: str,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1101,7 +1101,7 @@ def _parallel_wall_attn_hopper(
     g: torch.Tensor,
     scale: float,
 ) -> torch.Tensor | None:
-    hopper = _load_hopper_module()
+    fwd = _load_fwd_module()
     b, t, hq, d = q.shape
     cache_dtype = q.dtype if route == "hopper_bf16" else torch.bfloat16
     q_cache = torch.empty((b, hq, t, d), device=q.device, dtype=cache_dtype)
@@ -1111,14 +1111,14 @@ def _parallel_wall_attn_hopper(
     lse = torch.empty((b, t, hq), device=q.device, dtype=torch.float32)
     unsafe = torch.zeros((), device=q.device, dtype=torch.int32)
 
-    hopper.prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe)
+    fwd.prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe)
 
     # Never pass invalid cached operands to WGMMA. This synchronization is part
     # of the public provider's end-to-end latency and must remain in benchmarks.
     if unsafe.item():
         return None
 
-    hopper.parallel_wall_attn_fwd_hopper(q_cache, k_cache, v, output, lse, capacity=2, scale=scale)
+    fwd.parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, capacity=2, scale=scale)
     return output
 
 
@@ -1155,7 +1155,7 @@ def parallel_wall_attn(
     )
     if route != "official_fallback":
         with torch.cuda.device(q.device):
-            output = _parallel_wall_attn_hopper(
+            output = _parallel_wall_attn_fast_path(
                 route,
                 q,
                 k,

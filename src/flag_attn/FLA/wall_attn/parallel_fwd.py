@@ -276,7 +276,7 @@ def _wall_attn_consumer1(
 
 
 @triton.jit
-def parallel_wall_attn_fwd_kernel_hopper(
+def parallel_wall_attn_fwd_kernel(
     q_cache,
     k_cache,
     v,
@@ -475,12 +475,12 @@ def parallel_wall_attn_fwd_kernel_hopper(
     )
 
 
-def parallel_wall_attn_fwd_hopper(q_cache, k_cache, v, output, lse, capacity: int, scale=None):
+def parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, capacity: int, scale=None):
     _, hq, t, d = q_cache.shape
     h = v.shape[2]
     if scale is None:
         scale = d**-0.5
-    return parallel_wall_attn_fwd_kernel_hopper[(t // BT, hq)](
+    return parallel_wall_attn_fwd_kernel[(t // BT, hq)](
         q_cache,
         k_cache,
         v,
@@ -749,4 +749,4 @@ def prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe):
         _build_qk_cache(q, k, g, prefix, q_cache, k_cache, anchor, unsafe)
 
 
-__all__ = ["allocate_descriptor", "parallel_wall_attn_fwd_hopper", "prepare_qk_cache"]
+__all__ = ["allocate_descriptor", "parallel_wall_attn_fwd", "prepare_qk_cache"]
