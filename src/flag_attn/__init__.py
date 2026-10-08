@@ -36,3 +36,5 @@ from flag_attn.minimax_sparse_attention import (
 )
 
 from flag_attn import testing # noqa: F401
+
+from flag_attn.inkling_fa4 import inkling_fa4_rel_attention as inkling_fa4_rel_attention

@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Pure PyTorch reference for Inkling paged relative attention."""
 
 from __future__ import annotations
@@ -35,20 +49,12 @@ def ref_rel_attn(
         k_len = int(cache_seqlens[seq_id])
         num_blocks = (k_len + block_size - 1) // block_size
         physical_blocks = block_table[seq_id, :num_blocks].long()
-        k = key_cache[physical_blocks].reshape(
-            -1, num_kv_heads, head_dim
-        )[:k_len].float()
-        v = value_cache[physical_blocks].reshape(
-            -1, num_kv_heads, head_dim
-        )[:k_len].float()
+        k = key_cache[physical_blocks].reshape(-1, num_kv_heads, head_dim)[:k_len].float()
+        v = value_cache[physical_blocks].reshape(-1, num_kv_heads, head_dim)[:k_len].float()
         q_seq = q[q_start:q_end].float()
         rel_seq = rel_logits[q_start:q_end].float()
 
-        q_pos = (
-            torch.arange(q_len, device=q.device).view(q_len, 1)
-            + k_len
-            - q_len
-        )
+        q_pos = torch.arange(q_len, device=q.device).view(q_len, 1) + k_len - q_len
         k_pos = torch.arange(k_len, device=q.device).view(1, k_len)
         rel_dist = q_pos - k_pos
         rel_in_range = (rel_dist >= 0) & (rel_dist < rel_extent)
@@ -72,13 +78,9 @@ def ref_rel_attn(
                 rel_bias,
                 torch.zeros_like(rel_bias),
             )
-            probabilities = torch.softmax(
-                scores.masked_fill(~mask, -torch.inf), dim=-1
-            )
+            probabilities = torch.softmax(scores.masked_fill(~mask, -torch.inf), dim=-1)
             probabilities = torch.nan_to_num(probabilities)
-            out[q_start:q_end, q_head] = (
-                probabilities @ v[:, kv_head]
-            ).to(q.dtype)
+            out[q_start:q_end, q_head] = (probabilities @ v[:, kv_head]).to(q.dtype)
 
     return out
 

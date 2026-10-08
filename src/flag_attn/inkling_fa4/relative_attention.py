@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Inkling FA4 paged relative attention: Triton and optional Hopper TLE.
 
 The module exposes two implementations and one dispatcher:
@@ -13,7 +27,7 @@ The module exposes two implementations and one dispatcher:
     WGMMA tile. The symbol always exists; calling it without a working TLE
     installation raises ``RuntimeError``.
 
-    ``inkling_fa4_rel_attention``
+``inkling_fa4_rel_attention``
     Unified entry point. ``backend="auto"`` (default) uses TLE when it is
     importable and falls back to Triton otherwise. ``backend="triton"`` and
     ``backend="tle"`` force a path.
@@ -34,7 +48,7 @@ import torch
 import triton
 import triton.language as tl
 
-from inkling_fa4 import autotune_configs
+from . import launch_configs
 
 try:
     import triton.experimental.tle.language as tle
@@ -102,16 +116,10 @@ def inkling_fa4_rel_attention_triton(
     # Match FA4 interface window canonicalization. The vLLM wrapper only turns
     # exactly (-1, -1) into (None, None); mixed -1 values remain real local
     # window widths when their sum is non-negative.
-    window_left, window_right = (
-        (None, None) if window_size == (-1, -1) else window_size
-    )
+    window_left, window_right = (None, None) if window_size == (-1, -1) else window_size
     if causal:
         window_right = 0
-    if (
-        window_left is not None
-        and window_right is not None
-        and window_left + window_right < 0
-    ):
+    if window_left is not None and window_right is not None and window_left + window_right < 0:
         window_left = None
         window_right = None
     if window_left is None and window_right == 0:
@@ -151,7 +159,7 @@ def inkling_fa4_rel_attention_triton(
     # work.  Reading cache_seqlens.max().item() here would serialize every
     # serving invocation with the CPU.
     max_seqlen_k_bound = block_table.shape[1] * block_size
-    cfg = autotune_configs.get_preset(
+    cfg = launch_configs.get_preset(
         max_seqlen_q,
         max_seqlen_k=max_seqlen_k_bound,
         head_dim_q=head_dim_q,
@@ -166,9 +174,7 @@ def inkling_fa4_rel_attention_triton(
     max_q_blocks = triton.cdiv(max_scheduler_rows, block_q)
     split_kv = num_splits > 1
     if split_kv:
-        partial_out = torch.empty(
-            (num_splits, *out.shape), dtype=torch.float32, device=q.device
-        )
+        partial_out = torch.empty((num_splits, *out.shape), dtype=torch.float32, device=q.device)
         partial_max = torch.empty(
             (num_splits, q.shape[0], num_heads),
             dtype=torch.float32,
@@ -271,6 +277,7 @@ def inkling_fa4_rel_attention_triton(
         )
     return out
 
+
 def _validate_inputs(
     *,
     q: torch.Tensor,
@@ -302,18 +309,13 @@ def _validate_inputs(
     if q.ndim != 3:
         raise ValueError("q must have shape [total_q, num_heads, head_dim]")
     if key_cache.ndim != 4 or value_cache.ndim != 4:
-        raise ValueError(
-            "key_cache and value_cache must have shape "
-            "[num_blocks, block_size, num_kv_heads, head_dim]"
-        )
+        raise ValueError("key_cache and value_cache must have shape [num_blocks, block_size, num_kv_heads, head_dim]")
     if q.shape[1] <= 0 or key_cache.shape[2] <= 0:
         raise ValueError("Q and KV head counts must be positive")
     if key_cache.shape[1] <= 0:
         raise ValueError("KV cache block_size must be positive")
     if key_cache.shape[:3] != value_cache.shape[:3]:
-        raise ValueError(
-            "key_cache and value_cache block, token, and head shapes must match"
-        )
+        raise ValueError("key_cache and value_cache block, token, and head shapes must match")
     if block_table.ndim != 2:
         raise ValueError("block_table must have shape [batch, max_num_blocks]")
     if cache_seqlens.ndim != 1:
@@ -326,9 +328,7 @@ def _validate_inputs(
     if cu_seqlens_q.shape[0] != batch_size + 1:
         raise ValueError("cu_seqlens_q must contain batch_size + 1 entries")
     if rel_logits.shape != (q.shape[0], q.shape[1], rel_extent):
-        raise ValueError(
-            "rel_logits must have shape [total_q, num_heads, rel_extent]"
-        )
+        raise ValueError("rel_logits must have shape [total_q, num_heads, rel_extent]")
     if key_cache.shape[3] != q.shape[2]:
         raise ValueError("Q and K head dimensions must match")
     alignment = 16 // q.element_size()
@@ -338,10 +338,7 @@ def _validate_inputs(
         and q.shape[2] % alignment == 0
         and value_cache.shape[3] % alignment == 0
     ):
-        raise ValueError(
-            "Q/K and V head dimensions must be in [8, 512] and aligned "
-            f"to {alignment} elements"
-        )
+        raise ValueError(f"Q/K and V head dimensions must be in [8, 512] and aligned to {alignment} elements")
     if q.shape[1] % key_cache.shape[2] != 0:
         raise ValueError("num_heads must be divisible by num_kv_heads")
     if q.dtype not in (torch.bfloat16, torch.float16):
@@ -373,10 +370,8 @@ def _validate_inputs(
             raise ValueError("out must be on the same CUDA device as q")
         expected_out_shape = (q.shape[0], q.shape[1], value_cache.shape[3])
         if out.shape != expected_out_shape or out.dtype != q.dtype:
-            raise ValueError(
-                "out must have shape [total_q, num_heads, value_head_dim] "
-                "and the same dtype as q"
-            )
+            raise ValueError("out must have shape [total_q, num_heads, value_head_dim] and the same dtype as q")
+
 
 @triton.jit
 def _fa4_rel_attn_paged_kernel(
@@ -481,10 +476,7 @@ def _fa4_rel_attn_paged_kernel(
     scheduler_row = pid_q * BLOCK_Q + off_q
     if PACK_GQA:
         q_local = scheduler_row // Q_HEADS_PER_KV_HEAD
-        q_head = (
-            scheduler_head * Q_HEADS_PER_KV_HEAD
-            + scheduler_row % Q_HEADS_PER_KV_HEAD
-        )
+        q_head = scheduler_head * Q_HEADS_PER_KV_HEAD + scheduler_row % Q_HEADS_PER_KV_HEAD
         kv_head = scheduler_head
     else:
         q_local = scheduler_row
@@ -498,12 +490,7 @@ def _fa4_rel_attn_paged_kernel(
     q_global = q_start + q_local
     q_pos = q_local + k_len - q_len
 
-    q_ptrs = (
-        q_ptr
-        + q_global[:, None] * stride_q_t
-        + q_head_offset * stride_q_h
-        + off_d_q[None, :] * stride_q_d
-    )
+    q_ptrs = q_ptr + q_global[:, None] * stride_q_t + q_head_offset * stride_q_h + off_d_q[None, :] * stride_q_d
     q_value = tl.load(
         q_ptrs,
         mask=q_valid[:, None] & d_q_valid[None, :],
@@ -523,12 +510,8 @@ def _fa4_rel_attn_paged_kernel(
     if CAUSAL:
         valid_k_end = tl.minimum(valid_k_end, q_pos_max + 1)
     if LOCAL:
-        valid_k_start = tl.maximum(
-            valid_k_start, q_pos_min - WINDOW_LEFT
-        )
-        valid_k_end = tl.minimum(
-            valid_k_end, q_pos_max + WINDOW_RIGHT + 1
-        )
+        valid_k_start = tl.maximum(valid_k_start, q_pos_min - WINDOW_LEFT)
+        valid_k_end = tl.minimum(valid_k_end, q_pos_max + WINDOW_RIGHT + 1)
     valid_k_start = tl.maximum(valid_k_start, 0)
     valid_k_end = tl.maximum(tl.minimum(valid_k_end, k_len), 0)
     valid_block_start = valid_k_start // BLOCK_K
@@ -537,9 +520,7 @@ def _fa4_rel_attn_paged_kernel(
     num_k_blocks = (k_len + BLOCK_K - 1) // BLOCK_K
     blocks_per_split = (num_k_blocks + NUM_SPLITS - 1) // NUM_SPLITS
     split_block_start = split_idx * blocks_per_split
-    split_block_end = tl.minimum(
-        split_block_start + blocks_per_split, num_k_blocks
-    )
+    split_block_end = tl.minimum(split_block_start + blocks_per_split, num_k_blocks)
     block_start = tl.maximum(split_block_start, valid_block_start)
     block_end = tl.minimum(split_block_end, valid_block_end)
     for block_k in range(block_start, block_end):
@@ -552,18 +533,14 @@ def _fa4_rel_attn_paged_kernel(
         # page / 64-or-128-token compute tile case.
         if BLOCK_K == BLOCK_SIZE:
             physical_page = tl.load(
-                block_table_ptr
-                + seq_id * stride_bt_b
-                + block_k * stride_bt_block,
+                block_table_ptr + seq_id * stride_bt_b + block_k * stride_bt_block,
                 mask=block_k < num_k_blocks,
                 other=0,
             )
             physical_block = physical_page + tl.zeros([BLOCK_K], tl.int32)
         else:
             physical_block = tl.load(
-                block_table_ptr
-                + seq_id * stride_bt_b
-                + logical_block * stride_bt_block,
+                block_table_ptr + seq_id * stride_bt_b + logical_block * stride_bt_block,
                 mask=k_valid,
                 other=0,
             )
@@ -586,22 +563,15 @@ def _fa4_rel_attn_paged_kernel(
         if CAUSAL:
             mask = mask & (k_local[None, :] <= q_pos[:, None])
         if LOCAL:
-            mask = mask & (
-                k_local[None, :] >= q_pos[:, None] - WINDOW_LEFT
-            )
+            mask = mask & (k_local[None, :] >= q_pos[:, None] - WINDOW_LEFT)
         if LOCAL:
-            mask = mask & (
-                k_local[None, :] <= q_pos[:, None] + WINDOW_RIGHT
-            )
+            mask = mask & (k_local[None, :] <= q_pos[:, None] + WINDOW_RIGHT)
 
         rel_dist = q_pos[:, None] - k_local[None, :]
         rel_in_range = (rel_dist >= 0) & (rel_dist < REL_EXTENT)
         safe_rel_idx = tl.where(rel_in_range, rel_dist, 0)
         rel_ptrs = (
-            rel_ptr
-            + q_global[:, None] * stride_rel_t
-            + q_head_offset * stride_rel_h
-            + safe_rel_idx * stride_rel_d
+            rel_ptr + q_global[:, None] * stride_rel_t + q_head_offset * stride_rel_h + safe_rel_idx * stride_rel_d
         )
         rel_bias = tl.load(
             rel_ptrs,
@@ -652,11 +622,7 @@ def _fa4_rel_attn_paged_kernel(
             + q_head_offset * stride_partial_h
             + off_d_v[None, :] * stride_partial_d
         )
-        stats_ptrs = (
-            split_idx * stride_stats_s
-            + q_global * stride_stats_t
-            + q_head * stride_stats_h
-        )
+        stats_ptrs = split_idx * stride_stats_s + q_global * stride_stats_t + q_head * stride_stats_h
         tl.store(partial_ptrs, acc, mask=q_valid[:, None] & d_v_valid[None, :])
         tl.store(partial_max_ptr + stats_ptrs, m_i, mask=q_valid)
         tl.store(partial_sum_ptr + stats_ptrs, l_i, mask=q_valid)
@@ -664,12 +630,10 @@ def _fa4_rel_attn_paged_kernel(
         denominator = tl.where(l_i > 0.0, l_i, 1.0)
         output = acc / denominator[:, None]
         out_ptrs = (
-            out_ptr
-            + q_global[:, None] * stride_out_t
-            + q_head_offset * stride_out_h
-            + off_d_v[None, :] * stride_out_d
+            out_ptr + q_global[:, None] * stride_out_t + q_head_offset * stride_out_h + off_d_v[None, :] * stride_out_d
         )
         tl.store(out_ptrs, output, mask=q_valid[:, None] & d_v_valid[None, :])
+
 
 @triton.jit
 def _combine_split_kv_kernel(
@@ -704,11 +668,7 @@ def _combine_split_kv_kernel(
     # unrolled and never constructs a [SPLITS_PAD, BLOCK_D_V] tensor.
     global_max = -float("inf")
     for split in tl.static_range(0, NUM_SPLITS):
-        stats_offset = (
-            split * stride_stats_s
-            + q_global * stride_stats_t
-            + q_head * stride_stats_h
-        )
+        stats_offset = split * stride_stats_s + q_global * stride_stats_t + q_head * stride_stats_h
         split_max = tl.load(partial_max_ptr + stats_offset)
         global_max = tl.maximum(global_max, split_max)
 
@@ -719,11 +679,7 @@ def _combine_split_kv_kernel(
     numerator = tl.zeros([BLOCK_D_V], dtype=tl.float32)
     denominator = 0.0
     for split in tl.static_range(0, NUM_SPLITS):
-        stats_offset = (
-            split * stride_stats_s
-            + q_global * stride_stats_t
-            + q_head * stride_stats_h
-        )
+        stats_offset = split * stride_stats_s + q_global * stride_stats_t + q_head * stride_stats_h
         split_max = tl.load(partial_max_ptr + stats_offset)
         split_sum = tl.load(partial_sum_ptr + stats_offset)
         weight = tl.where(
@@ -750,18 +706,13 @@ def _combine_split_kv_kernel(
         0.0,
     )
 
-    out_ptrs = (
-        out_ptr
-        + q_global * stride_out_t
-        + q_head * stride_out_h
-        + off_d * stride_out_d
-    )
+    out_ptrs = out_ptr + q_global * stride_out_t + q_head * stride_out_h + off_d * stride_out_d
 
     tl.store(out_ptrs, output, mask=d_valid)
 
 
-
 if TLE_AVAILABLE:
+
     @torch.no_grad()
     def inkling_fa4_rel_attention_tle(
         q: torch.Tensor,
@@ -810,16 +761,10 @@ if TLE_AVAILABLE:
         # Match FA4 interface window canonicalization. The vLLM wrapper only turns
         # exactly (-1, -1) into (None, None); mixed -1 values remain real local
         # window widths when their sum is non-negative.
-        window_left, window_right = (
-            (None, None) if window_size == (-1, -1) else window_size
-        )
+        window_left, window_right = (None, None) if window_size == (-1, -1) else window_size
         if causal:
             window_right = 0
-        if (
-            window_left is not None
-            and window_right is not None
-            and window_left + window_right < 0
-        ):
+        if window_left is not None and window_right is not None and window_left + window_right < 0:
             window_left = None
             window_right = None
         if window_left is None and window_right == 0:
@@ -870,7 +815,7 @@ if TLE_AVAILABLE:
         # work.  Reading cache_seqlens.max().item() here would serialize every
         # serving invocation with the CPU.
         max_seqlen_k_bound = block_table.shape[1] * block_size
-        cfg = autotune_configs.get_tle_preset(
+        cfg = launch_configs.get_tle_preset(
             max_seqlen_q,
             max_seqlen_k=max_seqlen_k_bound,
             head_dim_q=head_dim_q,
@@ -885,9 +830,7 @@ if TLE_AVAILABLE:
         max_q_blocks = triton.cdiv(max_scheduler_rows, block_q)
         split_kv = num_splits > 1
         if split_kv:
-            partial_out = torch.empty(
-                (num_splits, *out.shape), dtype=torch.float32, device=q.device
-            )
+            partial_out = torch.empty((num_splits, *out.shape), dtype=torch.float32, device=q.device)
             partial_max = torch.empty(
                 (num_splits, q.shape[0], num_heads),
                 dtype=torch.float32,
@@ -1143,18 +1086,10 @@ if TLE_AVAILABLE:
             safe_block_2 = tl.minimum(macro_block + 2, block_end - 1)
             safe_block_3 = tl.minimum(macro_block + 3, block_end - 1)
             page_table_base = block_table_ptr + seq_id * stride_bt_b
-            physical_page_0 = tl.load(
-                page_table_base + safe_block_0 * stride_bt_block
-            )
-            physical_page_1 = tl.load(
-                page_table_base + safe_block_1 * stride_bt_block
-            )
-            physical_page_2 = tl.load(
-                page_table_base + safe_block_2 * stride_bt_block
-            )
-            physical_page_3 = tl.load(
-                page_table_base + safe_block_3 * stride_bt_block
-            )
+            physical_page_0 = tl.load(page_table_base + safe_block_0 * stride_bt_block)
+            physical_page_1 = tl.load(page_table_base + safe_block_1 * stride_bt_block)
+            physical_page_2 = tl.load(page_table_base + safe_block_2 * stride_bt_block)
+            physical_page_3 = tl.load(page_table_base + safe_block_3 * stride_bt_block)
             physical_page = tl.where(
                 page_in_macro == 0,
                 physical_page_0,
@@ -1285,10 +1220,7 @@ if TLE_AVAILABLE:
         scheduler_row = pid_q * BLOCK_Q + off_q
         if PACK_GQA:
             q_local = scheduler_row // Q_HEADS_PER_KV_HEAD
-            q_head = (
-                scheduler_head * Q_HEADS_PER_KV_HEAD
-                + scheduler_row % Q_HEADS_PER_KV_HEAD
-            )
+            q_head = scheduler_head * Q_HEADS_PER_KV_HEAD + scheduler_row % Q_HEADS_PER_KV_HEAD
             q_head_offset = q_head[:, None]
         else:
             q_local = scheduler_row
@@ -1299,10 +1231,7 @@ if TLE_AVAILABLE:
         q_pos = q_local + k_len - q_len
 
         q_value = tl.load(
-            q_ptr
-            + q_global[:, None] * stride_q_t
-            + q_head_offset * stride_q_h
-            + off_d_q[None, :] * stride_q_d,
+            q_ptr + q_global[:, None] * stride_q_t + q_head_offset * stride_q_h + off_d_q[None, :] * stride_q_d,
             mask=q_valid[:, None] & d_q_valid[None, :],
             other=0.0,
         )
@@ -1361,18 +1290,11 @@ if TLE_AVAILABLE:
                 q_valid[:, None]
                 & k_valid[None, :]
                 & (k_local[None, :] <= q_pos[:, None])
-                & (
-                    k_local[None, :]
-                    >= q_pos[:, None] - (REL_EXTENT - 1)
-                )
+                & (k_local[None, :] >= q_pos[:, None] - (REL_EXTENT - 1))
             )
             if LOCAL:
-                rel_valid = rel_valid & (
-                    k_local[None, :] >= q_pos[:, None] - WINDOW_LEFT
-                )
-                rel_valid = rel_valid & (
-                    k_local[None, :] <= q_pos[:, None] + WINDOW_RIGHT
-                )
+                rel_valid = rel_valid & (k_local[None, :] >= q_pos[:, None] - WINDOW_LEFT)
+                rel_valid = rel_valid & (k_local[None, :] <= q_pos[:, None] + WINDOW_RIGHT)
             rel_row_ptr = (
                 rel_ptr
                 + q_global[:, None] * stride_rel_t
@@ -1398,16 +1320,10 @@ if TLE_AVAILABLE:
             # across both the relative-logit load and WGMMA.
             score_valid = q_valid[:, None] & k_valid[None, :]
             if CAUSAL:
-                score_valid = score_valid & (
-                    k_local[None, :] <= q_pos[:, None]
-                )
+                score_valid = score_valid & (k_local[None, :] <= q_pos[:, None])
             if LOCAL:
-                score_valid = score_valid & (
-                    k_local[None, :] >= q_pos[:, None] - WINDOW_LEFT
-                )
-                score_valid = score_valid & (
-                    k_local[None, :] <= q_pos[:, None] + WINDOW_RIGHT
-                )
+                score_valid = score_valid & (k_local[None, :] >= q_pos[:, None] - WINDOW_LEFT)
+                score_valid = score_valid & (k_local[None, :] <= q_pos[:, None] + WINDOW_RIGHT)
             scores = tl.where(
                 score_valid,
                 (scores + rel_bias_lowp.to(tl.float32)) * 1.4426950408889634,
@@ -1418,9 +1334,7 @@ if TLE_AVAILABLE:
             m_new = tl.maximum(m_i, tile_max)
             row_has_value = m_new != -float("inf")
             m_safe = tl.where(row_has_value, m_new, 0.0)
-            alpha = tl.where(
-                m_i == -float("inf"), 0.0, tl.exp2(m_i - m_safe)
-            )
+            alpha = tl.where(m_i == -float("inf"), 0.0, tl.exp2(m_i - m_safe))
             probabilities = tl.exp2(scores - m_safe[:, None])
             l_i = l_i * alpha + tl.sum(probabilities, axis=1)
             acc = acc * alpha[:, None]
@@ -1449,11 +1363,7 @@ if TLE_AVAILABLE:
                 + q_head_offset * stride_partial_h
                 + off_d_v[None, :] * stride_partial_d
             )
-            stats_offsets = (
-                split_idx * stride_stats_s
-                + q_global * stride_stats_t
-                + q_head * stride_stats_h
-            )
+            stats_offsets = split_idx * stride_stats_s + q_global * stride_stats_t + q_head * stride_stats_h
             tl.store(partial_ptrs, acc, mask=q_valid[:, None] & d_v_valid[None, :])
             tl.store(partial_max_ptr + stats_offsets, m_i, mask=q_valid)
             tl.store(partial_sum_ptr + stats_offsets, l_i, mask=q_valid)
@@ -1471,17 +1381,44 @@ if TLE_AVAILABLE:
 
     @triton.jit
     def _v3_fa4_rel_attn_paged_ws_kernel(
-        q_ptr, k_ptr, v_ptr, rel_ptr, out_ptr,
-        partial_out_ptr, partial_max_ptr, partial_sum_ptr,
-        block_table_ptr, cache_seqlens_ptr, cu_seqlens_q_ptr,
-        stride_q_t, stride_q_h, stride_q_d,
-        stride_k_block, stride_k_t, stride_k_h, stride_k_d,
-        stride_v_block, stride_v_t, stride_v_h, stride_v_d,
-        stride_rel_t, stride_rel_h, stride_rel_d,
-        stride_out_t, stride_out_h, stride_out_d,
-        stride_partial_s, stride_partial_t, stride_partial_h, stride_partial_d,
-        stride_stats_s, stride_stats_t, stride_stats_h,
-        stride_bt_b, stride_bt_block, softmax_scale,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        rel_ptr,
+        out_ptr,
+        partial_out_ptr,
+        partial_max_ptr,
+        partial_sum_ptr,
+        block_table_ptr,
+        cache_seqlens_ptr,
+        cu_seqlens_q_ptr,
+        stride_q_t,
+        stride_q_h,
+        stride_q_d,
+        stride_k_block,
+        stride_k_t,
+        stride_k_h,
+        stride_k_d,
+        stride_v_block,
+        stride_v_t,
+        stride_v_h,
+        stride_v_d,
+        stride_rel_t,
+        stride_rel_h,
+        stride_rel_d,
+        stride_out_t,
+        stride_out_h,
+        stride_out_d,
+        stride_partial_s,
+        stride_partial_t,
+        stride_partial_h,
+        stride_partial_d,
+        stride_stats_s,
+        stride_stats_t,
+        stride_stats_h,
+        stride_bt_b,
+        stride_bt_block,
+        softmax_scale,
         NUM_HEADS: tl.constexpr,
         NUM_KV_HEADS: tl.constexpr,
         SCHEDULER_HEADS: tl.constexpr,
@@ -1533,39 +1470,93 @@ if TLE_AVAILABLE:
                 (
                     _v3_paged_kv_producer,
                     (
-                        k_ptr, v_ptr, block_table_ptr,
-                        cache_seqlens_ptr, cu_seqlens_q_ptr,
-                        k_smem, v_smem, slot_empty, macro_full,
-                        stride_k_block, stride_k_t, stride_k_h, stride_k_d,
-                        stride_v_block, stride_v_t, stride_v_h, stride_v_d,
-                        stride_bt_b, stride_bt_block,
-                        SCHEDULER_HEADS, Q_HEADS_PER_KV_HEAD,
-                        PACK_GQA, NUM_SPLITS,
-                        BLOCK_SIZE, HEAD_DIM_Q, HEAD_DIM_V, BLOCK_Q,
-                        CAUSAL, LOCAL, WINDOW_LEFT, WINDOW_RIGHT,
-                        PAGES_PER_MACRO, NUM_KV_BUFFERS, 0,
+                        k_ptr,
+                        v_ptr,
+                        block_table_ptr,
+                        cache_seqlens_ptr,
+                        cu_seqlens_q_ptr,
+                        k_smem,
+                        v_smem,
+                        slot_empty,
+                        macro_full,
+                        stride_k_block,
+                        stride_k_t,
+                        stride_k_h,
+                        stride_k_d,
+                        stride_v_block,
+                        stride_v_t,
+                        stride_v_h,
+                        stride_v_d,
+                        stride_bt_b,
+                        stride_bt_block,
+                        SCHEDULER_HEADS,
+                        Q_HEADS_PER_KV_HEAD,
+                        PACK_GQA,
+                        NUM_SPLITS,
+                        BLOCK_SIZE,
+                        HEAD_DIM_Q,
+                        HEAD_DIM_V,
+                        BLOCK_Q,
+                        CAUSAL,
+                        LOCAL,
+                        WINDOW_LEFT,
+                        WINDOW_RIGHT,
+                        PAGES_PER_MACRO,
+                        NUM_KV_BUFFERS,
+                        0,
                     ),
                 ),
                 (
                     _v3_attention_consumer,
                     (
-                        q_ptr, rel_ptr, out_ptr,
-                        partial_out_ptr, partial_max_ptr, partial_sum_ptr,
-                        cache_seqlens_ptr, cu_seqlens_q_ptr,
-                        k_smem, v_smem, slot_empty, macro_full,
-                        stride_q_t, stride_q_h, stride_q_d,
-                        stride_rel_t, stride_rel_h, stride_rel_d,
-                        stride_out_t, stride_out_h, stride_out_d,
-                        stride_partial_s, stride_partial_t,
-                        stride_partial_h, stride_partial_d,
-                        stride_stats_s, stride_stats_t, stride_stats_h,
+                        q_ptr,
+                        rel_ptr,
+                        out_ptr,
+                        partial_out_ptr,
+                        partial_max_ptr,
+                        partial_sum_ptr,
+                        cache_seqlens_ptr,
+                        cu_seqlens_q_ptr,
+                        k_smem,
+                        v_smem,
+                        slot_empty,
+                        macro_full,
+                        stride_q_t,
+                        stride_q_h,
+                        stride_q_d,
+                        stride_rel_t,
+                        stride_rel_h,
+                        stride_rel_d,
+                        stride_out_t,
+                        stride_out_h,
+                        stride_out_d,
+                        stride_partial_s,
+                        stride_partial_t,
+                        stride_partial_h,
+                        stride_partial_d,
+                        stride_stats_s,
+                        stride_stats_t,
+                        stride_stats_h,
                         softmax_scale,
-                        SCHEDULER_HEADS, Q_HEADS_PER_KV_HEAD, PACK_GQA,
-                        NUM_SPLITS, SPLIT_KV, HEAD_DIM_Q, HEAD_DIM_V,
-                        BLOCK_D_Q, BLOCK_D_V, REL_EXTENT,
-                        BLOCK_SIZE, BLOCK_Q,
-                        CAUSAL, LOCAL, WINDOW_LEFT, WINDOW_RIGHT,
-                        PAGES_PER_MACRO, NUM_KV_BUFFERS, 1,
+                        SCHEDULER_HEADS,
+                        Q_HEADS_PER_KV_HEAD,
+                        PACK_GQA,
+                        NUM_SPLITS,
+                        SPLIT_KV,
+                        HEAD_DIM_Q,
+                        HEAD_DIM_V,
+                        BLOCK_D_Q,
+                        BLOCK_D_V,
+                        REL_EXTENT,
+                        BLOCK_SIZE,
+                        BLOCK_Q,
+                        CAUSAL,
+                        LOCAL,
+                        WINDOW_LEFT,
+                        WINDOW_RIGHT,
+                        PAGES_PER_MACRO,
+                        NUM_KV_BUFFERS,
+                        1,
                     ),
                 ),
             ],
@@ -1669,7 +1660,7 @@ if TLE_AVAILABLE:
         )
 
         off_q = tl.arange(0, BLOCK_Q)
-        off_k = tl.arange(0, BLOCK_K)
+        tl.arange(0, BLOCK_K)
         off_d_q = tl.arange(0, BLOCK_D_Q)
         off_d_v = tl.arange(0, BLOCK_D_V)
         d_q_valid = off_d_q < HEAD_DIM_Q
@@ -1677,10 +1668,7 @@ if TLE_AVAILABLE:
         scheduler_row = pid_q * BLOCK_Q + off_q
         if PACK_GQA:
             q_local = scheduler_row // Q_HEADS_PER_KV_HEAD
-            q_head = (
-                scheduler_head * Q_HEADS_PER_KV_HEAD
-                + scheduler_row % Q_HEADS_PER_KV_HEAD
-            )
+            q_head = scheduler_head * Q_HEADS_PER_KV_HEAD + scheduler_row % Q_HEADS_PER_KV_HEAD
             kv_head = scheduler_head
         else:
             q_local = scheduler_row
@@ -1694,12 +1682,7 @@ if TLE_AVAILABLE:
         q_global = q_start + q_local
         q_pos = q_local + k_len - q_len
 
-        q_ptrs = (
-            q_ptr
-            + q_global[:, None] * stride_q_t
-            + q_head_offset * stride_q_h
-            + off_d_q[None, :] * stride_q_d
-        )
+        q_ptrs = q_ptr + q_global[:, None] * stride_q_t + q_head_offset * stride_q_h + off_d_q[None, :] * stride_q_d
         q_value = tl.load(
             q_ptrs,
             mask=q_valid[:, None] & d_q_valid[None, :],
@@ -1719,12 +1702,8 @@ if TLE_AVAILABLE:
         if CAUSAL:
             valid_k_end = tl.minimum(valid_k_end, q_pos_max + 1)
         if LOCAL:
-            valid_k_start = tl.maximum(
-                valid_k_start, q_pos_min - WINDOW_LEFT
-            )
-            valid_k_end = tl.minimum(
-                valid_k_end, q_pos_max + WINDOW_RIGHT + 1
-            )
+            valid_k_start = tl.maximum(valid_k_start, q_pos_min - WINDOW_LEFT)
+            valid_k_end = tl.minimum(valid_k_end, q_pos_max + WINDOW_RIGHT + 1)
         valid_k_start = tl.maximum(valid_k_start, 0)
         valid_k_end = tl.maximum(tl.minimum(valid_k_end, k_len), 0)
         # TMA descriptors must describe contiguous physical storage.  A logical
@@ -1736,9 +1715,7 @@ if TLE_AVAILABLE:
         num_k_blocks = (k_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         blocks_per_split = (num_k_blocks + NUM_SPLITS - 1) // NUM_SPLITS
         split_block_start = split_idx * blocks_per_split
-        split_block_end = tl.minimum(
-            split_block_start + blocks_per_split, num_k_blocks
-        )
+        split_block_end = tl.minimum(split_block_start + blocks_per_split, num_k_blocks)
         block_start = tl.maximum(split_block_start, valid_block_start)
         block_end = tl.minimum(split_block_end, valid_block_end)
         NUM_KV_BUFFERS: tl.constexpr = 2
@@ -1766,28 +1743,16 @@ if TLE_AVAILABLE:
         # local_ptr performs no implicit broadcasting.  Build the exact matrices
         # consumed by the existing tl.dot operations once, outside the KV loop.
         page_tokens = tl.arange(0, BLOCK_SIZE)
-        k_smem_t = tl.broadcast_to(
-            page_tokens[None, :], (HEAD_DIM_Q, BLOCK_SIZE)
-        )
-        k_smem_d = tl.broadcast_to(
-            tl.arange(0, HEAD_DIM_Q)[:, None], (HEAD_DIM_Q, BLOCK_SIZE)
-        )
-        v_smem_t = tl.broadcast_to(
-            page_tokens[:, None], (BLOCK_SIZE, HEAD_DIM_V)
-        )
-        v_smem_d = tl.broadcast_to(
-            tl.arange(0, HEAD_DIM_V)[None, :], (BLOCK_SIZE, HEAD_DIM_V)
-        )
+        tl.broadcast_to(page_tokens[None, :], (HEAD_DIM_Q, BLOCK_SIZE))
+        tl.broadcast_to(tl.arange(0, HEAD_DIM_Q)[:, None], (HEAD_DIM_Q, BLOCK_SIZE))
+        tl.broadcast_to(page_tokens[:, None], (BLOCK_SIZE, HEAD_DIM_V))
+        tl.broadcast_to(tl.arange(0, HEAD_DIM_V)[None, :], (BLOCK_SIZE, HEAD_DIM_V))
 
         # Prologue: put page zero of this CTA's range in slot 0. Invalid regular-
         # grid CTAs and empty pruned ranges issue no TMA and enter a zero-trip loop.
         has_page = block_start < block_end
         if has_page:
-            physical_page = tl.load(
-                block_table_ptr
-                + seq_id * stride_bt_b
-                + block_start * stride_bt_block
-            )
+            physical_page = tl.load(block_table_ptr + seq_id * stride_bt_b + block_start * stride_bt_block)
             k_desc = tl.make_tensor_descriptor(
                 k_ptr + physical_page * stride_k_block + kv_head * stride_k_h,
                 shape=[BLOCK_SIZE, HEAD_DIM_Q],
@@ -1801,11 +1766,17 @@ if TLE_AVAILABLE:
                 block_shape=[BLOCK_SIZE, HEAD_DIM_V],
             )
             tle.gpu.copy(
-                k_desc, k_smem.slot(0), [BLOCK_SIZE, HEAD_DIM_Q], [0, 0],
+                k_desc,
+                k_smem.slot(0),
+                [BLOCK_SIZE, HEAD_DIM_Q],
+                [0, 0],
                 barrier=k_full[0],
             )
             tle.gpu.copy(
-                v_desc, v_smem.slot(0), [BLOCK_SIZE, HEAD_DIM_V], [0, 0],
+                v_desc,
+                v_smem.slot(0),
+                [BLOCK_SIZE, HEAD_DIM_V],
+                [0, 0],
                 barrier=v_full[0],
             )
 
@@ -1822,23 +1793,15 @@ if TLE_AVAILABLE:
             next_block = block_k + 1
             if next_block < block_end:
                 next_slot = (page_iter + 1) % NUM_KV_BUFFERS
-                next_physical_page = tl.load(
-                    block_table_ptr
-                    + seq_id * stride_bt_b
-                    + next_block * stride_bt_block
-                )
+                next_physical_page = tl.load(block_table_ptr + seq_id * stride_bt_b + next_block * stride_bt_block)
                 next_k_desc = tl.make_tensor_descriptor(
-                    k_ptr
-                    + next_physical_page * stride_k_block
-                    + kv_head * stride_k_h,
+                    k_ptr + next_physical_page * stride_k_block + kv_head * stride_k_h,
                     shape=[BLOCK_SIZE, HEAD_DIM_Q],
                     strides=[stride_k_t, stride_k_d],
                     block_shape=[BLOCK_SIZE, HEAD_DIM_Q],
                 )
                 next_v_desc = tl.make_tensor_descriptor(
-                    v_ptr
-                    + next_physical_page * stride_v_block
-                    + kv_head * stride_v_h,
+                    v_ptr + next_physical_page * stride_v_block + kv_head * stride_v_h,
                     shape=[BLOCK_SIZE, HEAD_DIM_V],
                     strides=[stride_v_t, stride_v_d],
                     block_shape=[BLOCK_SIZE, HEAD_DIM_V],
@@ -1876,22 +1839,15 @@ if TLE_AVAILABLE:
             if CAUSAL:
                 mask = mask & (k_local[None, :] <= q_pos[:, None])
             if LOCAL:
-                mask = mask & (
-                    k_local[None, :] >= q_pos[:, None] - WINDOW_LEFT
-                )
+                mask = mask & (k_local[None, :] >= q_pos[:, None] - WINDOW_LEFT)
             if LOCAL:
-                mask = mask & (
-                    k_local[None, :] <= q_pos[:, None] + WINDOW_RIGHT
-                )
+                mask = mask & (k_local[None, :] <= q_pos[:, None] + WINDOW_RIGHT)
 
             rel_dist = q_pos[:, None] - k_local[None, :]
             rel_in_range = (rel_dist >= 0) & (rel_dist < REL_EXTENT)
             safe_rel_idx = tl.where(rel_in_range, rel_dist, 0)
             rel_ptrs = (
-                rel_ptr
-                + q_global[:, None] * stride_rel_t
-                + q_head_offset * stride_rel_h
-                + safe_rel_idx * stride_rel_d
+                rel_ptr + q_global[:, None] * stride_rel_t + q_head_offset * stride_rel_h + safe_rel_idx * stride_rel_d
             )
             rel_bias = tl.load(
                 rel_ptrs,
@@ -1937,11 +1893,7 @@ if TLE_AVAILABLE:
                 + q_head_offset * stride_partial_h
                 + off_d_v[None, :] * stride_partial_d
             )
-            stats_ptrs = (
-                split_idx * stride_stats_s
-                + q_global * stride_stats_t
-                + q_head * stride_stats_h
-            )
+            stats_ptrs = split_idx * stride_stats_s + q_global * stride_stats_t + q_head * stride_stats_h
             tl.store(partial_ptrs, acc, mask=q_valid[:, None] & d_v_valid[None, :])
             tl.store(partial_max_ptr + stats_ptrs, m_i, mask=q_valid)
             tl.store(partial_sum_ptr + stats_ptrs, l_i, mask=q_valid)
@@ -2045,10 +1997,7 @@ if TLE_AVAILABLE:
             0.0,
         )
         out_ptrs = (
-            out_ptr
-            + q_global[:, None] * stride_out_t
-            + q_head[:, None] * stride_out_h
-            + off_d[None, :] * stride_out_d
+            out_ptr + q_global[:, None] * stride_out_t + q_head[:, None] * stride_out_h + off_d[None, :] * stride_out_d
         )
         tl.store(out_ptrs, output, mask=value_mask)
 
@@ -2056,15 +2005,38 @@ else:
 
     def inkling_fa4_rel_attention_tle(*args: Any, **kwargs: Any) -> torch.Tensor:
         """Placeholder used when ``triton.experimental.tle`` is unavailable."""
-        raise RuntimeError(
-            "TLE backend unavailable: "
-            f"{type(TLE_IMPORT_ERROR).__name__}: {TLE_IMPORT_ERROR}"
-        )
-
+        raise RuntimeError(f"TLE backend unavailable: {type(TLE_IMPORT_ERROR).__name__}: {TLE_IMPORT_ERROR}")
 
 
 _TRITON_ALIASES = {"triton", "base"}
 _TLE_ALIASES = {"tle", "triton_tle", "triton-tle"}
+
+
+def tle_available() -> tuple[bool, str]:
+    """Return TLE import availability and an optional diagnostic reason."""
+    if TLE_AVAILABLE:
+        return True, ""
+    return False, f"{type(TLE_IMPORT_ERROR).__name__}: {TLE_IMPORT_ERROR}"
+
+
+def get_backend(name: str | None = None):
+    """Resolve an implementation without launching it or checking its input layout.
+
+    Auto selects TLE when importable. Use ``inkling_fa4_rel_attention`` for
+    layout-aware fallback. An explicitly requested unavailable TLE raises
+    ImportError so benchmark callers can report it as unavailable.
+    """
+    selected = (name or os.getenv("INKLING_FA4_BACKEND", "auto")).strip().lower()
+    if selected in _TRITON_ALIASES:
+        return inkling_fa4_rel_attention_triton
+    if selected in _TLE_ALIASES:
+        if not TLE_AVAILABLE:
+            raise ImportError(f"triton.experimental.tle unavailable: {TLE_IMPORT_ERROR}")
+        return inkling_fa4_rel_attention_tle
+    if selected == "auto":
+        return inkling_fa4_rel_attention_tle if TLE_AVAILABLE else inkling_fa4_rel_attention_triton
+    choices = ", ".join(sorted(_TRITON_ALIASES | _TLE_ALIASES | {"auto"}))
+    raise ValueError(f"unknown Inkling FA4 backend={selected!r}; choose from {choices}")
 
 
 def inkling_fa4_rel_attention(
@@ -2080,9 +2052,7 @@ def inkling_fa4_rel_attention(
     implementation handles short query shapes with masked WGMMA tiles; it
     raises ``NotImplementedError`` only for unsupported tensor layouts.
     """
-    selected = (
-        backend or os.getenv("INKLING_FA4_BACKEND", "auto")
-    ).strip().lower()
+    selected = (backend or os.getenv("INKLING_FA4_BACKEND", "auto")).strip().lower()
 
     if selected in _TRITON_ALIASES:
         return inkling_fa4_rel_attention_triton(*args, **kwargs)
@@ -2092,9 +2062,7 @@ def inkling_fa4_rel_attention(
 
     if selected != "auto":
         choices = ", ".join(sorted(_TRITON_ALIASES | _TLE_ALIASES | {"auto"}))
-        raise ValueError(
-            f"unknown Inkling FA4 backend={selected!r}; choose from {choices}"
-        )
+        raise ValueError(f"unknown Inkling FA4 backend={selected!r}; choose from {choices}")
 
     if not TLE_AVAILABLE:
         return inkling_fa4_rel_attention_triton(*args, **kwargs)
@@ -2108,6 +2076,8 @@ def inkling_fa4_rel_attention(
 
 
 __all__ = [
+    "get_backend",
+    "tle_available",
     "TLE_AVAILABLE",
     "TLE_IMPORT_ERROR",
     "inkling_fa4_rel_attention",
