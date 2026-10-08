@@ -19,13 +19,16 @@ import pytest
 import torch
 
 from flag_attn import InfLLMV2Config, infllmv2_attention, infllmv2_decode
-from flag_attn.infllmv2.api import _infllmv2_attention_debug
-from flag_attn.infllmv2.kernels import (
+from flag_attn.infllmv2 import forward as forward_impl
+from flag_attn.infllmv2.forward import (
     _sparse_attention_forward,
+    compressed_lengths,
     compress_k,
     pool_scores,
     select_blocks,
+    sparse_attention_tle_hopper,
     stage1,
+    stage1_tle_hopper,
 )
 from flag_attn.infllmv2.reference import (
     compress_k_ref,
@@ -42,15 +45,7 @@ pytestmark = pytest.mark.skipif(not HAS_GPU, reason="CUDA, PyTorch and Triton ar
 ATTENTION = pytest.mark.infllmv2_attention
 DECODE = pytest.mark.infllmv2_decode
 
-try:
-    from flag_attn.infllmv2.tle_kernels import (
-        sparse_attention_tle_hopper,
-        stage1_tle_hopper,
-    )
-except (ImportError, AttributeError):
-    HAS_TLE = False
-else:
-    HAS_TLE = True
+HAS_TLE = forward_impl._TLE_AVAILABLE
 
 
 def _cu(lengths: tuple[int, ...]) -> torch.Tensor:
@@ -225,11 +220,10 @@ def test_attention_full_prefix_chunk_varlen(
 def test_attention_dense_path(d: int) -> None:
     q, k, v, cu_q, cu_k = _packed_inputs((96, 128), (128, 192), d=d)
     config = InfLLMV2Config(dense_len=8192)
-    actual, debug = _infllmv2_attention_debug(
+    actual = infllmv2_attention(
         q, k, v, cu_q, cu_k, 128, 192, config=config
     )
     expected = dense_attention_ref(q, k, v, cu_q, cu_k)
-    assert debug.path == "dense"
     torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
 
 
@@ -325,7 +319,7 @@ def test_tle_stage2_matches_standard_when_available() -> None:
 
 @ATTENTION
 def test_d64_tle_stage1_dispatch_and_standard_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    kernels = importlib.import_module("flag_attn.infllmv2.kernels")
+    kernels = importlib.import_module("flag_attn.infllmv2.forward")
     q = torch.zeros((1, 32, 64), device="cuda", dtype=torch.bfloat16)
     k1 = torch.zeros((1, 2, 64), device="cuda", dtype=torch.bfloat16)
     k2 = torch.zeros_like(k1)

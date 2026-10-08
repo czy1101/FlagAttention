@@ -1,13 +1,12 @@
 # Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
+# Licensed under the Apache License, Version 2.0.
 
-"""Readable PyTorch references for the InfLLM-V2 selector and sparse attention.
+"""Readable PyTorch references for the InfLLM-V2 algorithm.
 
-These functions intentionally favor clarity over speed.  They define the tensor
-layout and edge semantics used by the Triton implementation and are useful for
-testing individual pipeline stages without entering the production API.
+These functions favor clarity over speed. They define the tensor layouts and
+edge semantics used by the Triton implementation and are intended for tests,
+validation, and algorithm study. The production public APIs do not dispatch to
+this module.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ import math
 
 import torch
 
-from .utils import compressed_lengths
+from .forward import compressed_lengths
 
 
 def compress_k_ref(
@@ -51,12 +50,7 @@ def stage1_ref(
     causal: bool = True,
     cu_seqlens_k: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Two-pass Stage-1 semantics, returning ``[Hkv, Tq, max_K1]``.
-
-    The coarse K2 pass supplies the log-sum-exp denominator.  Fine K1 weights
-    are normalized by it, then summed across the G query heads associated with
-    each KV head.  Unused padded columns are zero.
-    """
+    """Two-pass Stage-1 semantics, returning ``[Hkv, Tq, max_K1]``."""
     total_q, hq, d = q.shape
     hkv = k1.shape[1]
     if hq % hkv:
@@ -66,7 +60,9 @@ def stage1_ref(
     max_k1 = int(torch.max(cu_seqlens_k1[1:] - cu_seqlens_k1[:-1]).item())
     out = torch.zeros((hkv, total_q, max_k1), dtype=q.dtype, device=q.device)
     q_cu = cu_seqlens_q.detach().cpu().tolist()
-    original_k_cu = (cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k).detach().cpu().tolist()
+    original_k_cu = (
+        cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k
+    ).detach().cpu().tolist()
     k1_cu = cu_seqlens_k1.detach().cpu().tolist()
     k2_cu = cu_seqlens_k2.detach().cpu().tolist()
 
@@ -81,9 +77,8 @@ def stage1_ref(
         k2_cu[1:],
     ):
         q_seq = q[qs:qe].float().view(qe - qs, hkv, group, d)
-        q_position_offset = (ke - ks) - (qe - qs)
         for hk in range(hkv):
-            qh = q_seq[:, hk]  # [Lq, G, D]
+            qh = q_seq[:, hk]
             coarse = torch.einsum("qgd,kd->qgk", qh, k2[a2:z2, hk].float()) * scale
             fine = torch.einsum("qgd,kd->qgk", qh, k1[a1:z1, hk].float()) * scale
             if causal:
@@ -94,9 +89,13 @@ def stage1_ref(
                 coarse_q_len = max(0, qe - qs - coarse_stride + 1) // coarse_stride
                 fine_q_len = max(0, qe - qs - k1_stride + 1) // k1_stride
                 coarse_valid = cpos < torch.clamp(
-                    (qpos + 1) // coarse_stride - 1 + z2 - a2 - coarse_q_len, min=0)
+                    (qpos + 1) // coarse_stride - 1 + z2 - a2 - coarse_q_len,
+                    min=0,
+                )
                 fine_valid = fpos < torch.clamp(
-                    (qpos + 1) // k1_stride - 1 + z1 - a1 - fine_q_len, min=0)
+                    (qpos + 1) // k1_stride - 1 + z1 - a1 - fine_q_len,
+                    min=0,
+                )
                 coarse = coarse.masked_fill(~coarse_valid[:, None, :], -torch.inf)
                 fine = fine.masked_fill(~fine_valid[:, None, :], -torch.inf)
             lse = torch.logsumexp(coarse, dim=-1)
@@ -119,19 +118,30 @@ def pool_scores_ref(
     cu_seqlens_k: torch.Tensor | None = None,
     max_seqlen_k: int | None = None,
 ) -> torch.Tensor:
-    """Map K1 scores to 64-token block scores using the operator pooling rules."""
-    hkv, total_q, max_k1 = score.shape
-    if max_seqlen_k is None:
-        max_seqlen_k = max_seqlen_q
+    """Map K1 scores to block scores using the operator pooling rules."""
+    hkv, total_q, _ = score.shape
+    max_seqlen_k = max_seqlen_q if max_seqlen_k is None else max_seqlen_k
     max_blocks = math.ceil(max_seqlen_k / block_size)
-    result = torch.full((hkv, total_q, max_blocks), -torch.inf, device=score.device, dtype=score.dtype)
+    result = torch.full(
+        (hkv, total_q, max_blocks),
+        -torch.inf,
+        device=score.device,
+        dtype=score.dtype,
+    )
     window = kernel_size // kernel_stride + block_size // kernel_stride - 1
     pad = kernel_size // kernel_stride - 1
     q_cu = cu_seqlens_q.detach().cpu().tolist()
-    original_k_cu = (cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k).detach().cpu().tolist()
+    original_k_cu = (
+        cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k
+    ).detach().cpu().tolist()
     k1_cu = cu_seqlens_k1.detach().cpu().tolist()
     for qs, qe, ks, ke, k1s, k1e in zip(
-        q_cu[:-1], q_cu[1:], original_k_cu[:-1], original_k_cu[1:], k1_cu[:-1], k1_cu[1:]
+        q_cu[:-1],
+        q_cu[1:],
+        original_k_cu[:-1],
+        original_k_cu[1:],
+        k1_cu[:-1],
+        k1_cu[1:],
     ):
         k1_len = k1e - k1s
         q_position_offset = (ke - ks) - (qe - qs)
@@ -139,14 +149,16 @@ def pool_scores_ref(
             q_block = (q_position_offset + q_local) // block_size
             num_k_blocks = math.ceil((ke - ks) / block_size)
             for kb in range(num_k_blocks):
-                if kb < init_blocks or (kb <= q_block <= kb + local_blocks):
+                if kb < init_blocks or kb <= q_block <= kb + local_blocks:
                     result[:, qs + q_local, kb] = torch.inf
                     continue
                 begin = kb * (block_size // kernel_stride) - pad
                 ids = torch.arange(begin, begin + window, device=score.device)
                 valid = (ids >= 0) & (ids < k1_len)
                 if valid.any():
-                    result[:, qs + q_local, kb] = score[:, qs + q_local, ids[valid]].amax(dim=-1)
+                    result[:, qs + q_local, kb] = score[
+                        :, qs + q_local, ids[valid]
+                    ].amax(dim=-1)
     return result
 
 
@@ -157,19 +169,36 @@ def select_blocks_ref(
     block_size: int = 64,
     cu_seqlens_k: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Select causal blocks. Invalid slots are ``-1`` and rows are sorted."""
+    """Select causal blocks; invalid slots are ``-1`` and rows are sorted."""
     hkv, total_q, _ = block_score.shape
-    result = torch.full((hkv, total_q, topk), -1, dtype=torch.int32, device=block_score.device)
+    result = torch.full(
+        (hkv, total_q, topk),
+        -1,
+        dtype=torch.int32,
+        device=block_score.device,
+    )
     q_cu = cu_seqlens_q.detach().cpu().tolist()
-    original_k_cu = (cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k).detach().cpu().tolist()
-    for qs, qe, ks, ke in zip(q_cu[:-1], q_cu[1:], original_k_cu[:-1], original_k_cu[1:]):
+    original_k_cu = (
+        cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k
+    ).detach().cpu().tolist()
+    for qs, qe, ks, ke in zip(
+        q_cu[:-1], q_cu[1:], original_k_cu[:-1], original_k_cu[1:]
+    ):
         q_position_offset = (ke - ks) - (qe - qs)
         for q_local in range(qe - qs):
             q_position = q_position_offset + q_local
-            valid_blocks = min(math.ceil((ke - ks) / block_size), (q_position + block_size) // block_size)
+            valid_blocks = min(
+                math.ceil((ke - ks) / block_size),
+                (q_position + block_size) // block_size,
+            )
             count = min(topk, valid_blocks)
             if count:
-                idx = torch.argsort(block_score[:, qs + q_local, :valid_blocks], dim=-1, descending=True, stable=True)[:, :count]
+                idx = torch.argsort(
+                    block_score[:, qs + q_local, :valid_blocks],
+                    dim=-1,
+                    descending=True,
+                    stable=True,
+                )[:, :count]
                 result[:, qs + q_local, :count] = idx.sort(dim=-1).values.to(torch.int32)
     return result
 
@@ -190,10 +219,6 @@ def sparse_attention_ref(
     hkv = k.shape[1]
     group = hq // hkv
     scale = softmax_scale if softmax_scale is not None else d**-0.5
-    # Cast BEFORE repeated indexing: autograd must accumulate the contributions
-    # from all queries/heads in FP32, then cast each input gradient only once.
-    # Casting each indexed slice separately would accumulate dK/dV in BF16/FP16
-    # at the input and introduce large, avoidable errors in the reference itself.
     q_fp32, k_fp32, v_fp32 = q.float(), k.float(), v.float()
     out = torch.zeros_like(q)
     q_cu = cu_seqlens_q.detach().cpu().tolist()
@@ -204,14 +229,12 @@ def sparse_attention_ref(
             causal_limit = k_len - q_len + qi + 1
             for h in range(hq):
                 hk = h // group
-                blocks = selected_blocks[hk, qs + qi]
                 positions: list[int] = []
-                for block in blocks.detach().cpu().tolist():
+                for block in selected_blocks[hk, qs + qi].detach().cpu().tolist():
                     if block < 0:
                         continue
                     lo = block * block_size
-                    hi = min(lo + block_size, k_len)
-                    positions.extend(range(lo, hi))
+                    positions.extend(range(lo, min(lo + block_size, k_len)))
                 if causal:
                     positions = [pos for pos in positions if pos < causal_limit]
                 if not positions:
@@ -219,7 +242,9 @@ def sparse_attention_ref(
                 ids = torch.tensor(positions, device=q.device, dtype=torch.long)
                 logits = (k_fp32[ks + ids, hk] @ q_fp32[qs + qi, h]) * scale
                 probs = torch.softmax(logits, dim=0)
-                out[qs + qi, h] = (probs[:, None] * v_fp32[ks + ids, hk]).sum(dim=0).to(q.dtype)
+                out[qs + qi, h] = (
+                    probs[:, None] * v_fp32[ks + ids, hk]
+                ).sum(dim=0).to(q.dtype)
     return out
 
 
@@ -244,7 +269,6 @@ def dense_attention_ref(
     k_cu = cu_seqlens_k.detach().cpu().tolist()
     for qs, qe, ks, ke in zip(q_cu[:-1], q_cu[1:], k_cu[:-1], k_cu[1:]):
         q_seq = q[qs:qe].float().transpose(0, 1)
-        # Keep the GQA head reduction in FP32 during autograd as well.
         k_seq = k[ks:ke].float().repeat_interleave(group, dim=1).transpose(0, 1)
         v_seq = v[ks:ke].float().repeat_interleave(group, dim=1).transpose(0, 1)
         logits = torch.matmul(q_seq, k_seq.transpose(-1, -2)) * scale
@@ -253,7 +277,6 @@ def dense_attention_ref(
             q_pos = (k_len - q_len) + torch.arange(q_len, device=q.device)[:, None]
             k_pos = torch.arange(k_len, device=q.device)[None, :]
             logits = logits.masked_fill((k_pos > q_pos)[None, :, :], -torch.inf)
-        probs = torch.softmax(logits, dim=-1)
-        probs = torch.nan_to_num(probs, nan=0.0)
+        probs = torch.nan_to_num(torch.softmax(logits, dim=-1), nan=0.0)
         outputs.append(torch.matmul(probs, v_seq).transpose(0, 1).to(q.dtype))
     return torch.cat(outputs, dim=0)
