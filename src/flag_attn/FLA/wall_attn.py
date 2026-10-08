@@ -8,6 +8,7 @@ the bundled official implementation.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from functools import lru_cache
 from importlib import import_module
 from numbers import Real
@@ -24,6 +25,12 @@ RCP_LN2 = 1.4426950216
 _FAST_T = frozenset((512, 1024, 2048, 4096))
 _FAST_H = frozenset((2, 8))
 _FAST_BF16_D = frozenset((64, 128))
+_LAST_ROUTE: ContextVar[str | None] = ContextVar("wall_attn_route", default=None)
+
+
+def get_last_route() -> str | None:
+    """Return the completed call's route in this context, for benchmark reporting."""
+    return _LAST_ROUTE.get()
 
 
 @lru_cache(maxsize=1)
@@ -60,7 +67,7 @@ def select_route(
     window_size: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
 ) -> str:
-    """Select ``tle_bf16``, ``tle_fp16``, or ``official_fallback``."""
+    """Select a candidate path from metadata; preprocessing checks numerical safety."""
     if any(value is not None for value in (g_scalar, sink_bias, window_size, cu_seqlens)):
         return "official_fallback"
     if scale is not None and not isinstance(scale, Real):
@@ -94,6 +101,11 @@ def select_route(
         return "official_fallback"
     if _requires_backward(q, k, v, g):
         return "official_fallback"
+    # Numerical validation reads a device flag. Keep graph capture on the
+    # general implementation, which does not require a device-to-host read.
+    with torch.cuda.device(q.device):
+        if torch.cuda.is_current_stream_capturing():
+            return "official_fallback"
 
     if q.dtype == k.dtype == v.dtype == g.dtype == torch.bfloat16 and d in _FAST_BF16_D:
         return "tle_bf16"
@@ -109,7 +121,7 @@ def _parallel_wall_attn_tle(
     v: torch.Tensor,
     g: torch.Tensor,
     scale: float,
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     attention_bf16, attention_fp16, cache, preprocess = _load_tle_modules()
     b, t, hq, d = q.shape
     cache_dtype = q.dtype if route == "tle_bf16" else torch.bfloat16
@@ -118,12 +130,18 @@ def _parallel_wall_attn_tle(
     anchor = torch.empty((b, hq, d), device=q.device, dtype=torch.float32)
     output = torch.empty((b, t, hq, d), device=q.device, dtype=v.dtype)
     lse = torch.empty((b, t, hq), device=q.device, dtype=torch.float32)
+    unsafe = torch.zeros((), device=q.device, dtype=torch.int32)
 
     if t <= 2048:
-        preprocess.launch(q, k, g, q_cache, k_cache, anchor, bt=128, bc=8, warps=4)
+        preprocess.launch(q, k, g, q_cache, k_cache, anchor, unsafe, bt=128, bc=8, warps=4)
     else:
         prefix = chunk_global_cumsum(g, scale=RCP_LN2)
-        cache.build(q, k, prefix, q_cache, k_cache, anchor)
+        cache.build(q, k, g, prefix, q_cache, k_cache, anchor, unsafe)
+
+    # Never pass invalid cached operands to WGMMA. This synchronization is part
+    # of the public provider's end-to-end latency and must remain in benchmarks.
+    if unsafe.item():
+        return None
 
     attention = attention_bf16 if route == "tle_bf16" else attention_fp16
     attention.launch(q_cache, k_cache, v, output, lse, capacity=2, scale=scale)
@@ -142,7 +160,14 @@ def parallel_wall_attn(
     window_size: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
 ) -> torch.Tensor:
-    """Run the accepted H100 fast path or the full official implementation."""
+    """Run a numerically checked H100 path or the full official implementation.
+
+    Fast paths require nonpositive gates and finite, non-underflowing BF16 Q/K
+    operands with gauge exponents within +/-125. Other data use the general
+    implementation. Validation synchronizes with the host; graph capture uses
+    the general implementation instead.
+    """
+    _LAST_ROUTE.set(None)
     route = select_route(
         q,
         k,
@@ -155,15 +180,19 @@ def parallel_wall_attn(
         cu_seqlens=cu_seqlens,
     )
     if route != "official_fallback":
-        return _parallel_wall_attn_tle(
-            route,
-            q,
-            k,
-            v,
-            g,
-            scale=k.shape[-1] ** -0.5 if scale is None else float(scale),
-        )
-    return _official_wall_attn(
+        with torch.cuda.device(q.device):
+            output = _parallel_wall_attn_tle(
+                route,
+                q,
+                k,
+                v,
+                g,
+                scale=k.shape[-1] ** -0.5 if scale is None else float(scale),
+            )
+        if output is not None:
+            _LAST_ROUTE.set(route)
+            return output
+    output = _official_wall_attn(
         q,
         k,
         v,
@@ -174,6 +203,8 @@ def parallel_wall_attn(
         window_size=window_size,
         cu_seqlens=cu_seqlens,
     )
+    _LAST_ROUTE.set("official_fallback")
+    return output
 
 
-__all__ = ["parallel_wall_attn", "select_route"]
+__all__ = ["parallel_wall_attn", "select_route", "get_last_route"]

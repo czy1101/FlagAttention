@@ -20,7 +20,7 @@ except ModuleNotFoundError:
     from recording import benchmark_metric, record_benchmark_result
 
 from flag_attn import parallel_wall_attn
-from flag_attn.FLA.wall_attn import select_route
+from flag_attn.FLA.wall_attn import get_last_route, select_route
 from flag_attn.utils import has_triton_tle
 
 SEQUENCE_LENGTHS = (512, 1024, 2048, 4096)
@@ -90,6 +90,7 @@ def _run_benchmark(dtype_name, dtype, record_property=None):
             assert select_route(*inputs, scale=scale) == expected_route
 
             outputs = {name: fn() for name, fn in providers.items()}
+            actual_route = get_last_route()
             torch.cuda.synchronize()
             for name, output in outputs.items():
                 assert torch.isfinite(output).all(), f"{name} produced NaN/Inf"
@@ -140,7 +141,7 @@ def _run_benchmark(dtype_name, dtype, record_property=None):
                     latency_base=fla_ms,
                     latency=optimized_ms,
                     speedup=speedup,
-                    provider_route=expected_route,
+                    provider_route=actual_route,
                     samples=latency,
                 )
             )

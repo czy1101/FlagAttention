@@ -28,7 +28,7 @@ def global_anchor_kernel(prefix, anchor, T: tl.constexpr, HQ: tl.constexpr,
 
 @triton.jit
 def global_gauge_cache_kernel(
-    q, k, prefix, anchor, q_cache, k_cache,
+    q, k, g, prefix, anchor, q_cache, k_cache, unsafe,
     T: tl.constexpr, H: tl.constexpr, HQ: tl.constexpr,
     G: tl.constexpr, D: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_D: tl.constexpr,
@@ -64,14 +64,30 @@ def global_gauge_cache_kernel(
         + dims[None, :],
         mask=mask, other=0.0,
     ).to(tl.float32)
+    gate = tl.load(
+        g + ((batch * T + tokens[:, None]) * HQ + query_head) * D + dims[None, :],
+        mask=mask, other=0.0,
+    ).to(tl.float32)
     q_operand = q_value * tl.exp2(p - reference[None, :])
     k_operand = k_value * tl.exp2(reference[None, :] - p)
+    q_stored = q_operand.to(q_cache.dtype.element_ty)
+    k_stored = k_operand.to(k_cache.dtype.element_ty)
+    valid = (
+        (gate <= 0.0)
+        & (tl.abs(p - reference[None, :]) <= 125.0)
+        & (tl.abs(q_stored.to(tl.float32)) < float("inf"))
+        & (tl.abs(k_stored.to(tl.float32)) < float("inf"))
+        & ((q_value == 0.0) | (q_stored != 0.0))
+        & ((k_value == 0.0) | (k_stored != 0.0))
+    )
+    if tl.sum(tl.sum((mask & ~valid).to(tl.int32), axis=0), axis=0) > 0:
+        tl.atomic_or(unsafe, 1, sem="relaxed")
     output_offset = ((bhq * T + tokens[:, None]) * D) + dims[None, :]
-    tl.store(q_cache + output_offset, q_operand, mask=mask)
-    tl.store(k_cache + output_offset, k_operand, mask=mask)
+    tl.store(q_cache + output_offset, q_stored, mask=mask)
+    tl.store(k_cache + output_offset, k_stored, mask=mask)
 
 
-def build(q, k, prefix, q_cache, k_cache, anchor):
+def build(q, k, g, prefix, q_cache, k_cache, anchor, unsafe):
     b, t, hq, d = q.shape
     h = k.shape[2]
     global_anchor_kernel[(b * hq, triton.cdiv(d, 32))](
@@ -81,7 +97,7 @@ def build(q, k, prefix, q_cache, k_cache, anchor):
     global_gauge_cache_kernel[
         (triton.cdiv(t, 64), triton.cdiv(d, 32), b * hq)
     ](
-        q, k, prefix, anchor, q_cache, k_cache,
+        q, k, g, prefix, anchor, q_cache, k_cache, unsafe,
         T=t, H=h, HQ=hq, G=hq // h, D=d,
         BLOCK_T=64, BLOCK_D=32,
         num_warps=4, num_stages=2,
