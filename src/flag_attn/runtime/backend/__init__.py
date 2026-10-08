@@ -11,3 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from .device_finder import DeviceDetector, detect_vendor
+
+
+def get_backend_name() -> str:
+    """Return the selected vendor, including CUDA-compatible vendor runtimes."""
+    return detect_vendor()
+
+
+def is_metax_backend() -> bool:
+    return get_backend_name() == "metax"
+
+
+__all__ = ["DeviceDetector", "get_backend_name", "is_metax_backend"]

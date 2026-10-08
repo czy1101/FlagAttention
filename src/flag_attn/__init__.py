@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
+from flag_attn import runtime
+
+# Match FlagGems and FlagGems-vllm: the package exposes strings, while
+# runtime.device retains the structured vendor/device metadata.
+device = runtime.device.name
+vendor_name = runtime.device.vendor_name
+vendor = vendor_name
+backend_info = runtime.device
+
 try:
     from ._version import version as __version__
     from ._version import version_tuple
