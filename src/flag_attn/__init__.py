@@ -37,6 +37,11 @@ from flag_attn.split_kv import attention as flash_attention_split_kv  # noqa: F4
 from flag_attn.paged import attention as paged_attention  # noqa: F401
 from flag_attn import testing  # noqa: F401
 
+_FLA_EXPORTS = {
+    "chunk_log_linear_attn": (
+        "flag_attn.FLA.log_linear_attn",
+        "chunk_log_linear_attn",
+    ),
 _OPERATOR_EXPORTS = {
     "chunk_gated_delta_rule": (
         "flag_attn.FLA.gated_delta_rule",
@@ -49,6 +54,18 @@ _OPERATOR_EXPORTS = {
     "chunk_gdn2": ("flag_attn.gdn2", "chunk_gdn2"),
     "chunk_kda": ("flag_attn.FLA.chunk_kda", "chunk_kda_fwd_infer"),
     "parallel_wall_attn": ("flag_attn.FLA.wall_attn", "parallel_wall_attn"),
+    "InfLLMV2Config": (
+        "flag_attn.infllmv2",
+        "InfLLMV2Config",
+    ),
+    "infllmv2_attention": (
+        "flag_attn.infllmv2",
+        "infllmv2_attention",
+    ),
+    "infllmv2_decode": (
+        "flag_attn.infllmv2",
+        "infllmv2_decode",
+    ),
 }
 
 for _name in (
@@ -89,15 +106,19 @@ __all__ = [
     "flash_attention",
     "flash_attention_split_kv",
     "paged_attention",
+    "chunk_log_linear_attn",
     "chunk_gated_delta_rule",
     "chunk_gla",
     "chunk_gdn2",
     "chunk_kda",
-    "parallel_wall_attn",
+    "InfLLMV2Config",
+    "infllmv2_attention",
+    "infllmv2_decode",
     "minimax_m3_index_decode",
     "minimax_m3_index_decode_score",
     "minimax_m3_index_score",
     "minimax_m3_index_topk",
     "minimax_m3_sparse_attn",
     "minimax_m3_sparse_attn_decode",
+    "parallel_wall_attn",
 ]
