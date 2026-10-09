@@ -295,7 +295,3 @@ def run_benchmark(
             torch.cuda.empty_cache()
         recorder.record()
     _print_footer()
-
-
-if __name__ == "__main__":
-    run_benchmark()

@@ -93,9 +93,10 @@ ops:
       - tests/flag_attn/test_hpc_ops_decode_qkpertoken_perhead_vperhead_fp8.py::test_attn_fp8_sm90
       - tests/flag_attn/test_hpc_ops_decode_qpertoken_perhead_kvpertensor_fp8.py::test_attn_fp8_sm90
     benchmark: benchmark/test_hpc_ops_decode_fp8_perf.py
-  - id: chunk_gated_delta_rule_fwd
+  - id: chunk_gated_delta_rule
     description: Run the forward path for chunked gated delta rule attention.
     for:
+      - chunk_gated_delta_rule
       - chunk_gated_delta_rule_fwd
     labels:
       - fused
@@ -256,8 +257,15 @@ ops:
       - inkling_fa4_rel_attention
     labels:
       - KernelGen
+      - Attention
+      - NoCPU
     kind:
-      - NeuralNetwork
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_relative_attention.py
+    benchmark: benchmark/test_inkling_fa4_benchmark.py
   - id: minimax_m3_index_topk
     description: Select MiniMax M3 prefill sparse-attention top-k blocks.
     for:
@@ -316,6 +324,9 @@ ops:
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_k16_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_identity_out_and_score_out_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_fp8
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_public_exports_use_active_backend
+      - tests/flag_attn/test_minimax_sparse_attention.py::test_metax_public_exports
+    benchmark: benchmark/test_minimax_sparse_attention_benchmark.py
   - id: parallel_moba
     description: Run variable-length parallel MoBA attention.
     for:
@@ -367,7 +378,7 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/flag_attn/test_parallel_nsa.py
-    benchmark: benchmark/parallel_nsa_benchmark.py
+    benchmark: benchmark/test_parallel_nsa_benchmark.py
     benchmark_requires:
       - torch_gcu
   - id: parallel_nsa_compression
@@ -385,6 +396,9 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/flag_attn/test_parallel_nsa_compression.py
+    benchmark: benchmark/test_parallel_nsa_benchmark.py
+    benchmark_requires:
+      - torch_gcu
   - id: piecewise_attention
     description: Run the forward path for piecewise attention.
     for:
@@ -458,3 +472,133 @@ ops:
     tests:
       - src/flag_attn/runtime/backend/_ascend/test_sage_attention.py
     benchmark: src/flag_attn/runtime/backend/_ascend/sage_attention_benchmark.py
+  - id: fused_attnres
+    description: Run fused attention residual aggregation.
+    for:
+      - fused_attnres
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_attnres.py
+    benchmark: benchmark/test_fused_attnres_benchmark.py
+  - id: parallel_forgetting_attn
+    description: Run ACP-enabled forgetting attention.
+    for:
+      - forgetting_attention
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_forgetting_attention.py
+    benchmark: benchmark/test_forgetting_attention_benchmark.py
+  - id: parallel_parallax
+    description: Run fixed-length and variable-length parallel Parallax attention.
+    for:
+      - parallel_parallax
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_parallax.py
+    benchmark: benchmark/test_parallax_benchmark.py
+  - id: parallax_decode
+    description: Run Parallax attention decoding with KV caches.
+    for:
+      - parallax_decode
+      - parallax_attn_with_kvcache
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_parallax_decode.py
+    benchmark: benchmark/test_parallax_decode_benchmark.py
+  - id: log_linear_attn
+    description: Run chunked log-linear attention.
+    for:
+      - chunk_log_linear_attn
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_log_linear_attn.py
+    benchmark: benchmark/test_log_linear_attn_benchmark.py
+  - id: diffkv_attention
+    description: Run paged DiffKV attention.
+    for:
+      - diffkv_attention
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_diffkv_attention.py
+    benchmark: benchmark/test_diffkv_attention_benchmark.py
+  - id: infllmv2_attention
+    description: Run infllmv2_attention correctness and performance checks.
+    for:
+      - infllmv2_attention
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_infllmv2_attention.py::test_selector_pipeline_matches_reference
+      - tests/flag_attn/test_infllmv2_attention.py::test_attention_full_prefix_chunk_varlen
+      - tests/flag_attn/test_infllmv2_attention.py::test_attention_dense_path
+      - tests/flag_attn/test_infllmv2_attention.py::test_attention_sparse_backward
+      - tests/flag_attn/test_infllmv2_attention.py::test_wide_topk_tle_or_standard_matches_streaming
+      - tests/flag_attn/test_infllmv2_attention.py::test_tle_stage1_matches_standard_when_available
+      - tests/flag_attn/test_infllmv2_attention.py::test_tle_stage2_matches_standard_when_available
+      - tests/flag_attn/test_infllmv2_attention.py::test_d64_tle_stage1_dispatch_and_standard_fallback
+      - tests/flag_attn/test_infllmv2_attention.py::test_invalid_attention_input_is_rejected
+    benchmark: benchmark/test_infllmv2_attention_benchmark.py
+  - id: infllmv2_decode
+    description: Run infllmv2_decode correctness and performance checks.
+    for:
+      - infllmv2_decode
+    labels:
+      - fused
+      - Attention
+      - NoCPU
+    kind:
+      - Attention
+    stages:
+      - alpha: 'unreleased'
+    tests:
+      - tests/flag_attn/test_infllmv2_attention.py::test_decode_varlen_matches_reference
+      - tests/flag_attn/test_infllmv2_attention.py::test_invalid_decode_batch_is_rejected
+    benchmark: benchmark/test_infllmv2_attention_benchmark.py

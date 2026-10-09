@@ -10,6 +10,8 @@ and the complete compression-plus-selection pipeline.
 
 from __future__ import annotations
 
+import pytest
+
 import argparse
 import os
 import statistics
@@ -18,7 +20,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import torch
-import torch_gcu
+torch_gcu = pytest.importorskip("torch_gcu")
 
 from flag_attn.runtime.backend._enflame.FLA.nsa import (
     parallel_nsa,
@@ -26,6 +28,8 @@ from flag_attn.runtime.backend._enflame.FLA.nsa import (
 from flag_attn.runtime.backend._enflame.FLA.nsa.parallel_nsa_compression import (
     parallel_nsa_compression,
 )
+
+
 
 try:
     from benchmark.recording import benchmark_metric, record_benchmark_result
@@ -173,69 +177,7 @@ def measure(
     return samples
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=(
-            argparse.ArgumentDefaultsHelpFormatter
-        ),
-    )
-    parser.add_argument(
-        "--mode",
-        choices=(
-            "selected",
-            "compression",
-            "full",
-        ),
-        default="selected",
-    )
-    parser.add_argument(
-        "--case",
-        choices=tuple(CASES),
-        default="SMOKE",
-    )
-    parser.add_argument(
-        "--dtype",
-        choices=tuple(DTYPE_MAP),
-        default="bfloat16",
-    )
-    parser.add_argument(
-        "--device-index",
-        type=int,
-        default=int(
-            os.environ.get(
-                "S60_TEST_DEVICE",
-                "0",
-            )
-        ),
-    )
-    parser.add_argument(
-        "--selected-blocks",
-        type=int,
-        default=16,
-    )
-    parser.add_argument(
-        "--block-size",
-        type=int,
-        default=64,
-    )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=10,
-    )
-    parser.add_argument(
-        "--repeat",
-        type=int,
-        default=7,
-    )
-    parser.add_argument(
-        "--inner",
-        type=int,
-        default=10,
-    )
-    args = parser.parse_args()
-
+def run_benchmark(args, record_property=None) -> None:
     if args.warmup < 0:
         raise ValueError("warmup must be non-negative")
     if args.repeat <= 0:
@@ -434,7 +376,7 @@ def main() -> None:
         flush=True,
     )
     record_benchmark_result(
-        None,
+        record_property,
         op_name="parallel_nsa_compression" if args.mode == "compression" else "parallel_nsa",
         dtype=str(dtype),
         result=[
@@ -462,5 +404,20 @@ def main() -> None:
     )
 
 
-if __name__ == "__main__":
-    main()
+@pytest.mark.parametrize(
+    "mode",
+    [
+        pytest.param("selected", marks=pytest.mark.parallel_nsa),
+        pytest.param("full", marks=pytest.mark.parallel_nsa),
+        pytest.param("compression", marks=pytest.mark.parallel_nsa_compression),
+    ],
+)
+def test_parallel_nsa_benchmark(mode, record_property):
+    if not torch.gcu.is_available():
+        pytest.skip("NSA benchmark requires an Enflame GCU")
+    args = argparse.Namespace(
+        mode=mode, case="SMOKE", dtype="bfloat16",
+        device_index=int(os.environ.get("S60_TEST_DEVICE", "0")),
+        selected_blocks=16, block_size=64, warmup=10, repeat=7, inner=10,
+    )
+    run_benchmark(args, record_property)

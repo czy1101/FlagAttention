@@ -1021,7 +1021,9 @@ def run_benchmark(
             _run_dtype(args, dtype_name, record_property)
 
 
+# This shared benchmark runs both prefill and decode.
 @pytest.mark.minimax_m3_sparse_attn
+@pytest.mark.minimax_m3_sparse_attn_decode
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="MiniMax M3 benchmark requires CUDA"
 )
@@ -1033,7 +1035,3 @@ def test_msa_benchmark(request, record_property) -> None:
         rep=int(request.config.getoption("--iter", default=DEFAULT_REP)),
     )
     run_benchmark(args, record_property)
-
-
-if __name__ == "__main__":
-    run_benchmark(MSABenchmarkArgs())

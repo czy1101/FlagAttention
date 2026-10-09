@@ -23,6 +23,9 @@ import pytest
 import torch
 import triton
 
+
+pytestmark = pytest.mark.log_linear_attn
+
 # Optional baseline adapted from FLA's MIT-licensed
 # fla/ops/log_linear_attn/chunk.py. Keep TileLang out of normal test dependencies.
 try:

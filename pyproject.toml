@@ -77,6 +77,17 @@ pythonpath = [
     "tests/flag_attn",
 ]
 markers = [
+    "fused_attnres: fused attention residual tests and benchmarks",
+    "parallel_forgetting_attn: ACP-enabled forgetting attention tests and benchmarks",
+    "parallel_parallax: parallel Parallax attention tests and benchmarks",
+    "parallax_decode: Parallax decode tests and benchmarks",
+    "infllmv2_attention: InfLLM-V2 attention tests and benchmarks",
+    "infllmv2_decode: InfLLM-V2 decode tests and benchmarks",
+    "log_linear_attn: log-linear attention tests and benchmarks",
+    "diffkv_attention: DiffKV attention tests and benchmarks",
+    "minimax_m3_sparse_attn_decode: MiniMax M3 sparse attention decode tests and benchmarks",
+    "minimax_m3_index_topk: MiniMax M3 prefill top-k selection tests",
+    "sm90: requires Hopper SM90 GPU",
     "chunk_gated_delta_rule: chunked gated delta rule tests and benchmarks",
     "chunk_gated_delta_rule_fwd: inventory alias for chunked gated delta rule forward tests and benchmarks",
     "chunk_gdn2: chunked GDN2 tests and benchmarks",
@@ -99,9 +110,6 @@ markers = [
     "parallel_nsa_compression: native sparse attention compression",
     "parallel_wall_attn: Wall-Attention correctness and performance tests",
     "sage_attention: SageAttention tests and benchmarks",
-]
-
-markers = [
     "gpu: requires CUDA GPU",
     "performance: performance benchmark",
     "benchmark: benchmark entry point",

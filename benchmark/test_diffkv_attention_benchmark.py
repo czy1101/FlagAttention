@@ -7,11 +7,11 @@
 Run from the FlagAttention repository root with::
 
     pytest -q -s -m diffkv_attention \\
-        benchmark/diffkv_attention_benchmark.py
+        benchmark/test_diffkv_attention_benchmark.py
 
 The same named benchmark adapter can also be invoked explicitly::
 
-    python -c "from benchmark.diffkv_attention_benchmark import DiffKVBenchmark; DiffKVBenchmark(op_name='diffkv_attention').run()"
+    python -c "from benchmark.test_diffkv_attention_benchmark import DiffKVBenchmark; DiffKVBenchmark(op_name='diffkv_attention').run()"
 
 The benchmark follows the GLA benchmark convention: edit the constants in
 ``DEFAULT_BENCHMARK_CONFIG`` below instead of passing command-line options.
@@ -917,7 +917,3 @@ def test_perf_diffkv_attention():
     """Run the default DiffKV benchmark under pytest."""
     bench = DiffKVBenchmark(op_name=OP_NAME)
     bench.run()
-
-
-if __name__ == "__main__":
-    DiffKVBenchmark(op_name=OP_NAME).run()

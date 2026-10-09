@@ -286,7 +286,3 @@ def run_benchmark(
 )
 def test_chunk_gla_benchmark(record_property) -> None:
     run_benchmark(record_property=record_property)
-
-
-if __name__ == "__main__":
-    run_benchmark()

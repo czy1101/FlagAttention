@@ -99,8 +99,8 @@ def _tle_forward(inputs):
     )
 
 
-def main(
-    argv: list[str] | None = None,
+def run_benchmark(
+    argv: list[str] = (),
     record_property: Callable[[str, object], None] | None = None,
 ) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -155,8 +155,4 @@ def main(
     reason="GDN2 benchmark requires a compatible Triton TLE build",
 )
 def test_chunk_gdn2_benchmark(record_property) -> None:
-    main([], record_property)
-
-
-if __name__ == "__main__":
-    main()
+    run_benchmark([], record_property)

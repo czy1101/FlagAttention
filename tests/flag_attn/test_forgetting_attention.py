@@ -1,7 +1,7 @@
 """Self-contained Forgetting Attention / ACP correctness tests.
 
 Run: python -m pytest tests/flag_attn/test_forgetting_attention.py -v
-No JSON configuration, custom pytest markers or test-support package is needed.
+Operator marker: parallel_forgetting_attn.
 The benchmark imports the same inputs and reference adapters from this file.
 """
 import gc
@@ -191,6 +191,7 @@ def assert_bitwise(actual, expected):
 
 CUDA_SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
 pytestmark = [
+    pytest.mark.parallel_forgetting_attn,
     pytest.mark.skipif(not CUDA_SM90, reason="ACP V7.6 requires Hopper SM90 CUDA"),
     pytest.mark.skipif(not has_tle(), reason="ACP V7.6 requires compatible Triton 3.6 TLE"),
 ]

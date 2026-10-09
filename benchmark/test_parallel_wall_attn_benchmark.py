@@ -231,14 +231,3 @@ def _run_benchmark(dtype_name, dtype, record_property=None):
 )
 def test_parallel_wall_attn_benchmark(dtype_name, dtype, record_property):
     _run_benchmark(dtype_name, dtype, record_property)
-
-
-def main():
-    if not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0) and has_triton_tle()):
-        raise RuntimeError("Wall-Attention performance benchmark requires H100/SM90 with TLE")
-    for dtype_name, dtype in (("bf16", torch.bfloat16), ("fp16", torch.float16)):
-        _run_benchmark(dtype_name, dtype)
-
-
-if __name__ == "__main__":
-    main()

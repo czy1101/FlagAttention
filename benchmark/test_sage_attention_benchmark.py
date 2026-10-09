@@ -352,7 +352,3 @@ def benchmark(args: argparse.Namespace) -> None:
         rep=args.rep,
         maxnreg=args.maxnreg,
     )
-
-
-if __name__ == "__main__":
-    benchmark(parse_args())

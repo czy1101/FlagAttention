@@ -23,6 +23,9 @@ import triton
 import flag_attn
 
 
+pytestmark = pytest.mark.fused_attnres
+
+
 ATTNRES_EXTERNAL_BENCHMARK_SHAPES = [
     (2, 1),
     (5, 128),

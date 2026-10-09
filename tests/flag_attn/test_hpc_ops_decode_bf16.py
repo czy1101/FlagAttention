@@ -226,8 +226,6 @@ def _pytorch_reference(panel: _Panel, num_seq_q: int) -> torch.Tensor:
     return output.reshape_as(panel.q)
 
 
-@pytest.mark.attention_decode_bf16_static
-@pytest.mark.attention_decode_bf16_dynamic
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability()[0] < 9,
@@ -244,7 +242,13 @@ def _pytorch_reference(panel: _Panel, num_seq_q: int) -> torch.Tensor:
 @pytest.mark.parametrize("new_kv_included", [True])
 @pytest.mark.parametrize("use_output", [False])
 @pytest.mark.parametrize("splitk", [True])
-@pytest.mark.parametrize("use_dynamic_sched", [False, True])
+@pytest.mark.parametrize(
+    "use_dynamic_sched",
+    [
+        pytest.param(False, marks=pytest.mark.attention_decode_bf16_static),
+        pytest.param(True, marks=pytest.mark.attention_decode_bf16_dynamic),
+    ],
+)
 @pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
 @torch.no_grad()
 def test_attn_bf16_sm90(

@@ -50,6 +50,9 @@ from flag_attn.FLA.parallax.parallel import (
 )
 
 
+pytestmark = pytest.mark.parallel_parallax
+
+
 class BenchMode(Enum):
     KERNEL = "kernel"
     OPERATOR = "operator"
@@ -768,6 +771,7 @@ def _run_phase_table(
     print("-" * TABLE_WIDTH)
 
 
+@pytest.mark.parallel_parallax
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="parallel_parallax benchmark requires CUDA",

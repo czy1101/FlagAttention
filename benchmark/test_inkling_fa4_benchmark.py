@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Terminal-only benchmark for local Inkling FA4 relative attention.
+"""Pytest benchmark for local Inkling FA4 relative attention.
 
 Uses the same triton.testing.perf_report / do_bench convention as the other
 FlagAttention benchmarks. Providers share inputs, split counts and timing.
@@ -20,6 +20,8 @@ CuTe is an optional comparison baseline; no vLLM installation is required.
 """
 
 from __future__ import annotations
+
+import pytest
 
 import argparse
 import importlib
@@ -36,6 +38,9 @@ import torch.nn.functional as F
 import triton.testing as triton_testing
 
 from flag_attn.inkling_fa4 import get_backend, tle_available
+
+
+pytestmark = pytest.mark.inkling_fa4_rel_attention
 
 HEAD_DIM = 128
 BLOCK_SIZE = 16
@@ -285,32 +290,17 @@ def resolve_backends(names: list[str], flash_root: str | None) -> dict[str, Back
     return resolved
 
 
-def positive_int(value: str) -> int:
-    result = int(value)
-    if result <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return result
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cases", nargs="+", choices=[c.name for c in build_cases()])
-    parser.add_argument("--providers", nargs="+", choices=BACKEND_NAMES, default=list(BACKEND_NAMES))
-    parser.add_argument("--num-splits", nargs="+", type=positive_int, default=[1])
-    parser.add_argument("--warmup", type=positive_int, default=25, help="warmup duration in milliseconds")
-    parser.add_argument("--rep", type=positive_int, default=100, help="measurement duration in milliseconds")
-    parser.add_argument("--rel", choices=("real", "zeros"), default="real")
-    parser.add_argument("--flash-attn-root", default=os.getenv("FLASH_ATTN_ROOT"))
-    args = parser.parse_args()
-
+def run_benchmark(args) -> None:
     if not torch.cuda.is_available():
-        parser.error("this benchmark requires CUDA")
+        pytest.skip("this benchmark requires CUDA")
     if torch.cuda.get_device_capability() < (8, 0):
-        parser.error("the BF16 benchmark requires SM80 or newer")
+        pytest.skip("the BF16 benchmark requires SM80 or newer")
 
     backends = resolve_backends(args.providers, args.flash_attn_root)
     if not backends:
-        parser.error("none of the requested providers is available")
+        pytest.skip("none of the requested providers is available")
     cases = [c for c in build_cases() if args.cases is None or c.name in args.cases]
     # Reuse the exact same tensors across providers and split configurations.
     prepared = {
@@ -356,5 +346,10 @@ def main() -> None:
         bench_relative_attention.run(print_data=True, show_plots=False, save_path="")
 
 
-if __name__ == "__main__":
-    main()
+@pytest.mark.inkling_fa4_rel_attention
+def test_inkling_fa4_rel_attention_benchmark():
+    args = argparse.Namespace(
+        cases=None, providers=list(BACKEND_NAMES), num_splits=[1],
+        warmup=25, rep=100, rel="real", flash_attn_root=os.getenv("FLASH_ATTN_ROOT"),
+    )
+    run_benchmark(args)

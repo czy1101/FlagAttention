@@ -34,6 +34,7 @@ def _cuda_available() -> bool:
 
 
 pytestmark = [
+    pytest.mark.parallel_parallax,
     pytest.mark.skipif(
         not _cuda_available(),
         reason="parallel_parallax tests require CUDA",

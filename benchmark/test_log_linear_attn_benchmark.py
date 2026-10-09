@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Standalone Log-Linear Attention benchmark with an optional TileLang baseline."""
+"""Pytest Log-Linear Attention benchmark with an optional TileLang baseline."""
+
+import pytest
 
 import argparse
 import csv
@@ -20,11 +22,9 @@ import importlib.util
 from pathlib import Path
 
 
-def _positive_int(value):
-    number = int(value)
-    if number <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return number
+pytestmark = pytest.mark.log_linear_attn
+
+
 
 
 def _load_benchmark_module():
@@ -37,8 +37,9 @@ def _load_benchmark_module():
     return module
 
 
-def run(args):
-    module = _load_benchmark_module()
+def run(args, module=None):
+    if module is None:
+        module = _load_benchmark_module()
     if not module._tle_available():
         raise RuntimeError("requires CUDA and a FlagTree/Triton build with triton.experimental.tle")
     if args.provider == "both" and module.tilelang is None:
@@ -68,28 +69,12 @@ def run(args):
         print(f"Saved results to {args.csv}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--provider", choices=("auto", "tle", "both"), default="auto",
-                        help="auto compares TileLang when installed; tle measures TLE only")
-    parser.add_argument("--shape", nargs=4, type=_positive_int, action="append", metavar=("B", "T", "H", "D"),
-                        help="repeat to select shapes; default: six shapes from PR #65")
-    parser.add_argument("--rounds", type=_positive_int, default=7)
-    parser.add_argument("--warmup", type=_positive_int, default=1000, help="warmup time in milliseconds")
-    parser.add_argument("--rep", type=_positive_int, default=100, help="measurement time in milliseconds")
-    parser.add_argument("--csv", type=Path, help="optional output CSV path")
-    args = parser.parse_args()
-    for _, sequence, _, dim in args.shape or []:
-        if sequence < 64 or sequence & (sequence - 1) or dim not in (64, 128, 256):
-            parser.error("T must be a power of two >= 64; D must be 64, 128, or 256")
-    try:
-        run(args)
-    except ImportError as exc:
-        parser.exit(1, f"Missing dependency: {exc}. Install torch, pytest, and FlagTree/Triton; "
-                       "TileLang is optional (validated with 0.1.13).\n")
-    except (RuntimeError, ValueError) as exc:
-        parser.exit(1, f"Benchmark failed: {exc}\n")
-
-
-if __name__ == "__main__":
-    main()
+@pytest.mark.log_linear_attn
+def test_log_linear_attn_benchmark():
+    module = _load_benchmark_module()
+    if not module._tle_available():
+        pytest.skip("requires CUDA and FlagTree/TLE")
+    args = argparse.Namespace(
+        provider="auto", shape=None, rounds=7, warmup=1000, rep=100, csv=None,
+    )
+    run(args, module)
