@@ -242,13 +242,8 @@ def _pytorch_reference(panel: _Panel, num_seq_q: int) -> torch.Tensor:
 @pytest.mark.parametrize("new_kv_included", [True])
 @pytest.mark.parametrize("use_output", [False])
 @pytest.mark.parametrize("splitk", [True])
-@pytest.mark.parametrize(
-    "use_dynamic_sched",
-    [
-        pytest.param(False, marks=pytest.mark.hy3_attention),
-        pytest.param(True, marks=pytest.mark.hy3_attention),
-    ],
-)
+@pytest.mark.hy3_attention
+@pytest.mark.parametrize("use_dynamic_sched", [False, True])
 @pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
 @torch.no_grad()
 def test_attn_bf16_sm90(

@@ -324,16 +324,8 @@ def report_performance_results():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("mtp", BENCH_MTP, ids=lambda value: f"mtp{value}")
 @pytest.mark.parametrize("case", BENCH_CASES)
-@pytest.mark.parametrize(
-    "method",
-    [
-        pytest.param(
-            method,
-            marks=pytest.mark.hy3_attention,
-        )
-        for method in BENCH_METHODS
-    ],
-)
+@pytest.mark.hy3_attention
+@pytest.mark.parametrize("method", BENCH_METHODS)
 @pytest.mark.parametrize("layout", BENCH_LAYOUTS)
 def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
     if not HAS_TLE and mtp != 1:

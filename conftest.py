@@ -146,6 +146,17 @@ def _operator_key(marks: list[str], selected_mark: str | None, default: str) -> 
     return marks[0] if marks else default
 
 
+_AUXILIARY_MARKS = {"gpu", "sm90", "performance", "benchmark"}
+
+
+def _operator_marks(item: pytest.Item) -> list[str]:
+    """Return unique operator marks, excluding execution and reporting tags."""
+    return list(dict.fromkeys(
+        mark.name for mark in item.iter_markers()
+        if mark.name not in _BUILTIN_MARKS and mark.name not in _AUXILIARY_MARKS
+    ))
+
+
 class _MarkCollector:
     """Collect operator marks for the shared FlagOS runner."""
 
@@ -157,12 +168,8 @@ class _MarkCollector:
         self, session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
     ) -> None:
         for item in items:
-            marks = [
-                mark.name
-                for mark in item.iter_markers()
-                if mark.name not in _BUILTIN_MARKS
-            ]
-            self.items.append({"nodeid": item.nodeid, "marks": sorted(set(marks))})
+            marks = _operator_marks(item)
+            self.items.append({"nodeid": item.nodeid, "marks": sorted(marks)})
 
     def pytest_sessionfinish(
         self, session: pytest.Session, exitstatus: pytest.ExitCode
@@ -193,11 +200,7 @@ class _JsonResultRecorder:
     def pytest_runtest_protocol(self, item: pytest.Item, nextitem: pytest.Item | None):
         callspec = getattr(item, "callspec", None)
         params = dict(callspec.params) if callspec is not None else {}
-        operator_marks = [
-            mark.name
-            for mark in item.iter_markers()
-            if mark.name not in _BUILTIN_MARKS
-        ]
+        operator_marks = _operator_marks(item)
         if _is_benchmark_path(Path(str(item.path)), self.rootpath):
             key = _operator_key(operator_marks, self.selected_mark, item.nodeid)
             self.item_keys[item.nodeid] = key

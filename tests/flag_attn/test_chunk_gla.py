@@ -932,7 +932,6 @@ def _assert_close(name, actual, expected, ratio, err_atol=1e-6):
 
 
 @pytest.mark.chunk_gla
-@pytest.mark.chunk_gla_chunk
 @pytest.mark.parametrize(
     ("B", "T", "H", "D", "gate_logit_normalizer", "dtype"),
     [
@@ -1000,7 +999,6 @@ def test_chunk(B, T, H, D, dtype, gate_logit_normalizer):
 
 
 @pytest.mark.chunk_gla
-@pytest.mark.chunk_gla_state_v_first
 @pytest.mark.parametrize(
     ("B", "T", "H", "D", "dtype"),
     [
@@ -1058,7 +1056,6 @@ def test_chunk_state_v_first(B, T, H, D, dtype):
 
 
 @pytest.mark.chunk_gla
-@pytest.mark.chunk_gla_varlen
 @pytest.mark.parametrize(
     ("H", "D", "cu_seqlens", "dtype"),
     [

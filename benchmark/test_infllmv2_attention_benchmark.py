@@ -33,11 +33,12 @@ except ModuleNotFoundError:  # Direct invocation from the benchmark directory.
 from flag_attn import InfLLMV2Config, infllmv2_attention, infllmv2_decode
 
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is required for performance tests"
-)
-ATTENTION = pytest.mark.infllmv2_attention
-DECODE = pytest.mark.infllmv2_attention
+pytestmark = [
+    pytest.mark.infllmv2_attention,
+    pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA is required for performance tests"
+    ),
+]
 WARMUP_MS = int(os.getenv("INFLLMV2_BENCH_WARMUP_MS", "20"))
 REP_MS = int(os.getenv("INFLLMV2_BENCH_REP_MS", "100"))
 _RESULTS: list[dict[str, object]] = []
@@ -264,7 +265,6 @@ def _report(
     )
 
 
-@ATTENTION
 @pytest.mark.parametrize("case", PREFILL_CASES, ids=lambda case: case.name)
 def test_infllmv2_attention_benchmark(
     case: AttentionCase, record_property
@@ -306,7 +306,6 @@ def test_infllmv2_attention_benchmark(
     )
 
 
-@ATTENTION
 @pytest.mark.parametrize("case", BACKWARD_CASES, ids=lambda case: case.name)
 def test_infllmv2_attention_backward_benchmark(
     case: AttentionCase, record_property
@@ -351,7 +350,6 @@ def test_infllmv2_attention_backward_benchmark(
     )
 
 
-@DECODE
 @pytest.mark.parametrize("case", DECODE_CASES, ids=lambda case: case.name)
 def test_infllmv2_decode_benchmark(
     case: DecodeCase, record_property

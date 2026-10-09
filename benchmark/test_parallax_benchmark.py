@@ -771,7 +771,6 @@ def _run_phase_table(
     print("-" * TABLE_WIDTH)
 
 
-@pytest.mark.parallel_parallax
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="parallel_parallax benchmark requires CUDA",

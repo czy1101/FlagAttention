@@ -93,7 +93,6 @@ def detail_for(row):
                         "speedup": row["speedup"], "accuracy": row["accuracy"]}]}
 
 
-@pytest.mark.parallel_forgetting_attn
 @pytest.mark.parametrize("case", DEFAULT_CASES, ids=case_id)
 def test_forgetting_attention_benchmark(case, record_property):
     row = benchmark_case(case)

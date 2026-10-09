@@ -734,9 +734,8 @@ def op_marker(op):
          distinct ``stack`` operator), prefix it with ``underscore_`` instead:
          ``_stack`` -> ``underscore_stack``.
 
-    Non-underscore operator ids are returned unchanged. This mirrors the markers
-    declared in the test files and enforced by
-    ``tools/ci_checks/check_operator_markers.py``.
+    Non-underscore operator ids are returned unchanged and must match the
+    markers registered in pyproject.toml and declared by the test files.
     """
     if not op.startswith("_"):
         return op

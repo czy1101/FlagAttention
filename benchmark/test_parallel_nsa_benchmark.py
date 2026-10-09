@@ -404,14 +404,8 @@ def run_benchmark(args, record_property=None) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        pytest.param("selected", marks=pytest.mark.parallel_nsa),
-        pytest.param("full", marks=pytest.mark.parallel_nsa),
-        pytest.param("compression", marks=pytest.mark.parallel_nsa),
-    ],
-)
+@pytest.mark.parallel_nsa
+@pytest.mark.parametrize("mode", ["selected", "full", "compression"])
 def test_parallel_nsa_benchmark(mode, record_property):
     if not torch.gcu.is_available():
         pytest.skip("NSA benchmark requires an Enflame GCU")

@@ -9,7 +9,7 @@ from flag_attn import chunk_gated_delta_rule
 from flag_attn.FLA.gated_delta_rule import chunk_gated_delta_rule_fwd
 from flag_attn.utils import has_triton_tle
 
-pytestmark = pytest.mark.chunk_gated_delta_rule_fwd
+pytestmark = pytest.mark.chunk_gated_delta_rule
 
 ASSERT_RATIO = 0.01
 RECOMPUTE_TLE_ENV = "FLAG_ATTN_CHUNK_GDR_RECOMPUTE_TLE"
@@ -197,7 +197,6 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
     )
 
 
-@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN recompute TLE tests require CUDA/TLE"
 )
@@ -217,7 +216,6 @@ def test_chunk_gated_delta_rule_fwd_recompute_tle_matches_native(dtype, shape):
     _assert_close("final_state", actual[3], baseline[3])
 
 
-@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN fused TLE tests require CUDA/TLE"
 )
@@ -237,7 +235,6 @@ def test_chunk_gated_delta_rule_fwd_full_tle_matches_native(dtype, shape):
     _assert_close("final_state", actual[3], baseline[3])
 
 
-@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(not _cuda_tle_available(), reason="GDN public API test requires CUDA/TLE")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
@@ -267,7 +264,6 @@ def test_chunk_gated_delta_rule_public_api_matches_native(dtype):
     _assert_close("final_state", final_state, baseline[3])
 
 
-@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN two-kernel tests require CUDA/TLE"
 )
@@ -308,7 +304,6 @@ def _two_kernel_configs():
     ]
 
 
-@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN autotune configurations require CUDA/TLE"
 )
@@ -338,7 +333,6 @@ def test_chunk_gated_delta_rule_two_kernel_configs(dtype, config):
     _assert_close("final_state", final_state, baseline[3])
 
 
-@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN hybrid tests require CUDA/TLE"
 )
@@ -368,7 +362,6 @@ def test_chunk_gated_delta_rule_fwd_hybrid_matches_two_kernel(dtype):
     _assert_close("final_state", actual[3], expected[3])
 
 
-@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN external comparison requires CUDA/TLE"
 )
@@ -386,7 +379,6 @@ def test_chunk_gated_delta_rule_hybrid_matches_fla(dtype, shape):
     _assert_close("final_state", actual_final_state, expected_final_state)
 
 
-@pytest.mark.chunk_gated_delta_rule
 @pytest.mark.skipif(
     not _cuda_tle_available(), reason="GDN public two-kernel test requires CUDA/TLE"
 )

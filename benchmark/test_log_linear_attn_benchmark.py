@@ -69,7 +69,6 @@ def run(args, module=None):
         print(f"Saved results to {args.csv}")
 
 
-@pytest.mark.log_linear_attn
 def test_log_linear_attn_benchmark():
     module = _load_benchmark_module()
     if not module._tle_available():

@@ -41,9 +41,10 @@ from flag_attn.infllmv2.reference import (
 
 
 HAS_GPU = torch.cuda.is_available() and importlib.util.find_spec("triton") is not None
-pytestmark = pytest.mark.skipif(not HAS_GPU, reason="CUDA, PyTorch and Triton are required")
-ATTENTION = pytest.mark.infllmv2_attention
-DECODE = pytest.mark.infllmv2_attention
+pytestmark = [
+    pytest.mark.infllmv2_attention,
+    pytest.mark.skipif(not HAS_GPU, reason="CUDA, PyTorch and Triton are required"),
+]
 
 HAS_TLE = forward_impl._TLE_AVAILABLE
 
@@ -138,7 +139,6 @@ def _reference_attention(
     )
 
 
-@ATTENTION
 @pytest.mark.parametrize("d", [64, 128], ids=lambda value: f"d{value}")
 def test_selector_pipeline_matches_reference(d: int) -> None:
     q, k, _, cu_q, cu_k = _packed_inputs((96, 128), (192, 256), d=d)
@@ -195,7 +195,6 @@ ATTENTION_CASES = (
 )
 
 
-@ATTENTION
 @pytest.mark.parametrize("q_lengths,kv_lengths,d,dtype", ATTENTION_CASES)
 def test_attention_full_prefix_chunk_varlen(
     q_lengths: tuple[int, ...],
@@ -215,7 +214,6 @@ def test_attention_full_prefix_chunk_varlen(
     torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
 
 
-@ATTENTION
 @pytest.mark.parametrize("d", [64, 128], ids=lambda value: f"d{value}")
 def test_attention_dense_path(d: int) -> None:
     q, k, v, cu_q, cu_k = _packed_inputs((96, 128), (128, 192), d=d)
@@ -227,7 +225,6 @@ def test_attention_dense_path(d: int) -> None:
     torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
 
 
-@ATTENTION
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_attention_sparse_backward(dtype: torch.dtype) -> None:
     q, k, v, cu_q, cu_k = _packed_inputs(
@@ -250,7 +247,6 @@ def test_attention_sparse_backward(dtype: torch.dtype) -> None:
     torch.testing.assert_close(v.grad, v_ref.grad, atol=7e-2, rtol=7e-2)
 
 
-@DECODE
 @pytest.mark.parametrize("d", [64, 128], ids=lambda value: f"d{value}")
 @pytest.mark.parametrize("dense", [False, True], ids=["sparse", "dense"])
 def test_decode_varlen_matches_reference(d: int, dense: bool) -> None:
@@ -268,7 +264,6 @@ def test_decode_varlen_matches_reference(d: int, dense: bool) -> None:
     torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
 
 
-@ATTENTION
 def test_wide_topk_tle_or_standard_matches_streaming() -> None:
     generator = torch.Generator(device="cuda")
     generator.manual_seed(41)
@@ -286,7 +281,6 @@ def test_wide_topk_tle_or_standard_matches_streaming() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-@ATTENTION
 @pytest.mark.parametrize("d", [64, 128], ids=lambda value: f"d{value}")
 def test_tle_stage1_matches_standard_when_available(d: int) -> None:
     if not HAS_TLE or torch.cuda.get_device_capability() != (9, 0):
@@ -301,7 +295,6 @@ def test_tle_stage1_matches_standard_when_available(d: int) -> None:
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
-@ATTENTION
 def test_tle_stage2_matches_standard_when_available() -> None:
     if not HAS_TLE or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("TLE Stage2 requires Hopper")
@@ -317,7 +310,6 @@ def test_tle_stage2_matches_standard_when_available() -> None:
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
 
-@ATTENTION
 def test_d64_tle_stage1_dispatch_and_standard_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     kernels = importlib.import_module("flag_attn.infllmv2.forward")
     q = torch.zeros((1, 32, 64), device="cuda", dtype=torch.bfloat16)
@@ -348,14 +340,12 @@ def test_d64_tle_stage1_dispatch_and_standard_fallback(monkeypatch: pytest.Monke
     assert launches
 
 
-@ATTENTION
 def test_invalid_attention_input_is_rejected() -> None:
     q, k, v, cu_q, cu_k = _packed_inputs((32,), (64,), d=64)
     with pytest.raises(ValueError, match="maximum sequence lengths"):
         infllmv2_attention(q, k, v, cu_q, cu_k, 0, 64)
 
 
-@DECODE
 def test_invalid_decode_batch_is_rejected() -> None:
     _, k, v, _, cu_k = _packed_inputs((1, 1), (32, 64), d=64)
     bad_q = torch.empty((1, 32, 64), device="cuda", dtype=k.dtype)

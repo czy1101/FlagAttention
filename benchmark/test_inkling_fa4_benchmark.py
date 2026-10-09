@@ -346,7 +346,6 @@ def run_benchmark(args) -> None:
         bench_relative_attention.run(print_data=True, show_plots=False, save_path="")
 
 
-@pytest.mark.inkling_fa4_rel_attention
 def test_inkling_fa4_rel_attention_benchmark():
     args = argparse.Namespace(
         cases=None, providers=list(BACKEND_NAMES), num_splits=[1],
