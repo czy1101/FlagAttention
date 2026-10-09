@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import torch
 import pytest
 
+from flag_attn.testing import backend as test_backend
 import flag_attn
 
 torch.random.manual_seed(10086)
+
+pytestmark = pytest.mark.skipif(not test_backend.is_available(), reason="requires an available accelerator")
 
 def max_diff(a, b):
     return (a - b).abs().max().item()
@@ -36,10 +40,10 @@ def report(name, actual, expected):
 def test_splitkv_large_logits(seed, operator):
     # These inputs expose early rounding of split outputs and cancellation in
     # the softmax/combine steps. Keep the same accuracy bound as the main suite.
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    q = torch.randn((1, 2, 4, 16), generator=generator, device="cuda", dtype=torch.float16) * 10
-    k = torch.randn((1, 1, 8202, 16), generator=generator, device="cuda", dtype=torch.float16) * 10
-    v = torch.randn(k.shape, generator=generator, device="cuda", dtype=torch.float16) * 10
+    generator = torch.Generator(device=test_backend.device).manual_seed(seed)
+    q = torch.randn((1, 2, 4, 16), generator=generator, device=test_backend.device, dtype=torch.float16) * 10
+    k = torch.randn((1, 1, 8202, 16), generator=generator, device=test_backend.device, dtype=torch.float16) * 10
+    v = torch.randn(k.shape, generator=generator, device=test_backend.device, dtype=torch.float16) * 10
     expected = flag_attn.testing.flash_attention(q, k, v, False, upcast=True)
     baseline = flag_attn.testing.flash_attention(q, k, v, False, upcast=False)
     actual = getattr(flag_attn, operator)(q, k, v)
@@ -48,9 +52,9 @@ def test_splitkv_large_logits(seed, operator):
 
 
 def test_splitkv_single_split_preserves_dtype():
-    generator = torch.Generator(device="cuda").manual_seed(2026)
+    generator = torch.Generator(device=test_backend.device).manual_seed(2026)
     q, k, v = [
-        torch.randn((1, 1, 16, 16), generator=generator, device="cuda", dtype=torch.bfloat16)
+        torch.randn((1, 1, 16, 16), generator=generator, device=test_backend.device, dtype=torch.bfloat16)
         for _ in range(3)
     ]
     actual = flag_attn.flash_attention_split_kv(q, k, v)
@@ -61,10 +65,10 @@ def test_splitkv_single_split_preserves_dtype():
 
 @pytest.mark.parametrize("operator", ["flash_attention", "flash_attention_split_kv"])
 def test_splitkv_independent_kv_strides(operator):
-    generator = torch.Generator(device="cuda").manual_seed(2026)
-    q = torch.randn((2, 4, 1, 32), generator=generator, device="cuda", dtype=torch.float16)
-    k = torch.randn((2, 2, 257, 32), generator=generator, device="cuda", dtype=torch.float16)
-    v = torch.randn((2, 257, 2, 32), generator=generator, device="cuda", dtype=torch.float16).transpose(1, 2)
+    generator = torch.Generator(device=test_backend.device).manual_seed(2026)
+    q = torch.randn((2, 4, 1, 32), generator=generator, device=test_backend.device, dtype=torch.float16)
+    k = torch.randn((2, 2, 257, 32), generator=generator, device=test_backend.device, dtype=torch.float16)
+    v = torch.randn((2, 257, 2, 32), generator=generator, device=test_backend.device, dtype=torch.float16).transpose(1, 2)
     assert k.stride() != v.stride()
     actual = getattr(flag_attn, operator)(q, k, v)
     expected = flag_attn.testing.flash_attention(q, k, v, False, upcast=True)
@@ -72,7 +76,7 @@ def test_splitkv_independent_kv_strides(operator):
     assert max_diff(actual, expected) <= 2 * max_diff(baseline, expected) + 1e-5
 
 
-@pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
+@pytest.mark.parametrize('device_id', list(range(test_backend.device_fn.device_count())))
 @pytest.mark.parametrize('scale', [1.0, 2.0, 3.0, 4.0])
 @pytest.mark.parametrize('B, Hq, Hk, M, N, D', [
     (2, 4, 4, 512, 612, 128),
@@ -99,7 +103,7 @@ def test_splitkv_independent_kv_strides(operator):
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize('stride_order', ['BHTD', 'BTHD'])
 def test_attention_fwd(B, Hq, Hk, M, N, D, causal, stride_order, dtype, scale, device_id):
-    device = f"cuda:{device_id}"
+    device = f"{test_backend.device}:{device_id}"
     if stride_order == "BHTD":
         q = torch.empty((B, Hq, M, D), dtype=dtype, device=device).normal_(mean=0., std=scale)
         k = torch.empty((B, Hk, N, D), dtype=dtype, device=device).normal_(mean=0., std=scale)
@@ -120,7 +124,7 @@ def test_attention_fwd(B, Hq, Hk, M, N, D, causal, stride_order, dtype, scale, d
     assert triton_max_diff <= 2 * torch_max_diff + 1e-5
 
 
-@pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
+@pytest.mark.parametrize('device_id', list(range(test_backend.device_fn.device_count())))
 @pytest.mark.parametrize('scale', [10.0])
 @pytest.mark.parametrize('B, Hq, Hk, M, N, D', [
     (2, 4, 4, 1, 612, 128),
@@ -147,7 +151,7 @@ def test_attention_fwd(B, Hq, Hk, M, N, D, causal, stride_order, dtype, scale, d
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize('stride_order', ['BHTD', 'BTHD'])
 def test_attention_splitkv(B, Hq, Hk, M, N, D, causal, stride_order, dtype, scale, device_id):
-    device = f"cuda:{device_id}"
+    device = f"{test_backend.device}:{device_id}"
     if stride_order == "BHTD":
         q = torch.empty((B, Hq, M, D), dtype=dtype, device=device).normal_(mean=0., std=scale)
         k = torch.empty((B, Hk, N, D), dtype=dtype, device=device).normal_(mean=0., std=scale)
@@ -167,7 +171,7 @@ def test_attention_splitkv(B, Hq, Hk, M, N, D, causal, stride_order, dtype, scal
     report("o torch", o_torch, o_ref)
     assert triton_max_diff <= 2 * torch_max_diff + 1e-5
 
-@pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
+@pytest.mark.parametrize('device_id', list(range(test_backend.device_fn.device_count())))
 @pytest.mark.parametrize('scale', [1.0, 2.0, 3.0, 4.0])
 @pytest.mark.parametrize('B, Hq, Hk, M, N, D', [
     (2, 4, 4, 512, 612, 128),
@@ -196,7 +200,7 @@ def test_attention_splitkv(B, Hq, Hk, M, N, D, causal, stride_order, dtype, scal
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize('stride_order', ['BHTD', 'BTHD'])
 def test_attention_bwd(B, Hq, Hk, M, N, D, causal, stride_order, dtype, scale, device_id):
-    device = f"cuda:{device_id}"
+    device = f"{test_backend.device}:{device_id}"
     if stride_order == "BHTD":
         q = torch.empty((B, Hq, M, D), dtype=dtype, device=device).normal_(mean=0., std=scale).requires_grad_()
         k = torch.empty((B, Hk, N, D), dtype=dtype, device=device).normal_(mean=0., std=scale).requires_grad_()
@@ -232,7 +236,7 @@ def test_attention_bwd(B, Hq, Hk, M, N, D, causal, stride_order, dtype, scale, d
     assert gv_triton_max_diff < 2 * gv_torch_max_diff + 1e-5
 
 
-@pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
+@pytest.mark.parametrize('device_id', list(range(test_backend.device_fn.device_count())))
 @pytest.mark.parametrize('seed', [55, 94])
 def test_attention_bwd_dropout_bfloat16_precision(device_id, seed):
     # These seeds expose dQ error from rounding scaled output gradients and O.
@@ -246,7 +250,7 @@ def test_attention_bwd_dropout_bfloat16_precision(device_id, seed):
         )
 
 
-@pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
+@pytest.mark.parametrize('device_id', list(range(test_backend.device_fn.device_count())))
 @pytest.mark.parametrize('scale', [1.0, 2.0, 3.0, 4.0])
 @pytest.mark.parametrize('B, H, M, N, D', [
     (2, 4, 512, 612, 128),
@@ -263,7 +267,7 @@ def test_attention_bwd_dropout_bfloat16_precision(device_id, seed):
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize('stride_order', ['BHTD', 'BTHD'])
 def test_attention_with_aux_outs(B, H, M, N, D, causal, stride_order, dtype, scale, device_id):
-    device = f"cuda:{device_id}"
+    device = f"{test_backend.device}:{device_id}"
     if stride_order == "BHTD":
         q = torch.empty((B, H, M, D), dtype=dtype, device=device).normal_(mean=0., std=scale)
         k = torch.empty((B, H, N, D), dtype=dtype, device=device).normal_(mean=0., std=scale)
@@ -291,7 +295,7 @@ def test_attention_with_aux_outs(B, H, M, N, D, causal, stride_order, dtype, sca
     assert triton_max_diff <= 2 * torch_max_diff + 1e-5
 
 
-@pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
+@pytest.mark.parametrize('device_id', list(range(test_backend.device_fn.device_count())))
 @pytest.mark.parametrize('scale', [1.0, 2.0])
 @pytest.mark.parametrize('B, H, M, N, D', [
     (2, 4, 512, 612, 128),
@@ -309,7 +313,7 @@ def test_attention_with_aux_outs(B, H, M, N, D, causal, stride_order, dtype, sca
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize('stride_order', ['BHTD', 'BTHD'])
 def test_attention_fwd_dropout(B, H, M, N, D, causal, dropout_p, stride_order, dtype, scale, device_id):
-    device = f"cuda:{device_id}"
+    device = f"{test_backend.device}:{device_id}"
     if stride_order == "BHTD":
         q = torch.empty((B, H, M, D), dtype=dtype, device=device).normal_(mean=0., std=scale)
         k = torch.empty((B, H, N, D), dtype=dtype, device=device).normal_(mean=0., std=scale)
@@ -333,7 +337,7 @@ def test_attention_fwd_dropout(B, H, M, N, D, causal, dropout_p, stride_order, d
 
 import random
 # @pytest.mark.parametrize('increment', [random.randint(0, 1000000000) for i in range(100)])
-@pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
+@pytest.mark.parametrize('device_id', list(range(test_backend.device_fn.device_count())))
 @pytest.mark.parametrize('scale', [1.0, 2.0])
 @pytest.mark.parametrize('B, H, M, N, D', [
     (2, 4, 512, 612, 128),
@@ -351,7 +355,7 @@ import random
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize('stride_order', ['BHTD', 'BTHD'])
 def test_attention_bwd_dropout(B, H, M, N, D, causal, dropout_p, stride_order, dtype, scale, device_id):
-    device = f"cuda:{device_id}"
+    device = f"{test_backend.device}:{device_id}"
     if stride_order == "BHTD":
         q = torch.empty((B, H, M, D), dtype=dtype, device=device).normal_(mean=0., std=scale).requires_grad_()
         k = torch.empty((B, H, N, D), dtype=dtype, device=device).normal_(mean=0., std=scale).requires_grad_()

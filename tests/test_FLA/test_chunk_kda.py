@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-pytest.importorskip("triton.experimental.tle.language", reason="chunk_kda requires Triton TLE >= 3.6")
+from flag_attn.testing import backend as test_backend
+if not test_backend.has_specialization("chunk_kda_fwd_infer"):
+    pytest.importorskip("triton.experimental.tle.language", reason="generic chunk_kda requires Triton TLE >= 3.6")
 
 from flag_attn import chunk_kda
 
@@ -26,7 +29,7 @@ LOWER_BOUND = -5.0
 ASSERT_RATIO = 0.005
 D_HEAD = 128
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="chunk_kda tests require CUDA")
+pytestmark = [pytest.mark.chunk_kda, pytest.mark.skipif(not test_backend.is_available(), reason="requires an available accelerator")]
 
 
 def _lower_bound_gate(
@@ -129,7 +132,7 @@ def _make_inputs(
     output_final_state: bool,
     noncontiguous: bool,
 ):
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
     is_varlen = len(seq_lens) > 1
     if is_varlen and B != 1:
         raise ValueError("varlen inputs require B=1")

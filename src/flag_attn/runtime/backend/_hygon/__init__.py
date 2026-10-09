@@ -16,7 +16,6 @@ from types import SimpleNamespace
 
 import torch
 
-
 # Hygon PyTorch exposes its device through the CUDA-compatible API.
 device = SimpleNamespace(vendor_name="hygon", name="cuda")
 torch_device_fn = torch.cuda
@@ -29,3 +28,35 @@ class _Error:
 
 
 error = _Error()
+
+
+import importlib
+
+_OPERATOR_EXPORTS = {
+    "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),
+    "sage_attention_forward": (".sage_attention.attn_qk_int8_per_block", "forward"),
+    "SPARSE_BLOCK_SIZE": (".msa.index_topk", "SPARSE_BLOCK_SIZE"),
+    "chunk_kda_fwd_infer": (".FLA.kda.chunk_kda", "chunk_kda_fwd_infer"),
+    "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
+    "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
+    "chunk_gla": (".FLA.gla", "chunk_gla"),
+    "minimax_m3_index_decode": (".msa", "minimax_m3_index_decode"),
+    "minimax_m3_index_decode_score": (".msa", "minimax_m3_index_decode_score"),
+    "minimax_m3_index_score": (".msa", "minimax_m3_index_score"),
+    "minimax_m3_index_topk": (".msa", "minimax_m3_index_topk"),
+    "minimax_m3_sparse_attn": (".msa", "minimax_m3_sparse_attn"),
+    "minimax_m3_sparse_attn_decode": (".msa", "minimax_m3_sparse_attn_decode"),
+}
+
+
+def __getattr__(name: str):
+    try:
+        module, symbol = _OPERATOR_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(importlib.import_module(module, __name__), symbol)
+    globals()[name] = value
+    return value
+
+
+__all__ = ["device", "torch_device_fn", "error", *sorted(_OPERATOR_EXPORTS)]

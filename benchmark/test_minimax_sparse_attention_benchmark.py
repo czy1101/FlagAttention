@@ -21,6 +21,7 @@ with scalar K/V dequantization scales passed to both implementations.
 
 from __future__ import annotations
 
+
 import ast
 import inspect
 import math
@@ -41,17 +42,20 @@ try:
 except ModuleNotFoundError:  # Direct script execution.
     from recording import BenchmarkRecorder
 
+from flag_attn.testing import backend as test_backend
+from flag_attn import minimax_m3_sparse_attn
 from flag_attn.minimax_sparse_attention import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode,
     minimax_m3_index_score,
     minimax_m3_index_topk,
-    minimax_m3_sparse_attn,
 )
 from flag_attn.minimax_sparse_attention import minimax_m3_sparse_attn_decode
 from functools import partial
 
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("CUDA comparison is unavailable on the selected backend")
     from vllm.models.minimax_m3.common.ops.index_topk import (
         minimax_m3_index_decode as vllm_index_decode,
     )
@@ -173,15 +177,15 @@ class MSAData:
 
 
 def _require_cuda() -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("This benchmark requires CUDA.")
+    if not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")):
+        raise RuntimeError("This benchmark requires an available accelerator.")
 
 
 def _supports_fp8() -> bool:
-    if FP8_DTYPE is None or not torch.cuda.is_available():
+    if FP8_DTYPE is None or not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")):
         return False
     # NVIDIA FP8 Tensor Core support starts with Ada (8.9) and Hopper (9.0).
-    return torch.cuda.get_device_capability() >= (8, 9)
+    return not test_backend.is_nvidia() or test_backend.cuda_capability() >= (8, 9)
 
 
 def _encode_fp8(value: torch.Tensor, scale: float) -> torch.Tensor:
@@ -450,9 +454,9 @@ def run_decode(
 def bench_fn(fn: Callable, warmup: int, rep: int) -> float:
     for _ in range(3):
         fn()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     return float(
-        triton_testing.do_bench(fn, warmup=warmup, rep=rep, return_mode="median")
+        test_backend.do_bench(fn, warmup=warmup, rep=rep, return_mode="median")
     )
 
 
@@ -665,7 +669,7 @@ def _bench_steps(
             )
 
         attention()
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         return {
             "index_decode": bench_fn(index_decode, args.warmup, args.rep),
             "attention_decode": bench_fn(attention, args.warmup, args.rep),
@@ -717,7 +721,7 @@ def _bench_steps(
     index_score()
     index_topk()
     attention()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     return {
         "index_score": bench_fn(index_score, args.warmup, args.rep),
         "index_topk": bench_fn(index_topk, args.warmup, args.rep),
@@ -798,7 +802,7 @@ def _run_dtype(
     print(_format_columns(headers))
     print(separator)
 
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
     recorder = BenchmarkRecorder(
         record_property,
         op_name="minimax_m3_sparse_attn",
@@ -902,7 +906,7 @@ def _run_dtype(
         if run_vllm:
             flag_attn_run()
             vllm_run()
-            torch.cuda.synchronize()
+            test_backend.device_fn.synchronize()
             assert vllm_output is not None and vllm_layout is not None
             accuracy = _check_outputs(
                 flag_attn_output,
@@ -970,7 +974,7 @@ def _run_dtype(
         if run_vllm:
             del providers, timings
         del flag_attn_run, vllm_run, flag_attn_output, vllm_output, vllm_data, data, generator
-        torch.cuda.empty_cache()
+        test_backend.device_fn.empty_cache()
 
     recorder.record()
 
@@ -986,9 +990,9 @@ def run_benchmark(
         raise ValueError("--decode-qlen must be positive")
     if args.warmup < 0 or args.rep <= 0:
         raise ValueError("--warmup must be non-negative and --rep must be positive")
-    capability = torch.cuda.get_device_capability()
+    capability = test_backend.cuda_capability()
     print(
-        f"[device] {torch.cuda.get_device_name()} "
+        f"[device] {test_backend.get_device_name()} "
         f"capability={capability[0]}.{capability[1]}"
     )
     if args.prefill_only:
@@ -1025,7 +1029,7 @@ def run_benchmark(
 # This shared benchmark runs both prefill and decode.
 @pytest.mark.minimax_m3_sparse_attn
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="MiniMax M3 benchmark requires CUDA"
+    not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")), reason="requires an available accelerator"
 )
 def test_msa_benchmark(request, record_property) -> None:
     """Run the MSA benchmark through pytest using benchmark CLI timing options."""

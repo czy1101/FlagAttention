@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+
 import math
 import sys
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
+from flag_attn.testing import backend as test_backend
 from flag_attn.hpc_ops_attention.decode import HAS_TLE  # noqa: E402
 from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_dynamic as fp8_dynamic,
@@ -38,7 +40,7 @@ from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
 from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_static as fp8_static,
 )
-from flag_attn.hpc_ops_attention import hy3_attention
+from flag_attn import hy3_attention
 
 
 BLOCK_SIZE = fp8_static.BLOCK_SIZE
@@ -88,20 +90,18 @@ QUANT_TYPE = "qkpertoken_perhead_vperhead"
 SUPPORTED_TEST_MTP = (1, 2, 4) if HAS_TLE else (1,)
 
 
-def _supports_sm90_fp8_backend() -> bool:
-    return (
-        torch.cuda.is_available()
-        and hasattr(torch, "float8_e4m3fn")
-        and torch.cuda.get_device_capability()[0] >= 9
-    )
+def _supports_sm90_fp8_backend():
+    return (hasattr(torch, "float8_e4m3fn") and
+            (test_backend.supports_operator("hy3_attention_decode_fp8_qk_static", min_sm=(9, 0)) or
+             test_backend.supports_operator("hy3_attention_decode_fp8_qk_dynamic", min_sm=(9, 0))))
 
 
 @pytest.fixture(autouse=True)
 def _triton_allocator():
-    if torch.cuda.is_available():
+    if test_backend.is_available():
         triton.set_allocator(
             lambda size, _align, _stream: torch.empty(
-                size, dtype=torch.int8, device="cuda"
+                size, dtype=torch.int8, device=test_backend.device
             )
         )
     yield
@@ -164,12 +164,12 @@ def _official_make_inputs(
 ) -> _Panel:
     """Reproduce the official FP8 correctness-test input distribution."""
     torch.manual_seed(41)
-    torch.cuda.manual_seed(41)
+    torch.manual_seed(41)
 
     q_bf16 = torch.randn(
         (num_batch * mtp, num_head_q, HEAD_DIM),
         dtype=torch.bfloat16,
-        device="cuda",
+        device=test_backend.device,
     ) / math.sqrt(HEAD_DIM)
     q_scale = q_bf16.float().abs().amax(-1) / 10.0
     q = (q_bf16 / q_scale[..., None]).to(torch.float8_e4m3fn)
@@ -180,35 +180,35 @@ def _official_make_inputs(
         new_k = torch.randn(
             (num_batch, mtp, num_head_kv, HEAD_DIM),
             dtype=torch.bfloat16,
-            device="cuda",
+            device=test_backend.device,
         )
         new_v = torch.randn_like(new_k)
         # The official test performs this draw before history generation even
         # though quant_paged_cache_perhead later supplies the effective scale.
-        torch.randn((num_head_kv,), dtype=torch.float32, device="cuda")
+        torch.randn((num_head_kv,), dtype=torch.float32, device=test_backend.device)
     else:
         new_k = (
             torch.randn(
                 (num_batch, mtp, num_head_kv, HEAD_DIM),
                 dtype=torch.bfloat16,
-                device="cuda",
+                device=test_backend.device,
             )
             / math.sqrt(HEAD_DIM)
         ).to(torch.float8_e4m3fn)
         new_v = torch.randn(
             (num_batch, mtp, num_head_kv, HEAD_DIM),
             dtype=torch.bfloat16,
-            device="cuda",
+            device=test_backend.device,
         ).to(torch.float8_e4m3fn)
-        k_scale = torch.randn((1,), dtype=torch.float32, device="cuda")
-        v_scale = torch.randn((1,), dtype=torch.float32, device="cuda")
+        k_scale = torch.randn((1,), dtype=torch.float32, device=test_backend.device)
+        v_scale = torch.randn((1,), dtype=torch.float32, device=test_backend.device)
 
     history = torch.randint(
         1,
         max_seq_kv,
         (num_batch,),
         dtype=torch.int32,
-        device="cuda",
+        device=test_backend.device,
     )
     kv_lens = history + mtp
     block_counts = (kv_lens + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -220,7 +220,7 @@ def _official_make_inputs(
         storage = torch.randn(
             (capacity, 2, BLOCK_SIZE + scale_rows, num_head_kv, HEAD_DIM),
             dtype=torch.bfloat16,
-            device="cuda",
+            device=test_backend.device,
         )
         if layout == "HND":
             storage = (
@@ -233,7 +233,7 @@ def _official_make_inputs(
             torch.randn(
                 (capacity, 2, BLOCK_SIZE, num_head_kv, HEAD_DIM),
                 dtype=torch.bfloat16,
-                device="cuda",
+                device=test_backend.device,
             )
             / math.sqrt(HEAD_DIM)
         ).to(torch.float8_e4m3fn)
@@ -247,12 +247,12 @@ def _official_make_inputs(
     # The official correctness tests draw the permutation on CPU and then
     # transfer it, so preserve that generator choice as well as call order.
     packed_ids = torch.randperm(capacity)[:total_blocks].to(
-        dtype=torch.int32, device="cuda"
+        dtype=torch.int32, device=test_backend.device
     )
     block_ids = torch.empty(
         (num_batch, int(block_counts.max().item())),
         dtype=torch.int32,
-        device="cuda",
+        device=test_backend.device,
     )
     cursor = 0
     for batch_id, count in enumerate(block_counts.cpu().tolist()):
@@ -347,11 +347,11 @@ def _pytorch_reference(panel, mtp: int, quant_type: str) -> torch.Tensor:
         causal_mask = torch.cat(
             (
                 torch.ones(
-                    (mtp, history), dtype=torch.bool, device="cuda"
+                    (mtp, history), dtype=torch.bool, device=test_backend.device
                 ),
                 torch.tril(
                     torch.ones(
-                        (mtp, mtp), dtype=torch.bool, device="cuda"
+                        (mtp, mtp), dtype=torch.bool, device=test_backend.device
                     )
                 ),
             ),
@@ -415,6 +415,9 @@ def test_attn_fp8_sm90(
     use_dynamic_sched: bool,
     kvcache_shape: str,
 ):
+    variant = "fp8_qk_dynamic" if use_dynamic_sched else "fp8_qk_static"
+    if not test_backend.supports_operator(f"hy3_attention_decode_{variant}", min_sm=(9, 0)):
+        pytest.skip("selected Hy3 decode variant is unavailable on this device")
     assert block_size == BLOCK_SIZE
     assert head_dim == HEAD_DIM
     assert new_kv_included
@@ -437,7 +440,7 @@ def test_attn_fp8_sm90(
     workspace = implementation.prepare_decode_workspace(inputs)
     actual = hy3_attention(inputs, workspace, stage="decode", variant=f"fp8_qk_{schedule}").detach().clone()
     expected = _pytorch_reference(panel, num_seq_q, QUANT_TYPE)
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     assert actual.shape == expected.shape
     torch.testing.assert_close(

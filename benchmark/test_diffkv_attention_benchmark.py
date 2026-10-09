@@ -47,6 +47,7 @@ style and does not expose a command-line argument parser.
 
 from __future__ import annotations
 
+
 import importlib
 import csv
 import math
@@ -72,6 +73,7 @@ if str(ROOT / "src") not in sys.path:
 # Keep benchmark-domain options local, as in the MSA benchmark.  Model layout
 # values are imported from the operator so the benchmark cannot silently use a
 # different HQ/HKV/DQK/DV/block-size contract.
+from flag_attn.testing import backend as test_backend
 from flag_attn.diffkv_attention.api import (  # noqa: E402
     DEFAULT_LAYOUT,
     LAUNCH,
@@ -129,7 +131,7 @@ class BenchmarkConfig:
     # Formal runs must have a directly measured FA3 baseline (or an explicit
     # fa3_csv reference); diagnostic callers may opt out explicitly.
     require_fa3: bool = True
-    device: str = "cuda:0"
+    device: str = test_backend.device + ':0'
 
 
 def fa3_key(
@@ -250,7 +252,7 @@ def load_fa3_provider(requested: str = "auto", extension_path: str | None = None
     """Load FA3 and return ``available/source/error`` status metadata."""
     if requested not in {"auto", "on", "off"}:
         raise ValueError(f"unsupported FA3 mode: {requested!r}")
-    if requested == "off":
+    if requested == "off" or not test_backend.is_nvidia():
         return {"available": False, "source": "disabled", "error": None}
     if fa3_op_available():
         return {"available": True, "source": "already-registered", "error": None}
@@ -354,6 +356,13 @@ def make_inputs(
 def build_runner(inputs, path: str, window_size: int, diffkv_impl):
     """Build a runner with the unified TLE/standard backend dispatcher."""
     query, key_cache, value_cache, context_lens, block_tables = inputs
+    if test_backend.has_specialization("diffkv_attention"):
+        from flag_attn import diffkv_attention
+
+        def run_public():
+            return diffkv_attention(*inputs, window_size=window_size, path=path)
+
+        return run_public, f"{test_backend.runtime.device.vendor_name} public API (full call)"
     batch, hq, dqk = query.shape
     hkv = key_cache.shape[2]
     dv = value_cache.shape[-1]
@@ -375,7 +384,8 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl):
     )
     block_q = block_m // num_q_per_kv
     total_num_q_blocks = query.shape[0] // block_q + batch
-    num_sms = torch.cuda.get_device_properties(query.device).multi_processor_count
+    properties = test_backend.device_fn.get_device_properties(query.device)
+    num_sms = getattr(properties, "multi_processor_count", None)
 
     # Backend selection is environment-based: the benchmark keeps TLE and
     # standard Triton as explicit, reproducible comparison modes.
@@ -403,11 +413,11 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl):
             hq,
             num_segments,
             padded_v,
-            device="cuda",
+            device=test_backend.device,
             dtype=query.dtype if use_optimized else torch.float32,
         )
         segm_max = torch.empty(
-            batch, hq, num_segments, device="cuda", dtype=torch.float32
+            batch, hq, num_segments, device=test_backend.device, dtype=torch.float32
         )
         segm_expsum = torch.empty_like(segm_max)
         threshold = batch
@@ -418,14 +428,14 @@ def build_runner(inputs, path: str, window_size: int, diffkv_impl):
 
     triton_window = (window_size - 1, 0) if window_size > 0 else (-1, -1)
     out = torch.empty(
-        batch, hq, value_cache.shape[-1], device="cuda", dtype=query.dtype
+        batch, hq, value_cache.shape[-1], device=test_backend.device, dtype=query.dtype
     )
     extra_kwargs = {}
     if use_optimized and use_3d and diffkv_impl.should_use_tle_fused_reducer(
         dqk, dv, 1, seq_len, batch, block_size, True
     ):
         extra_kwargs["fused_reducer_counter"] = torch.zeros(
-            batch * hq, device="cuda", dtype=torch.int32
+            batch * hq, device=test_backend.device, dtype=torch.int32
         )
 
     def run():
@@ -561,7 +571,7 @@ def measure(fn, warmup_ms: int, rep_ms: int, samples: int):
     """
     values = []
     for _ in range(samples):
-        timings_ms = triton.testing.do_bench(
+        timings_ms = test_backend.do_bench(
             fn,
             warmup=warmup_ms,
             rep=rep_ms,
@@ -609,15 +619,16 @@ def run_benchmark(config: BenchmarkConfig | None = None):
     # An explicit config remains useful for local diagnostics, while the
     # named adapter and pytest entry point keep the public op_name stable.
     config = DEFAULT_BENCHMARK_CONFIG if config is None else config
+    require_fa3 = config.require_fa3 and test_backend.is_nvidia()
     if config.op_name != OP_NAME:
         raise ValueError(
             f"unsupported benchmark op_name={config.op_name!r}; expected {OP_NAME!r}"
         )
-    if not torch.cuda.is_available():
-        raise RuntimeError("DiffKV benchmark requires CUDA")
+    if not test_backend.supports_operator("diffkv_attention"):
+        raise RuntimeError("DiffKV benchmark requires an available accelerator")
     torch_device = torch.device(config.device)
     if torch_device.index is not None:
-        torch.cuda.set_device(torch_device)
+        test_backend.device_fn.set_device(torch_device)
     diffkv_impl = load_diffkv_backend(config.backend)
     dtype = parse_dtype(config.dtype)
     fa3_reference = load_fa3_reference(
@@ -628,7 +639,7 @@ def run_benchmark(config: BenchmarkConfig | None = None):
         head_size_v=config.head_size_v,
     )
     fa3_status = load_fa3_provider(config.fa3)
-    if config.require_fa3 and not fa3_status["available"] and not fa3_reference:
+    if require_fa3 and not fa3_status["available"] and not fa3_reference:
         raise RuntimeError(
             "FA3 is required, but direct FA3 is unavailable and no usable "
             "BenchmarkConfig.fa3_csv reference was supplied. "
@@ -643,8 +654,8 @@ def run_benchmark(config: BenchmarkConfig | None = None):
     torch_version = torch.__version__
     triton_version = getattr(triton, "__version__", "unknown")
     cuda_runtime = torch.version.cuda or "unknown"
-    device_name = torch.cuda.get_device_name(torch_device)
-    capability = torch.cuda.get_device_capability(torch_device)
+    device_name = test_backend.get_device_name(torch_device)
+    capability = test_backend.cuda_capability(torch_device)
     print(
         f"Device: {device_name} ({config.device}) dtype={config.dtype} "
         f"compute_capability={capability[0]}.{capability[1]}"
@@ -749,7 +760,7 @@ def run_benchmark(config: BenchmarkConfig | None = None):
                 else:
                     fa3_us = reference_fa3_us
                     fa3_source = "reference-csv" if fa3_us is not None else "n/a"
-                if config.require_fa3 and fa3_us is None:
+                if require_fa3 and fa3_us is None:
                     raise RuntimeError(
                         "FA3 is required but no measurement/reference exists for "
                         f"mode={mode}, batch={batch}, seq_len={seq_len}, "
@@ -875,7 +886,7 @@ DEFAULT_BENCHMARK_CONFIG = BenchmarkConfig(
     include_tail_shapes=False,
     tail_seq_lens=DEFAULT_DIAGNOSTIC_SEQ_LENS,
     require_fa3=True,
-    device="cuda:0",
+    device=test_backend.device + ':0',
 )
 
 
@@ -909,8 +920,8 @@ class DiffKVBenchmark:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="DiffKV benchmark requires CUDA",
+    not test_backend.supports_operator("diffkv_attention"),
+    reason=test_backend.skip_reason("diffkv_attention"),
 )
 @pytest.mark.diffkv_attention
 def test_perf_diffkv_attention():

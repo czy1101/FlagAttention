@@ -15,11 +15,13 @@
 import itertools
 import math
 
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from benchmark.base import Benchmark
+from flag_attn.testing import backend as test_backend
 from flag_attn.runtime.backend._enflame.FLA.kda import chunk_kda
 
 DEVICE = "gcu"
@@ -37,7 +39,7 @@ FLASHKDA_CASES = FIXED_CASES + VARLEN_CASES
 
 
 def _gcu_available() -> bool:
-    return hasattr(torch, "gcu") and torch.gcu.is_available()
+    return test_backend.runtime.device.vendor_name == "enflame" and test_backend.is_available()
 
 
 def _chunk_kda_inference_op(*args, **kwargs):

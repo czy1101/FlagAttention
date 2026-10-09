@@ -17,18 +17,19 @@ import os
 import pytest
 import torch
 
-torch_gcu = pytest.importorskip("torch_gcu")
+from flag_attn import runtime
 
-from flag_attn.runtime.backend._enflame.FLA.nsa import parallel_nsa
+from flag_attn import parallel_nsa
 
 
 def _device():
+    if runtime.device.name == "cpu":
+        pytest.skip("NSA requires an accelerator")
     index = int(
         os.environ.get("S60_TEST_DEVICE", "0")
     )
-    torch.gcu.set_device(index)
-    return torch.device(f"gcu:{index}")
-
+    runtime.torch_device_fn.set_device(index)
+    return torch.device(f"{runtime.device.name}:{index}")
 
 
 def naive_nsa_compression_fwd(q, k, v, scale, block_size):

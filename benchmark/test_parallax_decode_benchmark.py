@@ -22,6 +22,7 @@ imported.
 
 from __future__ import annotations
 
+
 import math
 import os
 import statistics
@@ -29,10 +30,9 @@ import statistics
 import torch
 
 import pytest
-from flag_attn.FLA.parallax import (
-    HAS_TLE,
-    parallel_parallax,
-)
+from flag_attn.testing import backend as test_backend
+from flag_attn import parallel_parallax
+from flag_attn.FLA.parallax import HAS_TLE
 
 
 pytestmark = pytest.mark.parallel_parallax
@@ -53,28 +53,28 @@ CALLS_PER_GRAPH = int(os.getenv("PARALLAX_DECODE_BENCH_ITER", "100"))
 SAMPLES = int(os.getenv("PARALLAX_DECODE_BENCH_SAMPLES", "12"))
 
 
-def _capture_graph(fn, calls_per_graph: int) -> torch.cuda.CUDAGraph:
+def _capture_graph(fn, calls_per_graph: int) -> "torch.cuda.CUDAGraph":
     """Capture ``calls_per_graph`` stable-buffer operator invocations."""
-    graph = torch.cuda.CUDAGraph()
-    capture_stream = torch.cuda.Stream()
-    capture_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(capture_stream):
+    graph = test_backend.device_fn.CUDAGraph()
+    capture_stream = test_backend.device_fn.Stream()
+    capture_stream.wait_stream(test_backend.device_fn.current_stream())
+    with test_backend.device_fn.stream(capture_stream):
         # Finish lazy backend work before capture on this side stream.
         for _ in range(3):
             fn()
         capture_stream.synchronize()
-        with torch.cuda.graph(graph, stream=capture_stream):
+        with test_backend.device_fn.graph(graph, stream=capture_stream):
             for _ in range(calls_per_graph):
                 fn()
-    torch.cuda.current_stream().wait_stream(capture_stream)
-    torch.cuda.synchronize()
+    test_backend.device_fn.current_stream().wait_stream(capture_stream)
+    test_backend.device_fn.synchronize()
     return graph
 
 
-def _graph_sample_ms(graph: torch.cuda.CUDAGraph, calls_per_graph: int) -> float:
+def _graph_sample_ms(graph: "torch.cuda.CUDAGraph", calls_per_graph: int) -> float:
     """Time one graph replay and return per-operator device latency."""
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = test_backend.device_fn.Event(enable_timing=True)
+    end = test_backend.device_fn.Event(enable_timing=True)
     start.record()
     graph.replay()
     end.record()
@@ -89,7 +89,7 @@ def _median_and_mad_percent(samples: list[float]) -> tuple[float, float]:
 
 
 def _sample_median_and_mad(
-    graph: torch.cuda.CUDAGraph,
+    graph: "torch.cuda.CUDAGraph",
     calls_per_graph: int,
     samples: int,
 ) -> tuple[float, float]:
@@ -134,17 +134,17 @@ def _decode_reference(q, r, k, v, scale, window_size_left=-1):
 
 
 def _make_inputs(B, L, HQ, H, D, dtype, seed):
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    q = torch.randn(B, 1, HQ, D, device="cuda", dtype=dtype, generator=generator)
-    r = torch.randn(B, 1, HQ, D, device="cuda", dtype=dtype, generator=generator) * 0.5
-    k = torch.randn(B, L, H, D, device="cuda", dtype=dtype, generator=generator)
-    v = torch.randn(B, L, H, D, device="cuda", dtype=dtype, generator=generator)
+    generator = torch.Generator(device=test_backend.device).manual_seed(seed)
+    q = torch.randn(B, 1, HQ, D, device=test_backend.device, dtype=dtype, generator=generator)
+    r = torch.randn(B, 1, HQ, D, device=test_backend.device, dtype=dtype, generator=generator) * 0.5
+    k = torch.randn(B, L, H, D, device=test_backend.device, dtype=dtype, generator=generator)
+    v = torch.randn(B, L, H, D, device=test_backend.device, dtype=dtype, generator=generator)
     return q, r, k, v
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="parallax decode benchmark requires CUDA",
+    not test_backend.is_available(),
+    reason="requires an available accelerator",
 )
 @pytest.mark.parametrize(
     ("batch_size", "sequence_length", "num_query_heads", "num_kv_heads", "head_dim"),
@@ -163,8 +163,8 @@ def test_perf_parallax_decode(
     head_dim: int,
     dtype: torch.dtype,
 ) -> None:
-    if not HAS_TLE:
-        pytest.skip("FlagTree TLE is unavailable")
+    if not test_backend.supports_operator("parallax_decode", tle=True):
+        pytest.skip("selected Parallax decode implementation is unavailable")
 
     assert WARMUP > 0
     assert CALLS_PER_GRAPH > 0
@@ -199,20 +199,26 @@ def test_perf_parallax_decode(
 
     # Compile outside the timed region and reject numerically invalid rows.
     tle_fn()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     reference = _decode_reference(q, r, k, v, scale, WINDOW_SIZE_LEFT)
     tle_ref_error = _rel_err(out_tle, reference)
     assert tle_ref_error < 1e-2
+
+    if not test_backend.graph_available():
+        samples = [test_backend.do_bench(tle_fn, warmup=WARMUP, rep=100, return_mode="median") for _ in range(SAMPLES)]
+        median_ms = statistics.median(samples)
+        print(f"B={batch_size} L={sequence_length} dtype={dtype} latency={median_ms:.6f} ms (without graph capture)")
+        return
 
     # Warm every lazy path before capture. Stable out/workspace tensors are
     # supplied by the closure, so replay performs no allocator work.
     for _ in range(WARMUP):
         tle_fn()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     graph = _capture_graph(tle_fn, CALLS_PER_GRAPH)
     for _ in range(3):
         graph.replay()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     tle_ms, tle_mad = _sample_median_and_mad(graph, CALLS_PER_GRAPH, SAMPLES)
     print(

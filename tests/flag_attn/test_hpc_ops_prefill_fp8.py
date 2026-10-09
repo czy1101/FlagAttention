@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
 
 import pytest
 import torch
 
-from flag_attn.hpc_ops_attention import (
-    hy3_attention,
-)
+from flag_attn.testing import backend as test_backend
+from flag_attn import hy3_attention
 
 BLOCK = 128
 HEAD_DIM = 128
@@ -62,7 +62,7 @@ def _make_mask(q_len, kv_len, masked, device):
 
 
 def _make_inputs(quant_type, kv_layout, masked, page_size):
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
     fp8 = torch.float8_e4m3fn
     q_len, kv_len = 129, 257
     pages = math.ceil(kv_len / page_size)
@@ -213,14 +213,14 @@ def _reference(args):
 
 
 @pytest.mark.hy3_attention
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not test_backend.supports_operator("hy3_attention"), reason=test_backend.skip_reason("hy3_attention"))
 @pytest.mark.parametrize("quant_type", [0, 1])
 @pytest.mark.parametrize("kv_layout", ["nhd", "hnd"])
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("page_size", [32, 64])
 def test_attention_blocksparse_prefill_fp8(quant_type, kv_layout, masked, page_size):
     torch.manual_seed(10086)
-    torch.cuda.manual_seed(10086)
+    torch.manual_seed(10086)
     args = _make_inputs(quant_type, kv_layout, masked, page_size)
     reference = _reference(args)
     output = hy3_attention(

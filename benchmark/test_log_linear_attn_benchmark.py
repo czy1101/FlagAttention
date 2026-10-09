@@ -14,16 +14,17 @@
 
 """Pytest Log-Linear Attention benchmark with an optional TileLang baseline."""
 
+
 import pytest
 
 import argparse
 import csv
 import importlib.util
 from pathlib import Path
+from flag_attn.testing import backend as test_backend
 
 
 pytestmark = pytest.mark.log_linear_attn
-
 
 
 
@@ -72,7 +73,15 @@ def run(args, module=None):
 def test_log_linear_attn_benchmark():
     module = _load_benchmark_module()
     if not module._tle_available():
-        pytest.skip("requires CUDA and FlagTree/TLE")
+        if not test_backend.supports_operator("log_linear_attn", tle=True):
+            pytest.skip("selected Log-Linear implementation is unavailable")
+        from flag_attn import log_linear_attn
+
+        for shape in module.BENCHMARK_SHAPES:
+            inputs = module._make_inputs(*shape)
+            latency = test_backend.do_bench(lambda: log_linear_attn(*inputs), warmup=1000, rep=100, return_mode="median")
+            print(f"{shape}: public API latency={latency:.6f} ms (full call)")
+        return
     args = argparse.Namespace(
         provider="auto", shape=None, rounds=7, warmup=1000, rep=100, csv=None,
     )

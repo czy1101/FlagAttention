@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+
 import gc
 import math
 import statistics
@@ -32,6 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
+from flag_attn.testing import backend as test_backend
 from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_dynamic as fp8_qk_dynamic,
     fp8_qpertoken_perhead_kvpertensor_dynamic as fp8_kv_dynamic,
@@ -41,7 +43,7 @@ from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_static as fp8_qk_static,
     fp8_qpertoken_perhead_kvpertensor_static as fp8_kv_static,
 )
-from flag_attn.hpc_ops_attention import hy3_attention
+from flag_attn import hy3_attention
 
 
 BLOCK_SIZE = 64
@@ -95,6 +97,8 @@ class Panel:
 
 
 def _load_hpc():
+    if not test_backend.is_nvidia():
+        return None
     try:
         import hpc
         return hpc
@@ -165,8 +169,8 @@ def make_inputs(
     lengths, mtp: int, hkv: int, hq: int, layout: str, quant_type: str,
 ) -> Panel:
     torch.manual_seed(41)
-    torch.cuda.manual_seed(41)
-    kv_lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    torch.manual_seed(41)
+    kv_lens = torch.tensor(lengths, dtype=torch.int32, device=test_backend.device)
     block_counts = (kv_lens + BLOCK_SIZE - 1) // BLOCK_SIZE
     total_blocks = int(block_counts.sum().item())
     capacity = int(total_blocks * 1.2) + len(lengths) + 8
@@ -175,7 +179,7 @@ def make_inputs(
     # Q -> K/V -> scales -> block IDs.
     q_bf16 = torch.randn(
         (len(lengths) * mtp, hq, HEAD_DIM),
-        dtype=torch.bfloat16, device="cuda",
+        dtype=torch.bfloat16, device=test_backend.device,
     ) / math.sqrt(HEAD_DIM)
     q_scale = q_bf16.float().abs().amax(-1).clamp_min(1e-6)
     q = (q_bf16 / q_scale[..., None]).to(torch.float8_e4m3fn)
@@ -183,7 +187,7 @@ def make_inputs(
     if QUANT_TYPES[quant_type] == 0:
         raw_k = torch.randn(
             (capacity, BLOCK_SIZE + 2, hkv, HEAD_DIM),
-            dtype=torch.bfloat16, device="cuda",
+            dtype=torch.bfloat16, device=test_backend.device,
         )
         raw_v = torch.randn_like(raw_k)
         k_storage = _quantize_k_per_token(raw_k)
@@ -198,27 +202,27 @@ def make_inputs(
         k_cache = (
             torch.randn(
                 (capacity, BLOCK_SIZE, hkv, HEAD_DIM),
-                dtype=torch.bfloat16, device="cuda",
+                dtype=torch.bfloat16, device=test_backend.device,
             ) / math.sqrt(HEAD_DIM)
         ).to(torch.float8_e4m3fn)
         v_cache = torch.randn(
             (capacity, BLOCK_SIZE, hkv, HEAD_DIM),
-            dtype=torch.bfloat16, device="cuda",
+            dtype=torch.bfloat16, device=test_backend.device,
         ).to(torch.float8_e4m3fn)
         if layout == "HND":
             k_cache = _as_hnd_view(k_cache)
             v_cache = _as_hnd_view(v_cache)
         k_scale = torch.rand(
-            (1,), dtype=torch.float32, device="cuda"
+            (1,), dtype=torch.float32, device=test_backend.device
         ).clamp_min(1e-6)
         v_scale = torch.rand(
-            (1,), dtype=torch.float32, device="cuda"
+            (1,), dtype=torch.float32, device=test_backend.device
         ).clamp_min(1e-6)
 
-    packed_ids = torch.randperm(capacity, device="cuda")[:total_blocks].int()
+    packed_ids = torch.randperm(capacity, device=test_backend.device)[:total_blocks].int()
     block_ids = torch.empty(
         (len(lengths), int(block_counts.max().item())),
-        dtype=torch.int32, device="cuda",
+        dtype=torch.int32, device=test_backend.device,
     )
     offset = 0
     for batch, count in enumerate(block_counts.cpu().tolist()):
@@ -272,30 +276,32 @@ def _run_cuda(
 
 
 def _bench_ms(call, warmup: int, iters: int, graph_mode: bool) -> float:
+    if not test_backend.graph_available() or not hasattr(test_backend.device_fn, "Event"):
+        return test_backend.do_bench(call, warmup=warmup, rep=iters, return_mode="median")
     for _ in range(warmup):
         call()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     if graph_mode:
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
+        stream = test_backend.device_fn.Stream()
+        stream.wait_stream(test_backend.device_fn.current_stream())
+        with test_backend.device_fn.stream(stream):
+            graph = test_backend.device_fn.CUDAGraph()
+            with test_backend.device_fn.graph(graph, stream=stream):
                 call()
-        torch.cuda.current_stream().wait_stream(stream)
+        test_backend.device_fn.current_stream().wait_stream(stream)
         for _ in range(warmup):
             graph.replay()
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         call = graph.replay
     events = [
-        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        (test_backend.device_fn.Event(enable_timing=True), test_backend.device_fn.Event(enable_timing=True))
         for _ in range(iters)
     ]
     for start, end in events:
         start.record()
         call()
         end.record()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     values = sorted(start.elapsed_time(end) for start, end in events)
     return values[len(values) // 2]
 
@@ -320,7 +326,7 @@ def _measure(calls, warmup, iters, repeat, graph_mode):
 @pytest.fixture(scope="module")
 def hpc_baseline():
     triton.set_allocator(lambda size, _align, _stream: torch.empty(
-        size, dtype=torch.int8, device="cuda"
+        size, dtype=torch.int8, device=test_backend.device
     ))
     return _load_hpc()
 
@@ -395,7 +401,7 @@ def report_performance_results():
 
 
 @pytest.mark.hy3_attention
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not test_backend.is_available(), reason="requires an available accelerator")
 @pytest.mark.parametrize("mtp", BENCH_MTP, ids=lambda value: f"mtp{value}")
 @pytest.mark.parametrize("quant_type", BENCH_QUANT_TYPES)
 @pytest.mark.parametrize("schedule", BENCH_SCHEDULES)
@@ -404,6 +410,9 @@ def report_performance_results():
 def test_attention_decode_fp8_perf(
     hpc_baseline, mtp, quant_type, schedule, case, layout,
 ):
+    variant = ("fp8_qk_" if quant_type == "qkpertoken_perhead_vperhead" else "fp8_kv_") + schedule
+    if not test_backend.supports_operator(f"hy3_attention_decode_{variant}", min_sm=(9, 0)):
+        pytest.skip("selected Hy3 decode variant is unavailable on this device")
     if not HAS_TLE and mtp != 1:
         pytest.skip("pure Triton fallback supports MTP=1 only")
 
@@ -435,7 +444,7 @@ def test_attention_decode_fp8_perf(
 
     if BENCH_CHECK:
         actual = tle_call().detach().clone()
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         reset = implementation.workspace_is_reset(workspace)
         assert torch.isfinite(actual).all()
         assert reset, "decode workspace was not reset"
@@ -464,4 +473,4 @@ def test_attention_decode_fp8_perf(
 
     del panel, inputs, workspace, cuda_output, task_map
     gc.collect()
-    torch.cuda.empty_cache()
+    test_backend.device_fn.empty_cache()

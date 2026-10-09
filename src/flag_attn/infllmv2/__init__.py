@@ -3,8 +3,11 @@
 
 from typing import Literal
 
-from .operator import InfLLMV2Config, infllmv2_decode
-from .operator import infllmv2_attention as _infllmv2_prefill
+from flag_attn.runtime.backend import resolve_operator
+
+from .operator import InfLLMV2Config
+
+infllmv2_decode = resolve_operator("infllmv2_decode", "flag_attn.infllmv2.operator")
 
 
 def infllmv2_attention(*args, stage: Literal["prefill", "decode"] = "prefill", **kwargs):
@@ -15,7 +18,7 @@ def infllmv2_attention(*args, stage: Literal["prefill", "decode"] = "prefill", *
     The original config, cache layout and autograd behavior are preserved.
     """
     if stage == "prefill":
-        return _infllmv2_prefill(*args, **kwargs)
+        return resolve_operator("infllmv2_attention", "flag_attn.infllmv2.operator")(*args, **kwargs)
     if stage == "decode":
         return infllmv2_decode(*args, **kwargs)
     raise ValueError(f"Unsupported InfLLMv2 stage: {stage!r}; expected 'prefill' or 'decode'")

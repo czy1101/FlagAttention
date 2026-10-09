@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import torch
 import pytest
+from flag_attn.testing import backend as test_backend
 from flag_attn.testing import recompute_mask
 
+
+pytestmark = pytest.mark.skipif(not test_backend.is_available(), reason="requires an available accelerator")
 
 @pytest.mark.parametrize('B, H, M, N', [
     (2, 4, 512, 612),
@@ -33,7 +37,7 @@ def test_recompute_mask(B, H, M, N, p):
     import math
     seed = 123456789
     offset = 123456789123456789
-    device = torch.cuda.current_device()
+    device = f"{test_backend.device}:{test_backend.device_fn.current_device()}"
     mask = recompute_mask(B, H, M, N, p, seed, offset, device)
     # zeros indicate to drop
     # k follows Binomial distributio B(k; n, p)

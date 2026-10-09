@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import torch
 import pytest
 
+from flag_attn.testing import backend as test_backend
 import flag_attn
 
 NUM_BLOCKS = 1000
 
+
+pytestmark = pytest.mark.skipif(not test_backend.is_available(), reason="requires an available accelerator")
 
 def base_paged_attention(
     num_seqs,
@@ -29,7 +33,7 @@ def base_paged_attention(
     max_seq_len,
     num_splits=0,
     dtype=torch.float16,
-    device="cuda",
+    device=test_backend.device,
 ):
     torch.set_default_dtype(dtype)
     torch.set_default_device(device=device)
@@ -90,7 +94,7 @@ def test_paged_attention_default(
     block_size,
     max_seq_len,
     dtype=torch.float16,
-    device="cuda",
+    device=test_backend.device,
 ):
     base_paged_attention(
         num_seqs,
@@ -118,7 +122,7 @@ def test_paged_attention_by_num_splits(
     max_seq_len,
     num_splits,
     dtype=torch.float16,
-    device="cuda",
+    device=test_backend.device,
 ):
     base_paged_attention(
         num_seqs,
@@ -144,7 +148,7 @@ def test_paged_attention_by_case(
     max_seq_len,
     num_splits,
     dtype=torch.float16,
-    device="cuda",
+    device=test_backend.device,
 ):
     base_paged_attention(
         num_seqs,

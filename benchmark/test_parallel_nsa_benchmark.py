@@ -20,11 +20,9 @@ from dataclasses import dataclass
 from typing import Callable
 
 import torch
-torch_gcu = pytest.importorskip("torch_gcu")
+from flag_attn import runtime
 
-from flag_attn.runtime.backend._enflame.FLA.nsa import (
-    parallel_nsa,
-)
+from flag_attn import parallel_nsa
 
 
 try:
@@ -80,7 +78,7 @@ DTYPE_MAP = {
 
 
 def synchronize() -> None:
-    torch.gcu.synchronize()
+    runtime.torch_device_fn.synchronize()
 
 
 def build_block_indices(
@@ -181,14 +179,12 @@ def run_benchmark(args, record_property=None) -> None:
     if args.inner <= 0:
         raise ValueError("inner must be positive")
 
-    torch.gcu.set_device(args.device_index)
+    runtime.torch_device_fn.set_device(args.device_index)
     torch.manual_seed(42)
 
     case = CASES[args.case]
     dtype = DTYPE_MAP[args.dtype]
-    device = torch.device(
-        f"gcu:{args.device_index}"
-    )
+    device = torch.device(f"{runtime.device.name}:{args.device_index}")
     scale = case.head_dim ** -0.5
 
     q = torch.randn(
@@ -404,8 +400,8 @@ def run_benchmark(args, record_property=None) -> None:
 @pytest.mark.parallel_nsa
 @pytest.mark.parametrize("mode", ["selected", "full", "compression"])
 def test_parallel_nsa_benchmark(mode, record_property):
-    if not torch.gcu.is_available():
-        pytest.skip("NSA benchmark requires an Enflame GCU")
+    if runtime.device.name == "cpu" or not runtime.torch_device_fn.is_available():
+        pytest.skip("NSA benchmark requires an accelerator")
     args = argparse.Namespace(
         mode=mode, case="SMOKE", dtype="bfloat16",
         device_index=int(os.environ.get("S60_TEST_DEVICE", "0")),

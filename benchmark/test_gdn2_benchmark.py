@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import argparse
 import math
 from collections.abc import Callable
@@ -15,6 +16,7 @@ try:
 except ModuleNotFoundError:  # Direct script execution.
     from recording import BenchmarkRecorder
 
+from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gdn2
 from flag_attn.gdn2.chunk import HAS_TLE_GDN2
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
@@ -54,13 +56,13 @@ def _parse_shape(value: str) -> tuple[int, int, int, int, int]:
 
 def _make_inputs(shape: tuple[int, int, int, int, int], dtype: torch.dtype):
     B, T, H, K, V = shape
-    q = torch.randn(B, T, H, K, device="cuda", dtype=dtype) / math.sqrt(K)
-    k = torch.randn(B, T, H, K, device="cuda", dtype=dtype) / math.sqrt(K)
-    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
-    g = (-torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 0.1).to(dtype)
-    b = torch.rand(B, T, H, K, device="cuda", dtype=dtype)
-    w = torch.rand(B, T, H, V, device="cuda", dtype=dtype)
-    initial_state = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32) * 0.01
+    q = torch.randn(B, T, H, K, device=test_backend.device, dtype=dtype) / math.sqrt(K)
+    k = torch.randn(B, T, H, K, device=test_backend.device, dtype=dtype) / math.sqrt(K)
+    v = torch.randn(B, T, H, V, device=test_backend.device, dtype=dtype)
+    g = (-torch.rand(B, T, H, K, device=test_backend.device, dtype=torch.float32) * 0.1).to(dtype)
+    b = torch.rand(B, T, H, K, device=test_backend.device, dtype=dtype)
+    w = torch.rand(B, T, H, V, device=test_backend.device, dtype=dtype)
+    initial_state = torch.randn(B, H, K, V, device=test_backend.device, dtype=torch.float32) * 0.01
     return q, k, v, g, b, w, initial_state
 
 
@@ -111,48 +113,46 @@ def run_benchmark(
     parser.add_argument("--rep", type=int, default=100)
     args = parser.parse_args(argv)
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("GDN2 benchmark requires CUDA")
-    if not HAS_TLE_GDN2:
-        raise RuntimeError("TLE GDN2 is unavailable; install a compatible Triton TLE build")
+    if not test_backend.supports_operator("chunk_gdn2"):
+        raise RuntimeError("GDN2 benchmark requires an available accelerator")
+    compare_native = test_backend.device == "cuda"
 
     dtype = getattr(torch, args.dtype)
     shapes = args.shape or (ALL_SHAPES if args.full else DEFAULT_SHAPES)
-    print(f"GPU: {torch.cuda.get_device_name()} | dtype: {args.dtype}")
-    print("B,T,H,K,V                     native_ms      tle_ms     speedup")
+    print(f"GPU: {test_backend.get_device_name()} | dtype: {args.dtype}")
+    print("B,T,H,K,V                     native_ms   public_ms     speedup")
     print("-" * 66)
     recorder = BenchmarkRecorder(
         record_property,
         op_name="chunk_gdn2",
         dtype=str(dtype),
-        baseline="native",
+        baseline="native" if compare_native else None,
         phase="forward",
     )
     for shape in shapes:
         torch.manual_seed(42)
         inputs = _make_inputs(shape, dtype)
-        _native_forward(inputs)
+        if compare_native:
+            _native_forward(inputs)
         _tle_forward(inputs)
-        torch.cuda.synchronize()
-        native_ms = triton.testing.do_bench(
+        test_backend.device_fn.synchronize()
+        native_ms = test_backend.do_bench(
             lambda: _native_forward(inputs), warmup=args.warmup, rep=args.rep
-        )
-        tle_ms = triton.testing.do_bench(
+        ) if compare_native else None
+        tle_ms = test_backend.do_bench(
             lambda: _tle_forward(inputs), warmup=args.warmup, rep=args.rep
         )
         shape_text = ",".join(str(item) for item in shape)
-        print(f"{shape_text:<28} {native_ms:>10.4f} {tle_ms:>11.4f} {native_ms / tle_ms:>10.3f}x")
+        baseline_text = "N/A" if native_ms is None else f"{native_ms:.4f}"
+        speedup_text = "N/A" if native_ms is None else f"{native_ms / tle_ms:.3f}x"
+        print(f"{shape_text:<28} {baseline_text:>10} {tle_ms:>11.4f} {speedup_text:>11}")
         recorder.add(shape_detail=shape, latency_base=native_ms, latency=tle_ms)
         del inputs
-        torch.cuda.empty_cache()
+        test_backend.device_fn.empty_cache()
     recorder.record()
 
 
 @pytest.mark.chunk_gdn2
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GDN2 benchmark requires CUDA")
-@pytest.mark.skipif(
-    not HAS_TLE_GDN2,
-    reason="GDN2 benchmark requires a compatible Triton TLE build",
-)
+@pytest.mark.skipif(not test_backend.supports_operator("chunk_gdn2"), reason=test_backend.skip_reason("chunk_gdn2"))
 def test_chunk_gdn2_benchmark(record_property) -> None:
     run_benchmark([], record_property)

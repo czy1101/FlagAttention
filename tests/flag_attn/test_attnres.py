@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import importlib
 import os
 import statistics
@@ -20,6 +21,7 @@ import pytest
 import torch
 import triton
 
+from flag_attn.testing import backend as test_backend
 import flag_attn
 
 
@@ -58,7 +60,7 @@ def _tle_available() -> bool:
         import triton.experimental.tle.language  # noqa: F401
     except ImportError:
         return False
-    return torch.cuda.is_available()
+    return test_backend.is_nvidia()
 
 
 def _require_fla_reference():
@@ -68,7 +70,7 @@ def _require_fla_reference():
 
 
 def _bench(fn):
-    return triton.testing.do_bench(
+    return test_backend.do_bench(
         fn,
         warmup=ATTNRES_BENCHMARK_WARMUP_MS,
         rep=ATTNRES_BENCHMARK_REP_MS,
@@ -77,10 +79,25 @@ def _bench(fn):
 
 
 def test_fused_attnres_public_export():
-    from flag_attn.FLA.attnres import fused_attnres
+    from flag_attn import fused_attnres
 
     assert flag_attn.fused_attnres is fused_attnres
-    assert fused_attnres is FLAG_ATTNRES_MODULE.fused_attnres
+    backend_name = f"flag_attn.runtime.backend._{flag_attn.runtime.device.vendor_name}"
+    try:
+        backend = importlib.import_module(backend_name)
+    except ModuleNotFoundError as exc:
+        if exc.name != backend_name:
+            raise
+        backend = None
+
+    exports = vars(backend).get("_OPERATOR_EXPORTS", {}) if backend is not None else {}
+    generic_only = vars(backend).get("_GENERIC_ONLY_OPS", ()) if backend is not None else ()
+    if "fused_attnres" in exports and "fused_attnres" not in generic_only:
+        module_name, symbol = exports["fused_attnres"]
+        expected = getattr(importlib.import_module(module_name, backend_name), symbol)
+    else:
+        expected = FLAG_ATTNRES_MODULE.fused_attnres
+    assert fused_attnres is expected
     assert "fused_attnres" in flag_attn.__all__
 
 
@@ -102,18 +119,18 @@ def test_fused_attnres(
     output_norm: bool,
     dtype: torch.dtype,
 ):
-    if not _tle_available():
-        pytest.skip("fused_attnres requires CUDA and triton.experimental.tle")
+    if not test_backend.supports_operator("fused_attnres", tle=True):
+        pytest.skip("selected AttnRes implementation is unavailable")
 
     torch.manual_seed(42)
     residuals = [
-        torch.randn(batch, tokens, hidden_size, device="cuda", dtype=dtype)
+        torch.randn(batch, tokens, hidden_size, device=test_backend.device, dtype=dtype)
         for _ in range(num_sources)
     ]
-    query = torch.randn(hidden_size, device="cuda", dtype=dtype)
-    rms_weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+    query = torch.randn(hidden_size, device=test_backend.device, dtype=dtype)
+    rms_weight = torch.randn(hidden_size, device=test_backend.device, dtype=dtype)
     output_rms_weight = (
-        torch.randn(hidden_size, device="cuda", dtype=dtype) if output_norm else None
+        torch.randn(hidden_size, device=test_backend.device, dtype=dtype) if output_norm else None
     )
 
     expected, expected_weights = flag_attn.testing.fused_attnres(
@@ -139,16 +156,16 @@ def test_fused_attnres(
 
 @torch.inference_mode()
 def test_fused_attnres_without_weights():
-    if not _tle_available():
-        pytest.skip("fused_attnres requires CUDA and triton.experimental.tle")
+    if not test_backend.supports_operator("fused_attnres", tle=True):
+        pytest.skip("selected AttnRes implementation is unavailable")
 
     hidden_size = 7168
     residuals = [
-        torch.randn(2, hidden_size, device="cuda", dtype=torch.bfloat16)
+        torch.randn(2, hidden_size, device=test_backend.device, dtype=torch.bfloat16)
         for _ in range(5)
     ]
-    query = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
-    rms_weight = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
+    query = torch.randn(hidden_size, device=test_backend.device, dtype=torch.bfloat16)
+    rms_weight = torch.randn(hidden_size, device=test_backend.device, dtype=torch.bfloat16)
 
     output = flag_attn.fused_attnres(query, residuals, rms_weight, scale=hidden_size**-0.5)
     assert isinstance(output, torch.Tensor)
@@ -180,13 +197,13 @@ def test_fused_attnres_kernel_benchmark(
     hidden_size = 7168
     dtype = torch.bfloat16
     residuals = [
-        torch.randn(num_rows, hidden_size, device="cuda", dtype=dtype)
+        torch.randn(num_rows, hidden_size, device=test_backend.device, dtype=dtype)
         for _ in range(num_sources)
     ]
-    query = torch.randn(hidden_size, device="cuda", dtype=dtype)
-    rms_weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+    query = torch.randn(hidden_size, device=test_backend.device, dtype=dtype)
+    rms_weight = torch.randn(hidden_size, device=test_backend.device, dtype=dtype)
     output_rms_weight = (
-        torch.randn(hidden_size, device="cuda", dtype=dtype) if output_norm else None
+        torch.randn(hidden_size, device=test_backend.device, dtype=dtype) if output_norm else None
     )
     scale = hidden_size**-0.5
 
@@ -204,11 +221,11 @@ def test_fused_attnres_kernel_benchmark(
     fla_ptrs = FLA_ATTNRES_MODULE._build_ptr_table(residuals)
     fla_output = torch.empty_like(residuals[0])
     stats_shape = (num_sources, num_rows)
-    fla_probability = torch.empty(stats_shape, device="cuda", dtype=torch.float32)
+    fla_probability = torch.empty(stats_shape, device=test_backend.device, dtype=torch.float32)
     fla_rstd = torch.empty_like(fla_probability)
     fla_score_mean = torch.empty_like(fla_probability)
     fla_output_rstd = (
-        torch.empty((num_rows,), device="cuda", dtype=torch.float32)
+        torch.empty((num_rows,), device=test_backend.device, dtype=torch.float32)
         if output_norm
         else None
     )
@@ -266,7 +283,7 @@ def test_fused_attnres_kernel_benchmark(
 
     run_fla_kernel()
     run_flag_kernel()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     torch.testing.assert_close(
         flag_output.float(), fla_output.float(), atol=5e-3, rtol=1e-2
     )

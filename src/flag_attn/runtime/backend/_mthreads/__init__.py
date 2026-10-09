@@ -18,28 +18,24 @@ from __future__ import annotations
 
 import importlib
 
-
 _OPERATOR_EXPORTS = {
-    "chunk_gla": (".FLA.gla", "chunk_gla"),
+    "SPARSE_BLOCK_SIZE": (".minimax_sparse_attention.index_topk", "SPARSE_BLOCK_SIZE"),
     "chunk_gdn2": (".FLA.gdn2", "chunk_gdn2"),
     "chunk_gdn2_native": (".FLA.gdn2.native.chunk_fwd", "chunk_gdn2_fwd"),
+    "chunk_gla": (".FLA.gla", "chunk_gla"),
     "chunk_kda": (".FLA.kda", "chunk_kda"),
+    "chunk_kda_fwd_infer": (".FLA.kda.chunk_kda", "chunk_kda_fwd_infer"),
     "minimax_m3_index_decode": (".minimax_sparse_attention", "minimax_m3_index_decode"),
-    "minimax_m3_index_decode_score": (
-        ".minimax_sparse_attention",
-        "minimax_m3_index_decode_score",
-    ),
+    "minimax_m3_index_decode_score": (".minimax_sparse_attention", "minimax_m3_index_decode_score"),
     "minimax_m3_index_score": (".minimax_sparse_attention", "minimax_m3_index_score"),
     "minimax_m3_index_topk": (".minimax_sparse_attention", "minimax_m3_index_topk"),
     "minimax_m3_sparse_attn": (".minimax_sparse_attention", "minimax_m3_sparse_attn"),
-    "minimax_m3_sparse_attn_decode": (
-        ".minimax_sparse_attention",
-        "minimax_m3_sparse_attn_decode",
-    ),
-    "parallel_nsa": (".FLA.nsa", "parallel_nsa"),
-    "parallel_nsa_compression": (".FLA.nsa", "parallel_nsa_compression"),
-    "sage_attention_forward": (".sage_attention", "forward"),
-    "sage_attention_per_block_int8": (".sage_attention", "per_block_int8"),
+    "minimax_m3_sparse_attn_decode": (".minimax_sparse_attention", "minimax_m3_sparse_attn_decode"),
+    "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
+    "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
+    "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),
+    "sage_attention_forward": (".sage_attention.attn_qk_int8_per_block", "forward"),
+    "sage_attention_per_block_int8": (".sage_attention.quant_per_block", "per_block_int8"),
 }
 
 

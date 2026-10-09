@@ -16,14 +16,13 @@
 
 from typing import Literal
 
+from flag_attn.runtime.backend import resolve_operator
+
 from .decode import HAS_TLE, parallax_attn_with_kvcache, parallax_decode
 from .parallel import (
     ParallaxFunction,
     parallel_parallax_bwd,
     parallel_parallax_fwd,
-)
-from .parallel import (
-    parallel_parallax as _parallel_parallax_prefill,
 )
 
 
@@ -36,11 +35,11 @@ def parallel_parallax(*args, stage: Literal["prefill", "decode", "kvcache"] = "p
     its original scale, window and output-buffer conventions.
     """
     if stage == "prefill":
-        return _parallel_parallax_prefill(*args, **kwargs)
+        return resolve_operator("parallel_parallax", "flag_attn.FLA.parallax.parallel")(*args, **kwargs)
     if stage == "decode":
-        return parallax_decode(*args, **kwargs)
+        return resolve_operator("parallax_decode", "flag_attn.FLA.parallax.decode")(*args, **kwargs)
     if stage == "kvcache":
-        return parallax_attn_with_kvcache(*args, **kwargs)
+        return resolve_operator("parallax_attn_with_kvcache", "flag_attn.FLA.parallax.decode")(*args, **kwargs)
     raise ValueError(f"Unsupported Parallax stage: {stage!r}; expected 'prefill', 'decode' or 'kvcache'")
 
 

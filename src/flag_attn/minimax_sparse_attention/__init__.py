@@ -23,30 +23,51 @@ The cache layout is compatible with vLLM:
 
 from typing import Literal
 
-from flag_attn.runtime.backend import is_metax_backend
+from flag_attn.runtime.backend import resolve_operator
 
-if is_metax_backend():
-    from flag_attn.runtime.backend._metax.msa import (
-        SPARSE_BLOCK_SIZE,
-        minimax_m3_index_decode,
-        minimax_m3_index_decode_score,
-        minimax_m3_index_score,
-        minimax_m3_index_topk,
-        minimax_m3_sparse_attn_decode,
-    )
-    from flag_attn.runtime.backend._metax.msa import (
-        minimax_m3_sparse_attn as _minimax_m3_sparse_attn_prefill,
-    )
-else:
-    from .index_topk import (
-        SPARSE_BLOCK_SIZE,
-        minimax_m3_index_decode,
-        minimax_m3_index_decode_score,
-        minimax_m3_index_score,
-        minimax_m3_index_topk,
-    )
-    from .sparse_attn import minimax_m3_sparse_attn as _minimax_m3_sparse_attn_prefill
-    from .sparse_attn import minimax_m3_sparse_attn_decode
+_OPERATOR_EXPORTS = {
+    "SPARSE_BLOCK_SIZE": ("SPARSE_BLOCK_SIZE", "flag_attn.minimax_sparse_attention.index_topk", "SPARSE_BLOCK_SIZE"),
+    "minimax_m3_index_decode": (
+        "minimax_m3_index_decode",
+        "flag_attn.minimax_sparse_attention.index_topk",
+        "minimax_m3_index_decode",
+    ),
+    "minimax_m3_index_decode_score": (
+        "minimax_m3_index_decode_score",
+        "flag_attn.minimax_sparse_attention.index_topk",
+        "minimax_m3_index_decode_score",
+    ),
+    "minimax_m3_index_score": (
+        "minimax_m3_index_score",
+        "flag_attn.minimax_sparse_attention.index_topk",
+        "minimax_m3_index_score",
+    ),
+    "minimax_m3_index_topk": (
+        "minimax_m3_index_topk",
+        "flag_attn.minimax_sparse_attention.index_topk",
+        "minimax_m3_index_topk",
+    ),
+    "minimax_m3_sparse_attn_decode": (
+        "minimax_m3_sparse_attn_decode",
+        "flag_attn.minimax_sparse_attention.sparse_attn",
+        "minimax_m3_sparse_attn_decode",
+    ),
+    "_minimax_m3_sparse_attn_prefill": (
+        "minimax_m3_sparse_attn",
+        "flag_attn.minimax_sparse_attention.sparse_attn",
+        "minimax_m3_sparse_attn",
+    ),
+}
+
+
+def __getattr__(name: str):
+    try:
+        operator, module, symbol = _OPERATOR_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = resolve_operator(operator, module, symbol)
+    globals()[name] = value
+    return value
 
 
 def minimax_m3_sparse_attn(*args, stage: Literal["prefill", "decode"] = "prefill", **kwargs):
@@ -58,9 +79,13 @@ def minimax_m3_sparse_attn(*args, stage: Literal["prefill", "decode"] = "prefill
     No cache preparation or tensor conversion is performed here.
     """
     if stage == "prefill":
-        return _minimax_m3_sparse_attn_prefill(*args, **kwargs)
+        implementation = globals().get("_minimax_m3_sparse_attn_prefill") or __getattr__(
+            "_minimax_m3_sparse_attn_prefill"
+        )
+        return implementation(*args, **kwargs)
     if stage == "decode":
-        return minimax_m3_sparse_attn_decode(*args, **kwargs)
+        implementation = globals().get("minimax_m3_sparse_attn_decode") or __getattr__("minimax_m3_sparse_attn_decode")
+        return implementation(*args, **kwargs)
     raise ValueError(f"Unsupported MiniMax stage: {stage!r}; expected 'prefill' or 'decode'")
 
 
@@ -70,6 +95,6 @@ __all__ = [
     "minimax_m3_index_decode_score",
     "minimax_m3_index_score",
     "minimax_m3_index_topk",
-    "minimax_m3_sparse_attn",
     "minimax_m3_sparse_attn_decode",
+    "minimax_m3_sparse_attn",
 ]

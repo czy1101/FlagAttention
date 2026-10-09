@@ -14,7 +14,7 @@
 
 ops:
   - id: parallel_wall_attn
-    description: Run Wall-Attention correctness and H100 performance tests.
+    description: Run Wall-Attention correctness and performance tests on the selected backend.
     for:
       - parallel_wall_attn
     labels:
@@ -29,8 +29,6 @@ ops:
     tests:
       - tests/flag_attn/test_parallel_wall_attn.py
     benchmark: benchmark/test_parallel_wall_attn_benchmark.py
-    benchmark_requires:
-      - fla
   - id: hy3_attention
     description: Run Hy3 FP8 prefill and BF16/FP8 decode, including static and dynamic scheduling. Requires PyTorch 2.7.0.
     for:
@@ -80,8 +78,6 @@ ops:
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_hybrid_matches_fla
       - tests/flag_attn/test_gated_delta_rule.py::test_chunk_gated_delta_rule_public_api_uses_two_kernel
     benchmark: benchmark/test_gated_delta_rule_benchmark.py
-    benchmark_requires:
-      - fla
   - id: chunk_gdn2
     description: Compare native and TLE chunked GDN2 implementations and resource controls.
     for:
@@ -115,8 +111,9 @@ ops:
       - tests/flag_attn/test_chunk_gla.py::test_chunk_varlen
     benchmark: benchmark/test_chunk_gla_benchmark.py
   - id: chunk_kda
-    description: Compare CUDA TLE Kimi Delta Attention against its recurrent reference.
+    description: Run Kimi Delta Attention inference on the selected backend against its recurrent reference.
     for:
+      - chunk_kda
       - chunk_kda_fwd_infer
     labels:
       - fused
@@ -144,7 +141,7 @@ ops:
       - alpha: 'unreleased'
     tests:
       - tests/flag_attn/test_chunk_kda.py
-      - benchmark/test_chunk_kda.py
+    benchmark: benchmark/test_chunk_kda.py
   - id: flash_attention
     description: Run FlashAttention forward, including its auxiliary-output path.
     for:
@@ -161,6 +158,8 @@ ops:
     tests:
       - tests/flag_attn/test_flash_attention.py::test_attention_fwd
       - tests/flag_attn/test_flash_attention.py::test_attention_with_aux_outs
+      - tests/flag_attn/test_flash_attention.py::test_splitkv_large_logits
+      - tests/flag_attn/test_flash_attention.py::test_splitkv_independent_kv_strides
     benchmark: benchmark/flash_benchmark.py
   - id: flash_attention_backward
     description: Run the backward path for FlashAttention.
@@ -277,8 +276,6 @@ ops:
     tests:
       - tests/flag_attn/test_moba.py
     benchmark: benchmark/test_moba_perf.py
-    benchmark_requires:
-      - flash_moba
   - id: paged_attention
     description: Run paged KV-cache attention with automatic, explicit, and targeted split selection.
     for:
@@ -298,14 +295,13 @@ ops:
       - tests/flag_attn/test_paged_attention.py::test_paged_attention_by_case
     benchmark: benchmark/paged_benchmark.py
   - id: parallel_nsa
-    description: Run Enflame native sparse attention selection, compression, and full pipeline.
+    description: Run native sparse attention selection, compression, and full pipeline on the selected backend.
     for:
       - parallel_nsa
       - parallel_nsa_compression
     labels:
       - fused
       - FLA
-      - enflame
       - NoCPU
     kind:
       - Attention
@@ -315,8 +311,6 @@ ops:
       - tests/flag_attn/test_parallel_nsa.py
       - tests/flag_attn/test_parallel_nsa_compression.py
     benchmark: benchmark/test_parallel_nsa_benchmark.py
-    benchmark_requires:
-      - torch_gcu
   - id: piecewise_attention
     description: Run the forward path for piecewise attention.
     for:
@@ -374,22 +368,6 @@ ops:
     tests:
       - tests/flag_attn/test_sage_attention.py
     benchmark: benchmark/test_sage_attention_benchmark.py
-  - id: sage_attention_ascend
-    description: Run the Ascend SageAttention backend tests and benchmark.
-    for:
-      - sage_attention
-    labels:
-      - fused
-      - Attention
-      - ascend
-      - NoCPU
-    kind:
-      - Attention
-    stages:
-      - alpha: 'unreleased'
-    tests:
-      - src/flag_attn/runtime/backend/_ascend/test_sage_attention.py
-    benchmark: src/flag_attn/runtime/backend/_ascend/sage_attention_benchmark.py
   - id: fused_attnres
     description: Run fused attention residual aggregation.
     for:

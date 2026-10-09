@@ -21,17 +21,22 @@ used as an additional baseline.
 
 from __future__ import annotations
 
+
 import math
 
 import pytest
 import torch
 
-from flag_attn.FLA.parallax import HAS_TLE, parallel_parallax
+from flag_attn.testing import backend as test_backend
+from flag_attn import parallel_parallax
+from flag_attn.FLA.parallax import HAS_TLE
 
 
 pytestmark = pytest.mark.parallel_parallax
 
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("CUDA comparison is unavailable on the selected backend")
     import parallax as parallax_kernel
 
     if not parallax_kernel.cute_decode_available:
@@ -90,17 +95,17 @@ def _decode_reference(q, r, k, v, scale, window_size_left=-1):
 
 
 def _inputs(B, L, HQ, H, D, dtype, seed=0):
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    q = torch.randn(B, 1, HQ, D, device="cuda", dtype=dtype, generator=generator)
-    r = torch.randn(B, 1, HQ, D, device="cuda", dtype=dtype, generator=generator) * 0.5
-    k = torch.randn(B, L, H, D, device="cuda", dtype=dtype, generator=generator)
-    v = torch.randn(B, L, H, D, device="cuda", dtype=dtype, generator=generator)
+    generator = torch.Generator(device=test_backend.device).manual_seed(seed)
+    q = torch.randn(B, 1, HQ, D, device=test_backend.device, dtype=dtype, generator=generator)
+    r = torch.randn(B, 1, HQ, D, device=test_backend.device, dtype=dtype, generator=generator) * 0.5
+    k = torch.randn(B, L, H, D, device=test_backend.device, dtype=dtype, generator=generator)
+    v = torch.randn(B, L, H, D, device=test_backend.device, dtype=dtype, generator=generator)
     return q, r, k, v
 
 
 def _require_tle():
-    if not HAS_TLE:
-        pytest.skip("FlagTree TLE is unavailable (triton.experimental.tle)")
+    if not test_backend.supports_operator("parallax_decode", tle=True):
+        pytest.skip("selected Parallax decode implementation is unavailable")
 
 
 @pytest.mark.sm90
@@ -129,15 +134,15 @@ def test_tle_decode_matches_reference_and_cute_when_available(B, L, HQ, H, D, wi
     scale = 1.0 / math.sqrt(D)
 
     actual = parallel_parallax(q, r, k, v, scale, stage="decode", window_size_left=window)
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     reference = _decode_reference(q, r, k, v, scale, window)
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     assert not torch.isnan(actual).any()
     assert _rel_err(actual, reference) < 1e-2
     if cute_decode is not None:
         baseline = cute_decode(q, r, k, v, scale, window_size_left=window)
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         assert _rel_err(actual, baseline) < 1e-2
 
 
@@ -148,7 +153,7 @@ def test_tle_runtime_seqused_k_matches_cute():
 
     B, L, HQ, H, D = 2, 2048, 8, 2, 128
     q, r, k, v = _inputs(B, L, HQ, H, D, torch.bfloat16, seed=123)
-    seqlens = torch.tensor([777, 1901], device="cuda", dtype=torch.int32)
+    seqlens = torch.tensor([777, 1901], device=test_backend.device, dtype=torch.int32)
     scale = 1.0 / math.sqrt(D)
     out = torch.empty_like(q)
 
@@ -163,7 +168,7 @@ def test_tle_runtime_seqused_k_matches_cute():
         scale=scale,
         out=out,
     )
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     references = []
     for batch_index, active_len in enumerate(seqlens.tolist()):
         references.append(
@@ -190,7 +195,7 @@ def test_tle_runtime_seqused_k_matches_cute():
             window_size=(257, 0),
             scale=scale,
         )
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         assert _rel_err(actual, baseline) < 1e-2
 
 
@@ -199,17 +204,17 @@ def test_tle_noncontiguous_decode_inputs():
     """Decode commonly receives q[:, -1:], which need not be contiguous."""
     _require_tle()
     B, L, H, D = 2, 1024, 8, 128
-    generator = torch.Generator(device="cuda").manual_seed(7)
-    q_full = torch.randn(B, 3, H, D, device="cuda", dtype=torch.bfloat16, generator=generator)
-    r_full = torch.randn(B, 3, H, D, device="cuda", dtype=torch.bfloat16, generator=generator)
-    k = torch.randn(B, L, H, D, device="cuda", dtype=torch.bfloat16, generator=generator)
+    generator = torch.Generator(device=test_backend.device).manual_seed(7)
+    q_full = torch.randn(B, 3, H, D, device=test_backend.device, dtype=torch.bfloat16, generator=generator)
+    r_full = torch.randn(B, 3, H, D, device=test_backend.device, dtype=torch.bfloat16, generator=generator)
+    k = torch.randn(B, L, H, D, device=test_backend.device, dtype=torch.bfloat16, generator=generator)
     v = torch.randn_like(k)
     q = q_full[:, -1:]
     r = r_full[:, -1:]
     assert not q.is_contiguous()
 
     actual = parallel_parallax(q, r, k, v, D**-0.5, stage="decode")
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     reference = _decode_reference(q, r, k, v, D**-0.5)
     assert _rel_err(actual, reference) < 1e-2
     if cute_decode is not None:
@@ -218,5 +223,5 @@ def test_tle_noncontiguous_decode_inputs():
         # materializes it internally. Compare values under each backend's
         # documented input contract.
         baseline = cute_decode(q.contiguous(), r.contiguous(), k, v, D**-0.5)
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         assert _rel_err(actual, baseline) < 1e-2

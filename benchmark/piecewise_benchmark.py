@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import logging
 import pathlib
 import datetime
@@ -19,6 +20,7 @@ import math
 import torch
 import triton
 
+from flag_attn.testing import backend as test_backend
 import flag_attn
 
 try:
@@ -27,10 +29,14 @@ except ModuleNotFoundError:  # Direct execution from the benchmark directory.
     from recording import record_triton_report
 
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("CUDA comparison is unavailable on the selected backend")
     from flash_attn import flash_attn_func
     FLASH_VER = 2
 except BaseException:
     try:
+        if not test_backend.is_nvidia():
+            raise ImportError("CUDA comparison is unavailable on the selected backend")
         from flash_attn.flash_attn_interface import flash_attn_func
         FLASH_VER = 1
     except BaseException:
@@ -48,13 +54,13 @@ configs = [triton.testing.Benchmark(
     ylabel='tflop/s',
     plot_name=f'piecewise_attention_d-{D_HEAD}_mode-{mode}_causal-{causal}_dtype-{dtype}',
     args={'D_HEAD': D_HEAD, 'dtype': dtype, 'mode': mode, 'causal': causal}
-) for mode in ['fwd', 'bwd'] 
+) for mode in ['fwd', 'bwd']
     for causal in [False, True]
     for D_HEAD in [64, 128]
     for dtype in [torch.float16, torch.bfloat16]]
 
 @triton.testing.perf_report(configs)
-def bench_flash_attention(N_CTX, D_HEAD, causal, mode, provider, dtype=torch.float16, device="cuda"):
+def bench_flash_attention(N_CTX, D_HEAD, causal, mode, provider, dtype=torch.float16, device=test_backend.device):
     assert mode in ['fwd', 'bwd']
     w = N_CTX // 2 # dist thresold
     warmup = 25
@@ -63,23 +69,23 @@ def bench_flash_attention(N_CTX, D_HEAD, causal, mode, provider, dtype=torch.flo
     BATCH = 32768 // N_CTX
     H = 2048 // D_HEAD
     if provider == "piecewise":
-        q1 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        k1 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        q2 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        k2 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+        q1 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
+        k1 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
+        q2 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
+        k2 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
         fn = lambda: flag_attn.piecewise_attention(q1, k1, q2, k2, v, w, causal=causal)
         if mode == 'bwd':
             o = fn()
             do = torch.randn_like(o)
             fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        ms = test_backend.do_bench(fn, warmup=warmup, rep=rep)
     if provider == "torch":
-        q1 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        k1 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        q2 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        k2 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+        q1 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
+        k1 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
+        q2 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
+        k2 = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
 
         try:
             fn = lambda: flag_attn.testing.piecewise_attention(q1, k1, q2, k2, v, w, causal=causal)
@@ -87,8 +93,8 @@ def bench_flash_attention(N_CTX, D_HEAD, causal, mode, provider, dtype=torch.flo
                 o = fn()
                 do = torch.randn_like(o)
                 fn = lambda: o.backward(do, retain_graph=True)
-            ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-        except torch.cuda.OutOfMemoryError as e:
+            ms = test_backend.do_bench(fn, warmup=warmup, rep=rep)
+        except torch.OutOfMemoryError as e:
             logging.info(f"torch OOM for batch_size: {BATCH}, num_heads: {H}, seqlen: {N_CTX}, headdim: {D_HEAD}")
             ms = float("inf")
     if provider == "flash":
@@ -100,9 +106,9 @@ def bench_flash_attention(N_CTX, D_HEAD, causal, mode, provider, dtype=torch.flo
             qkv = qkv.reshape(BATCH * N_CTX, 3, H, D_HEAD)
             fn = lambda: flash_attn_func(qkv, cu_seqlens, 0., N_CTX, causal=causal)
         elif FLASH_VER == 2:
-            q = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-            k = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-            v = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+            q = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
+            k = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
+            v = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device=test_backend.device, requires_grad=True)
             fn = lambda: flash_attn_func(q, k, v, causal=causal)
         else:
             raise ValueError(f'unknown {FLASH_VER = }')
@@ -110,7 +116,7 @@ def bench_flash_attention(N_CTX, D_HEAD, causal, mode, provider, dtype=torch.flo
             o = fn()
             do = torch.randn_like(o)
             fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        ms = test_backend.do_bench(fn, warmup=warmup, rep=rep)
 
     # total TFLOPS: following Flash Attention v2, only gemms are counted.
     # NOTE: It is not a fair play here, the total amount of flops and the elapsed time are different,
@@ -118,7 +124,7 @@ def bench_flash_attention(N_CTX, D_HEAD, causal, mode, provider, dtype=torch.flo
     if provider == "flash":
         macs = 2. * BATCH * H * N_CTX * N_CTX * D_HEAD # Q@K, P@V
         if mode == 'bwd':
-            macs *= 2.5  # Q@K, dO@V, dO@P, dS@Q dS@K 
+            macs *= 2.5  # Q@K, dO@V, dO@P, dS@Q dS@K
     else:
         macs = 3. * BATCH * H * N_CTX * N_CTX * D_HEAD # Q1@K1, Q2@K2, P@V
         if mode == 'bwd':

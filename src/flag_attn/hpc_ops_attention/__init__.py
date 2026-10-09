@@ -14,8 +14,9 @@
 
 """Hardware-specific attention operators grouped by execution phase."""
 
-from importlib import import_module
 from typing import Literal
+
+from flag_attn.runtime.backend import resolve_operator
 
 from . import decode, prefill
 
@@ -50,7 +51,11 @@ def hy3_attention(
     if stage == "prefill":
         if variant is not None:
             raise ValueError("Hy3 prefill does not accept a decode variant")
-        return prefill.attention_with_kvcache_blocksparse_prefill_fp8(*args, **kwargs)
+        return resolve_operator(
+            "hy3_attention",
+            "flag_attn.hpc_ops_attention.prefill.attention_blocksparse_prefill_fp8",
+            "attention_with_kvcache_blocksparse_prefill_fp8",
+        )(*args, **kwargs)
     if stage != "decode":
         raise ValueError(f"Unsupported Hy3 stage: {stage!r}; expected 'prefill' or 'decode'")
     try:
@@ -59,8 +64,10 @@ def hy3_attention(
         raise ValueError(
             f"Hy3 decode requires variant in {tuple(_HY3_DECODE_IMPLEMENTATIONS)}; got {variant!r}"
         ) from exc
-    implementation = import_module(f".decode.{module_name}", __name__)
-    return getattr(implementation, function_name)(*args, **kwargs)
+    implementation = resolve_operator(
+        f"hy3_attention_decode_{variant}", f"{__name__}.decode.{module_name}", function_name
+    )
+    return implementation(*args, **kwargs)
 
 
 __all__ = ["hy3_attention", "decode", "prefill"]

@@ -25,37 +25,30 @@ from .sparse_attn import (
 def install_msa_prefill(use_tle: bool = False) -> None:
     """Install the Enflame prefill and decode bindings."""
     if use_tle:
-        raise RuntimeError(
-            "S60 GCU300 compiler does not lower the Triton TLE dialect"
-        )
+        raise RuntimeError("S60 GCU300 compiler does not lower the Triton TLE dialect")
 
-    public = importlib.import_module(
-        "flag_attn.minimax_sparse_attention"
-    )
+    public = importlib.import_module("flag_attn.minimax_sparse_attention")
     root = importlib.import_module("flag_attn")
-    index_module = importlib.import_module(
-        "flag_attn.minimax_sparse_attention.index_topk"
-    )
-    sparse_module = importlib.import_module(
-        "flag_attn.minimax_sparse_attention.sparse_attn"
-    )
+    index_module = importlib.import_module("flag_attn.minimax_sparse_attention.index_topk")
+    sparse_module = importlib.import_module("flag_attn.minimax_sparse_attention.sparse_attn")
 
     bindings = {
         "minimax_m3_index_score": minimax_m3_index_score,
         "minimax_m3_index_score_topk": minimax_m3_index_score_topk,
         "minimax_m3_index_topk": minimax_m3_index_topk,
         "minimax_m3_index_decode": minimax_m3_index_decode,
-        "minimax_m3_sparse_attn": (
-            minimax_m3_sparse_attn
-        ),
-        "minimax_m3_sparse_attn_decode": (
-            minimax_m3_sparse_attn_decode
-        ),
+        "minimax_m3_sparse_attn": (minimax_m3_sparse_attn),
+        "minimax_m3_sparse_attn_decode": (minimax_m3_sparse_attn_decode),
     }
 
     for name, function in bindings.items():
-        setattr(public, name, function)
-        setattr(root, name, function)
+        if name == "minimax_m3_sparse_attn":
+            # Keep the unified stage entry while rebinding its prefill primitive.
+            public._minimax_m3_sparse_attn_prefill = function
+            root.minimax_m3_sparse_attn = public.minimax_m3_sparse_attn
+        else:
+            setattr(public, name, function)
+            setattr(root, name, function)
 
         if "index" in name:
             setattr(index_module, name, function)

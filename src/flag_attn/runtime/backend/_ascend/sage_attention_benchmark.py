@@ -104,7 +104,7 @@ def benchmark(args):
 
     record_benchmark_result(
         None,
-        op_name="sage_attention_ascend",
+        op_name="sage_attention",
         dtype=str(dtype),
         result=metrics,
         baseline=None,

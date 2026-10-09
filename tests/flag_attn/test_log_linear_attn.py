@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import importlib.util
 import math
 from functools import lru_cache
@@ -22,6 +23,7 @@ import statistics
 import pytest
 import torch
 import triton
+from flag_attn.testing import backend as test_backend
 
 
 pytestmark = pytest.mark.log_linear_attn
@@ -44,7 +46,7 @@ if tilelang is not None:
 
     @lru_cache(maxsize=None)
     def _level_lut(device_index: int) -> torch.Tensor:
-        device = torch.device("cuda", device_index)
+        device = torch.device(test_backend.device, device_index)
         lut = torch.zeros((CHUNK_SIZE, CHUNK_SIZE), dtype=torch.int32, device=device)
         rows = torch.arange(CHUNK_SIZE, device=device)[:, None]
         cols = torch.arange(CHUNK_SIZE, device=device)[None, :]
@@ -447,22 +449,22 @@ BENCHMARK_REP_MS = 100
 
 
 def _tle_available():
-    return torch.cuda.is_available() and TLE_MODULE.HAS_TLE_LOG_LINEAR_ATTN
+    return test_backend.is_nvidia() and TLE_MODULE.HAS_TLE_LOG_LINEAR_ATTN
 
 
 def _make_inputs(batch, sequence, heads, dim):
     levels = math.ceil(math.log2(sequence)) + 1
-    q = torch.randn(batch, sequence, 1, dim, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(batch, sequence, 1, dim, device=test_backend.device, dtype=torch.bfloat16)
     k = torch.randn_like(q)
-    v = torch.randn(batch, sequence, heads, dim, device="cuda", dtype=torch.bfloat16)
-    g = -0.05 * torch.rand(batch, sequence, heads, device="cuda", dtype=torch.float32)
+    v = torch.randn(batch, sequence, heads, dim, device=test_backend.device, dtype=torch.bfloat16)
+    g = -0.05 * torch.rand(batch, sequence, heads, device=test_backend.device, dtype=torch.float32)
     level_scales = torch.sigmoid(
         torch.randn(
             batch,
             sequence,
             heads,
             levels,
-            device="cuda",
+            device=test_backend.device,
             dtype=torch.float32,
         )
     ).to(torch.bfloat16)
@@ -478,7 +480,7 @@ def _assert_close(name, expected, actual, ratio=0.004):
 
 
 def _bench(fn, warmup=BENCHMARK_WARMUP_MS, rep=BENCHMARK_REP_MS):
-    return triton.testing.do_bench(
+    return test_backend.do_bench(
         fn,
         warmup=warmup,
         rep=rep,
@@ -496,7 +498,7 @@ def test_chunk_log_linear_attn_public_export():
     assert "from flag_attn.FLA.log_linear_attn.chunk_tle import" in operator_init
 
 
-@pytest.mark.skipif(not _tle_available(), reason="requires CUDA and FlagTree/TLE")
+@pytest.mark.skipif(not test_backend.supports_operator("log_linear_attn", tle=True), reason="selected Log-Linear implementation is unavailable")
 @pytest.mark.parametrize(
     ("batch", "sequence", "heads", "dim"),
     [
@@ -510,7 +512,9 @@ def test_chunk_log_linear_attn_matches_reference(batch, sequence, heads, dim):
     torch.manual_seed(42)
     inputs = _make_inputs(batch, sequence, heads, dim)
     expected = REFERENCE_MODULE.log_linear_attn_reference(*inputs)
-    actual = TLE_MODULE.log_linear_attn(*inputs)
+    from flag_attn import log_linear_attn
+
+    actual = log_linear_attn(*inputs)
     _assert_close("output", expected, actual)
 
 
@@ -525,7 +529,7 @@ def benchmark_shape(
     run_tle, tle_output = TLE_MODULE._prepare_tle_forward(*inputs)
 
     run_tle()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     if compare_tilelang:
         if tilelang is None:
@@ -533,7 +537,7 @@ def benchmark_shape(
         tile_kernel, tile_args, tile_output = _prepare_tilelang_forward(*inputs)
         run_tilelang = lambda: tile_kernel(*tile_args)
         run_tilelang()
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         _assert_close("TileLang/TLE", tile_output, tle_output)
 
     tilelang_rounds = []

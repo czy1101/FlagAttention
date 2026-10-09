@@ -12,19 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
+from flag_attn.runtime.backend import resolve_operator
 
-if hasattr(torch, "npu") and torch.npu.is_available():
-    from flag_attn.runtime.backend._ascend import forward, per_block_int8
-else:
-    from .attn_qk_int8_per_block import forward
-    from .quant_per_block import per_block_int8
-
-sage_attention = forward
+_OPERATOR_EXPORTS = {
+    "sage_attention": ("sage_attention", "flag_attn.sage_attention.attn_qk_int8_per_block", "forward"),
+    "forward": ("sage_attention", "flag_attn.sage_attention.attn_qk_int8_per_block", "forward"),
+    "per_block_int8": ("sage_attention_per_block_int8", "flag_attn.sage_attention.quant_per_block", "per_block_int8"),
+}
 
 
-__all__ = [
-    "sage_attention",
-    "forward",
-    "per_block_int8",
-]
+def __getattr__(name: str):
+    try:
+        operator, module, symbol = _OPERATOR_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = resolve_operator(operator, module, symbol)
+    globals()[name] = value
+    return value
+
+
+__all__ = ["sage_attention", "forward", "per_block_int8"]
