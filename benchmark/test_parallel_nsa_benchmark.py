@@ -409,7 +409,7 @@ def run_benchmark(args, record_property=None) -> None:
     [
         pytest.param("selected", marks=pytest.mark.parallel_nsa),
         pytest.param("full", marks=pytest.mark.parallel_nsa),
-        pytest.param("compression", marks=pytest.mark.parallel_nsa_compression),
+        pytest.param("compression", marks=pytest.mark.parallel_nsa),
     ],
 )
 def test_parallel_nsa_benchmark(mode, record_property):

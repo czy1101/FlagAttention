@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for performance tests"
 )
 ATTENTION = pytest.mark.infllmv2_attention
-DECODE = pytest.mark.infllmv2_decode
+DECODE = pytest.mark.infllmv2_attention
 WARMUP_MS = int(os.getenv("INFLLMV2_BENCH_WARMUP_MS", "20"))
 REP_MS = int(os.getenv("INFLLMV2_BENCH_REP_MS", "100"))
 _RESULTS: list[dict[str, object]] = []

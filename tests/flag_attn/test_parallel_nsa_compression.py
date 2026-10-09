@@ -95,7 +95,7 @@ def naive_nsa_compression_fwd(q, k, v, scale, block_size):
     return o, lse
 
 
-@pytest.mark.parallel_nsa_compression
+@pytest.mark.parallel_nsa
 @pytest.mark.parametrize("B", [1])
 @pytest.mark.parametrize("T", [64, 128])
 @pytest.mark.parametrize("H", [4])
@@ -135,7 +135,7 @@ def test_parallel_nsa_compression_fwd_accuracy(B, T, H, HQ, K, V, block_size, dt
     torch.testing.assert_close(res_lse.float(), ref_lse, rtol=1e-1, atol=2e-1)
 
 
-@pytest.mark.parallel_nsa_compression
+@pytest.mark.parallel_nsa
 @pytest.mark.parametrize("T", [128, 256])
 @pytest.mark.parametrize("block_size", [64])
 def test_parallel_nsa_compression_bwd_accuracy(T, block_size):
@@ -176,7 +176,7 @@ def test_parallel_nsa_compression_bwd_accuracy(T, block_size):
     assert torch.isfinite(v.grad).all(), "dv has non-finite values"
 
 
-@pytest.mark.parallel_nsa_compression
+@pytest.mark.parallel_nsa
 @pytest.mark.parametrize("T", [64, 128])
 def test_parallel_nsa_compression_no_grad(T):
     """Test forward-only (no grad) path for various shapes."""

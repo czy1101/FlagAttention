@@ -43,7 +43,7 @@ from flag_attn.infllmv2.reference import (
 HAS_GPU = torch.cuda.is_available() and importlib.util.find_spec("triton") is not None
 pytestmark = pytest.mark.skipif(not HAS_GPU, reason="CUDA, PyTorch and Triton are required")
 ATTENTION = pytest.mark.infllmv2_attention
-DECODE = pytest.mark.infllmv2_decode
+DECODE = pytest.mark.infllmv2_attention
 
 HAS_TLE = forward_impl._TLE_AVAILABLE
 

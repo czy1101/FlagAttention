@@ -1023,7 +1023,6 @@ def run_benchmark(
 
 # This shared benchmark runs both prefill and decode.
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_m3_sparse_attn_decode
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="MiniMax M3 benchmark requires CUDA"
 )

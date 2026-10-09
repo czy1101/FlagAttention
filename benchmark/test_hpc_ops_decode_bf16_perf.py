@@ -329,7 +329,7 @@ def report_performance_results():
     [
         pytest.param(
             method,
-            marks=getattr(pytest.mark, f"attention_decode_bf16_{method}"),
+            marks=pytest.mark.hy3_attention,
         )
         for method in BENCH_METHODS
     ],

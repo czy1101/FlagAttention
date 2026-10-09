@@ -62,7 +62,6 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_m3_sparse_attn_decode
 def test_public_exports_use_active_backend() -> None:
     from flag_attn.runtime.backend import is_metax_backend
 
@@ -76,7 +75,6 @@ def test_public_exports_use_active_backend() -> None:
 
 
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_m3_sparse_attn_decode
 def test_metax_public_exports() -> None:
     from flag_attn.runtime.backend import is_metax_backend
 
@@ -644,8 +642,6 @@ def _run_decode(case: tuple, mode: str) -> None:
 
 
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_m3_index_topk
-@pytest.mark.minimax_sparse_attention_topk
 def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
     """Invalid lanes must lose even when every valid score is negative infinity."""
     num_score_blocks = 96
@@ -683,8 +679,6 @@ def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
     reason="requires a backend with TLE radix top-k support",
 )
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_m3_index_topk
-@pytest.mark.minimax_sparse_attention_topk
 def test_prefill_topk_radix_path() -> None:
     """Exercise the actual wide-row TLE path instead of accepting fallback."""
     num_score_blocks = 1024
@@ -755,7 +749,6 @@ DECODE_K16_CASES = [
 @pytest.mark.parametrize(
     "case", PREFILL_CASES, ids=("boundary", "selection", "long_ragged")
 )
-@pytest.mark.minimax_sparse_attention_prefill
 @pytest.mark.minimax_m3_sparse_attn
 def test_prefill_bf16(case: tuple) -> None:
     _run_prefill(case, "bf16")
@@ -764,8 +757,7 @@ def test_prefill_bf16(case: tuple) -> None:
 @pytest.mark.parametrize(
     "case", DECODE_CASES, ids=("boundary", "selection", "long_gqa")
 )
-@pytest.mark.minimax_m3_sparse_attn_decode
-@pytest.mark.minimax_sparse_attention_decode
+@pytest.mark.minimax_m3_sparse_attn
 def test_decode_bf16(case: tuple) -> None:
     _run_decode(case, "bf16")
 
@@ -773,8 +765,7 @@ def test_decode_bf16(case: tuple) -> None:
 @pytest.mark.parametrize(
     "case", DECODE_SELECTION_CASES, ids=("split_k", "single_chunk")
 )
-@pytest.mark.minimax_m3_sparse_attn_decode
-@pytest.mark.minimax_sparse_attention_decode
+@pytest.mark.minimax_m3_sparse_attn
 def test_decode_topk_selection_bf16(case: tuple) -> None:
     """Cover N > K for both multi-chunk and single-chunk selection."""
     _run_decode(case, "bf16")
@@ -783,15 +774,13 @@ def test_decode_topk_selection_bf16(case: tuple) -> None:
 @pytest.mark.parametrize(
     "case", DECODE_K16_CASES, ids=("identity_ragged", "spec_causal")
 )
-@pytest.mark.minimax_m3_sparse_attn_decode
-@pytest.mark.minimax_sparse_attention_decode
+@pytest.mark.minimax_m3_sparse_attn
 def test_decode_topk_k16_bf16(case: tuple) -> None:
     """Cover the configured K=16 Identity and causal selection paths."""
     _run_decode(case, "bf16")
 
 
-@pytest.mark.minimax_m3_sparse_attn_decode
-@pytest.mark.minimax_sparse_attention_decode
+@pytest.mark.minimax_m3_sparse_attn
 def test_decode_topk_identity_out_and_score_out_bf16() -> None:
     """Identity must preserve out aliasing and populate an explicit score buffer."""
     seq_lens = (2048, 1025)
@@ -857,7 +846,6 @@ def test_decode_topk_identity_out_and_score_out_bf16() -> None:
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
 @pytest.mark.parametrize("case", PREFILL_CASES[:2], ids=("boundary", "selection"))
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_sparse_attention_prefill
 def test_prefill_fp8(mode: str, case: tuple) -> None:
     _run_prefill(case, mode)
 
@@ -868,7 +856,6 @@ def test_prefill_fp8(mode: str, case: tuple) -> None:
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
 @pytest.mark.parametrize("case", DECODE_CASES[:2], ids=("boundary", "selection"))
-@pytest.mark.minimax_m3_sparse_attn_decode
-@pytest.mark.minimax_sparse_attention_decode
+@pytest.mark.minimax_m3_sparse_attn
 def test_decode_fp8(mode: str, case: tuple) -> None:
     _run_decode(case, mode)

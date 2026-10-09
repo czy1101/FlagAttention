@@ -29,7 +29,7 @@ import torch
 from flag_attn.FLA.parallax import HAS_TLE, parallax_attn_with_kvcache, parallax_decode
 
 
-pytestmark = pytest.mark.parallax_decode
+pytestmark = pytest.mark.parallel_parallax
 
 try:
     import parallax as parallax_kernel

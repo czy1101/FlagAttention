@@ -35,7 +35,7 @@ from flag_attn.FLA.parallax.decode import (
 )
 
 
-pytestmark = pytest.mark.parallax_decode
+pytestmark = pytest.mark.parallel_parallax
 
 
 DEFAULT_SHAPES = (
@@ -142,7 +142,7 @@ def _make_inputs(B, L, HQ, H, D, dtype, seed):
     return q, r, k, v
 
 
-@pytest.mark.parallax_decode
+@pytest.mark.parallel_parallax
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="parallax decode benchmark requires CUDA",

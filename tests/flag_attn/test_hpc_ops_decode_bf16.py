@@ -245,8 +245,8 @@ def _pytorch_reference(panel: _Panel, num_seq_q: int) -> torch.Tensor:
 @pytest.mark.parametrize(
     "use_dynamic_sched",
     [
-        pytest.param(False, marks=pytest.mark.attention_decode_bf16_static),
-        pytest.param(True, marks=pytest.mark.attention_decode_bf16_dynamic),
+        pytest.param(False, marks=pytest.mark.hy3_attention),
+        pytest.param(True, marks=pytest.mark.hy3_attention),
     ],
 )
 @pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
