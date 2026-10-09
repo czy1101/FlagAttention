@@ -26,7 +26,7 @@ import math
 import pytest
 import torch
 
-from flag_attn.FLA.parallax import HAS_TLE, parallax_attn_with_kvcache, parallax_decode
+from flag_attn.FLA.parallax import HAS_TLE, parallel_parallax
 
 
 pytestmark = pytest.mark.parallel_parallax
@@ -128,7 +128,7 @@ def test_tle_decode_matches_reference_and_cute_when_available(B, L, HQ, H, D, wi
     q, r, k, v = _inputs(B, L, HQ, H, D, dtype, seed=B * 1009 + L + D)
     scale = 1.0 / math.sqrt(D)
 
-    actual = parallax_decode(q, r, k, v, scale, window_size_left=window)
+    actual = parallel_parallax(q, r, k, v, scale, stage="decode", window_size_left=window)
     torch.cuda.synchronize()
     reference = _decode_reference(q, r, k, v, scale, window)
     torch.cuda.synchronize()
@@ -152,11 +152,12 @@ def test_tle_runtime_seqused_k_matches_cute():
     scale = 1.0 / math.sqrt(D)
     out = torch.empty_like(q)
 
-    actual = parallax_attn_with_kvcache(
+    actual = parallel_parallax(
         q,
         r,
         k,
         v,
+        stage="kvcache",
         seqused_k=seqlens,
         window_size=(257, 0),
         scale=scale,
@@ -207,7 +208,7 @@ def test_tle_noncontiguous_decode_inputs():
     r = r_full[:, -1:]
     assert not q.is_contiguous()
 
-    actual = parallax_decode(q, r, k, v, D**-0.5)
+    actual = parallel_parallax(q, r, k, v, D**-0.5, stage="decode")
     torch.cuda.synchronize()
     reference = _decode_reference(q, r, k, v, D**-0.5)
     assert _rel_err(actual, reference) < 1e-2

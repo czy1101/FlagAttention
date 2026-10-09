@@ -11,7 +11,7 @@ def has_tle():
 
 
 def __getattr__(name):
-    if name == "forgetting_attention":
+    if name in {"forgetting_attention", "parallel_forgetting_attn"}:
         if not has_tle():
             raise RuntimeError(
                 "Forgetting Attention requires Triton 3.6 with compatible FlagTree/TLE"
@@ -26,4 +26,4 @@ def __getattr__(name):
     return value
 
 
-__all__ = ["forgetting_attention", "naive_forgetting_attention", "has_tle"]
+__all__ = ["parallel_forgetting_attn", "forgetting_attention", "naive_forgetting_attention", "has_tle"]

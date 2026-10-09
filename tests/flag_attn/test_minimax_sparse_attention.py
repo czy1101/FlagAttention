@@ -30,8 +30,8 @@ from flag_attn.minimax_sparse_attention import (
     minimax_m3_index_score,
     minimax_m3_index_topk,
     minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode,
 )
+from flag_attn.minimax_sparse_attention import minimax_m3_sparse_attn_decode
 
 index_topk_module = importlib.import_module(minimax_m3_index_topk.__module__)
 
@@ -65,7 +65,7 @@ pytestmark = pytest.mark.skipif(
 def test_public_exports_use_active_backend() -> None:
     from flag_attn.runtime.backend import is_metax_backend
 
-    module_name = minimax_m3_sparse_attn.__module__
+    module_name = minimax_m3_sparse_attn_decode.__module__
     if is_metax_backend():
         assert module_name.startswith(
             "flag_attn.runtime.backend._metax.minimax_sparse_attention"
@@ -85,7 +85,7 @@ def test_metax_public_exports() -> None:
     from flag_attn.runtime.backend import _metax
 
     assert flag_attn.chunk_gdn2 is _metax.chunk_gdn2
-    assert flag_attn.minimax_m3_sparse_attn is _metax.minimax_m3_sparse_attn
+    assert flag_attn.minimax_m3_sparse_attn_decode is _metax.minimax_m3_sparse_attn_decode
 
 
 @dataclass
@@ -621,7 +621,7 @@ def _run_decode(case: tuple, mode: str) -> None:
     sparse_kwargs = {}
     if data.k_scale is not None:
         sparse_kwargs = {"k_scale": data.k_scale, "v_scale": data.v_scale}
-    minimax_m3_sparse_attn_decode(
+    minimax_m3_sparse_attn(
         data.q,
         data.kv_cache,
         topk_idx,
@@ -631,6 +631,7 @@ def _run_decode(case: tuple, mode: str) -> None:
         data.sm_scale,
         output,
         decode_qlen,
+        stage="decode",
         **sparse_kwargs,
     )
     torch.cuda.synchronize()

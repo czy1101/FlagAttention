@@ -17,8 +17,8 @@ import math
 import pytest
 import torch
 
-from flag_attn.hpc_ops_attention.prefill import (
-    attention_with_kvcache_blocksparse_prefill_fp8,
+from flag_attn.hpc_ops_attention import (
+    hy3_attention,
 )
 
 BLOCK = 128
@@ -34,7 +34,7 @@ def test_attention_blocksparse_prefill_fp8_rejects_cpu():
     scale = torch.empty(1)
     metadata = torch.empty(1, dtype=torch.int32)
     with pytest.raises(ValueError, match="must be a CUDA tensor"):
-        attention_with_kvcache_blocksparse_prefill_fp8(
+        hy3_attention(
             q,
             cache,
             cache,
@@ -223,7 +223,7 @@ def test_attention_blocksparse_prefill_fp8(quant_type, kv_layout, masked, page_s
     torch.cuda.manual_seed(10086)
     args = _make_inputs(quant_type, kv_layout, masked, page_size)
     reference = _reference(args)
-    output = attention_with_kvcache_blocksparse_prefill_fp8(
+    output = hy3_attention(
         *args[:-1],
         block_mask=args[-1],
         sparsity_bucket=2 if masked else None,

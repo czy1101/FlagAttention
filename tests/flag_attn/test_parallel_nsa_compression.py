@@ -19,9 +19,7 @@ import torch
 
 torch_gcu = pytest.importorskip("torch_gcu")
 
-from flag_attn.runtime.backend._enflame.FLA.nsa.parallel_nsa_compression import (
-    parallel_nsa_compression,
-)
+from flag_attn.runtime.backend._enflame.FLA.nsa import parallel_nsa
 
 
 def _device():
@@ -122,7 +120,8 @@ def test_parallel_nsa_compression_fwd_accuracy(B, T, H, HQ, K, V, block_size, dt
     ref_o, ref_lse = naive_nsa_compression_fwd(q, k, v, scale, block_size)
 
     # triton forward
-    res_o, res_lse = parallel_nsa_compression(
+    res_o, res_lse = parallel_nsa(
+        mode="compression",
         q=q,
         k=k,
         v=v,
@@ -155,7 +154,8 @@ def test_parallel_nsa_compression_bwd_accuracy(T, block_size):
     if T % block_size != 0:
         pytest.skip("T must be a multiple of block_size")
 
-    o, lse = parallel_nsa_compression(
+    o, lse = parallel_nsa(
+        mode="compression",
         q=q,
         k=k,
         v=v,
@@ -197,7 +197,8 @@ def test_parallel_nsa_compression_no_grad(T):
         pytest.skip("T must be a multiple of block_size")
 
     with torch.no_grad():
-        o, lse = parallel_nsa_compression(
+        o, lse = parallel_nsa(
+            mode="compression",
             q=q,
             k=k,
             v=v,

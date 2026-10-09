@@ -142,7 +142,7 @@ def make_inputs(case, seed=0):
 
 @lru_cache(maxsize=1)
 def optimized_entry():
-    return importlib.import_module("flag_attn.forgetting_attention").forgetting_attention
+    return importlib.import_module("flag_attn.forgetting_attention").parallel_forgetting_attn
 
 
 @lru_cache(maxsize=1)

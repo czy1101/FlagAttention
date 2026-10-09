@@ -29,9 +29,9 @@ import statistics
 import torch
 
 import pytest
-from flag_attn.FLA.parallax.decode import (
+from flag_attn.FLA.parallax import (
     HAS_TLE,
-    parallax_decode as parallax_decode_tle,
+    parallel_parallax,
 )
 
 
@@ -186,12 +186,13 @@ def test_perf_parallax_decode(
     out_tle = torch.empty_like(q)
 
     def tle_fn():
-        return parallax_decode_tle(
+        return parallel_parallax(
             q,
             r,
             k,
             v,
             scale,
+            stage="decode",
             window_size_left=WINDOW_SIZE_LEFT,
             out=out_tle,
         )

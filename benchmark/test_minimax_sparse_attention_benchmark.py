@@ -47,8 +47,9 @@ from flag_attn.minimax_sparse_attention import (
     minimax_m3_index_score,
     minimax_m3_index_topk,
     minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode,
 )
+from flag_attn.minimax_sparse_attention import minimax_m3_sparse_attn_decode
+from functools import partial
 
 try:
     from vllm.models.minimax_m3.common.ops.index_topk import (
@@ -653,7 +654,7 @@ def _bench_steps(
 
         def attention() -> None:
             _call_sparse(
-                minimax_m3_sparse_attn_decode,
+                partial(minimax_m3_sparse_attn, stage="decode"),
                 data,
                 topk_idx,
                 output,
@@ -842,7 +843,7 @@ def _run_dtype(
             if args.decode:
                 run_decode(
                     minimax_m3_index_decode,
-                    minimax_m3_sparse_attn_decode,
+                    partial(minimax_m3_sparse_attn, stage="decode"),
                     data,
                     seq_len,
                     num_kv_heads,

@@ -30,7 +30,7 @@ try:
 except ModuleNotFoundError:  # Direct script execution.
     from recording import BenchmarkRecorder
 
-from flag_attn.sage_attention import forward, per_block_int8
+from flag_attn.sage_attention import sage_attention, per_block_int8
 
 
 SDPA_BASELINE_NAME = "torch_sdpa"
@@ -119,7 +119,7 @@ def _run_flagattention(
     output_dtype: torch.dtype,
     maxnreg: int | None,
 ) -> torch.Tensor:
-    output, _ = forward(
+    output, _ = sage_attention(
         q_int8,
         k_int8,
         v,

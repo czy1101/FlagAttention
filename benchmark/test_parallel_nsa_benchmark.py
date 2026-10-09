@@ -25,10 +25,6 @@ torch_gcu = pytest.importorskip("torch_gcu")
 from flag_attn.runtime.backend._enflame.FLA.nsa import (
     parallel_nsa,
 )
-from flag_attn.runtime.backend._enflame.FLA.nsa.parallel_nsa_compression import (
-    parallel_nsa_compression,
-)
-
 
 
 try:
@@ -225,7 +221,8 @@ def run_benchmark(args, record_property=None) -> None:
 
         @torch.no_grad()
         def run() -> torch.Tensor:
-            output, _ = parallel_nsa_compression(
+            output, _ = parallel_nsa(
+                mode="compression",
                 q=q,
                 k=k,
                 v=v,

@@ -510,7 +510,7 @@ def test_chunk_log_linear_attn_matches_reference(batch, sequence, heads, dim):
     torch.manual_seed(42)
     inputs = _make_inputs(batch, sequence, heads, dim)
     expected = REFERENCE_MODULE.log_linear_attn_reference(*inputs)
-    actual = TLE_MODULE.chunk_log_linear_attn(*inputs)
+    actual = TLE_MODULE.log_linear_attn(*inputs)
     _assert_close("output", expected, actual)
 
 

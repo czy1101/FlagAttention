@@ -47,6 +47,9 @@ from flag_attn.minimax_sparse_attention import (
 from flag_attn import testing  # noqa: F401
 
 _OPERATOR_EXPORTS = {
+    "hy3_attention": ("flag_attn.hpc_ops_attention", "hy3_attention"),
+    "parallel_parallax": ("flag_attn.FLA.parallax", "parallel_parallax"),
+    "fused_attnres": ("flag_attn.FLA.attnres", "fused_attnres"),
     "inkling_fa4_rel_attention": (
         "flag_attn.inkling_fa4", "inkling_fa4_rel_attention",
     ),
@@ -109,6 +112,9 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "hy3_attention",
+    "parallel_parallax",
+    "fused_attnres",
     "inkling_fa4_rel_attention",
     "device",
     "vendor",

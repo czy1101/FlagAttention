@@ -34,6 +34,7 @@ ops:
   - id: hy3_attention
     description: Run Hy3 FP8 prefill and BF16/FP8 decode, including static and dynamic scheduling. Requires PyTorch 2.7.0.
     for:
+      - hy3_attention
       - attention_with_kvcache_blocksparse_prefill_fp8
       - attention_decode_bf16_static
       - attention_decode_bf16_dynamic
@@ -232,9 +233,9 @@ ops:
   - id: minimax_m3_sparse_attn
     description: Run MiniMax M3 sparse attention prefill, decode, and top-k selection.
     for:
+      - minimax_m3_sparse_attn
       - minimax_m3_index_topk
       - minimax_m3_index_score
-      - minimax_m3_sparse_attn
       - minimax_m3_index_decode
       - minimax_m3_index_decode_score
       - minimax_m3_sparse_attn_decode
@@ -407,6 +408,7 @@ ops:
   - id: parallel_forgetting_attn
     description: Run ACP-enabled forgetting attention.
     for:
+      - parallel_forgetting_attn
       - forgetting_attention
     labels:
       - fused
@@ -442,6 +444,7 @@ ops:
   - id: log_linear_attn
     description: Run chunked log-linear attention.
     for:
+      - log_linear_attn
       - chunk_log_linear_attn
     labels:
       - fused

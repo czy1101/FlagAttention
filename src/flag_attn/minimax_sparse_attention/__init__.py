@@ -21,6 +21,8 @@ The cache layout is compatible with vLLM:
   block_table: [batch, max_blocks]
 """
 
+from typing import Literal
+
 from flag_attn.runtime.backend import is_metax_backend
 
 if is_metax_backend():
@@ -30,8 +32,10 @@ if is_metax_backend():
         minimax_m3_index_decode_score,
         minimax_m3_index_score,
         minimax_m3_index_topk,
-        minimax_m3_sparse_attn,
         minimax_m3_sparse_attn_decode,
+    )
+    from flag_attn.runtime.backend._metax.msa import (
+        minimax_m3_sparse_attn as _minimax_m3_sparse_attn_prefill,
     )
 else:
     from .index_topk import (
@@ -41,7 +45,24 @@ else:
         minimax_m3_index_score,
         minimax_m3_index_topk,
     )
-    from .sparse_attn import minimax_m3_sparse_attn, minimax_m3_sparse_attn_decode
+    from .sparse_attn import minimax_m3_sparse_attn as _minimax_m3_sparse_attn_prefill
+    from .sparse_attn import minimax_m3_sparse_attn_decode
+
+
+def minimax_m3_sparse_attn(*args, stage: Literal["prefill", "decode"] = "prefill", **kwargs):
+    """Run MiniMax M3 sparse attention for the explicitly selected stage.
+
+    The default preserves the existing prefill call. Arguments and return
+    values follow sparse_attn.minimax_m3_sparse_attn for prefill and
+    minimax_m3_sparse_attn_decode for decode, using the active backend.
+    No cache preparation or tensor conversion is performed here.
+    """
+    if stage == "prefill":
+        return _minimax_m3_sparse_attn_prefill(*args, **kwargs)
+    if stage == "decode":
+        return minimax_m3_sparse_attn_decode(*args, **kwargs)
+    raise ValueError(f"Unsupported MiniMax stage: {stage!r}; expected 'prefill' or 'decode'")
+
 
 __all__ = [
     "SPARSE_BLOCK_SIZE",

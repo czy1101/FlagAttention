@@ -35,7 +35,6 @@ sys.path.insert(0, str(SRC_ROOT))
 
 from flag_attn.hpc_ops_attention.decode.dynamic.bf16_dynamic import (  # noqa: E402
     DynamicBF16Inputs,
-    attention_decode_bf16_dynamic,
     bf16_dynamic_workspace_is_reset,
     prepare_dynamic_bf16_workspace,
 )
@@ -45,9 +44,9 @@ from flag_attn.hpc_ops_attention.decode.static.bf16_static import (  # noqa: E40
     HEAD_DIM,
     OFFICIAL_CASES,
     StaticBF16Inputs,
-    attention_decode_bf16_static,
     prepare_static_bf16_workspace,
 )
+from flag_attn.hpc_ops_attention import hy3_attention
 
 
 # Fixed pytest benchmark matrix.  Use pytest node IDs or ``-k`` to select a
@@ -352,7 +351,7 @@ def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
                 output=cuda_out,
             )
         )
-        tle_call = lambda: attention_decode_bf16_static(inputs, workspace)
+        tle_call = lambda: hy3_attention(inputs, workspace, stage="decode", variant="bf16_static")
     else:
         inputs = DynamicBF16Inputs(
             panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens, layout,
@@ -374,7 +373,7 @@ def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
                 task_map=cuda_task_map, output=cuda_out,
             )
         )
-        tle_call = lambda: attention_decode_bf16_dynamic(inputs, workspace)
+        tle_call = lambda: hy3_attention(inputs, workspace, stage="decode", variant="bf16_dynamic")
 
     if BENCH_CHECK:
         actual = tle_call().detach().clone()

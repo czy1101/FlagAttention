@@ -17,7 +17,7 @@ import math
 import pytest
 import torch
 
-from flag_attn.sage_attention import forward, per_block_int8
+from flag_attn.sage_attention import sage_attention, per_block_int8
 
 
 def _expand_scale(scale, block_size, length):
@@ -78,7 +78,7 @@ def test_forward_matches_dequantized_reference(tensor_layout, num_kv_heads):
         v = v.transpose(1, 2).contiguous()
 
     q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k, tensor_layout=tensor_layout)
-    actual, actual_lse = forward(
+    actual, actual_lse = sage_attention(
         q_int8,
         k_int8,
         v,
@@ -109,7 +109,7 @@ def test_forward_rejects_non_positive_maxnreg():
     k_scale = torch.ones((1, 1, 2), device="cuda")
 
     with pytest.raises(ValueError, match="maxnreg must be positive"):
-        forward(q, k, v, q_scale, k_scale, maxnreg=0)
+        sage_attention(q, k, v, q_scale, k_scale, maxnreg=0)
 
 
 @pytest.mark.sage_attention
@@ -128,7 +128,7 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind):
         attn_mask[..., ::3] = -2.0
 
     q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
-    actual, actual_lse = forward(
+    actual, actual_lse = sage_attention(
         q_int8,
         k_int8,
         v,

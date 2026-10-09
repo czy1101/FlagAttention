@@ -23,9 +23,7 @@ import torch
 bsa_ops = import_module(
     "flag_attn.hpc_ops_attention.prefill.attention_blocksparse_prefill_fp8"
 )
-attention_with_kvcache_blocksparse_prefill_fp8 = (
-    bsa_ops.attention_with_kvcache_blocksparse_prefill_fp8
-)
+from flag_attn.hpc_ops_attention import hy3_attention
 
 try:
     import hpc
@@ -357,7 +355,7 @@ def test_attention_blocksparse_prefill_fp8_perf(
     flagattention_output = torch.empty_like(inputs.q, dtype=torch.bfloat16)
 
     def run_flagattention():
-        return attention_with_kvcache_blocksparse_prefill_fp8(
+        return hy3_attention(
             inputs.q,
             inputs.k_cache,
             inputs.v_cache,

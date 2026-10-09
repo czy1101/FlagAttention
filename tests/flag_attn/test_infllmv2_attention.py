@@ -18,7 +18,7 @@ import importlib.util
 import pytest
 import torch
 
-from flag_attn import InfLLMV2Config, infllmv2_attention, infllmv2_decode
+from flag_attn import InfLLMV2Config, infllmv2_attention
 from flag_attn.infllmv2 import forward as forward_impl
 from flag_attn.infllmv2.forward import (
     _sparse_attention_forward,
@@ -257,7 +257,7 @@ def test_decode_varlen_matches_reference(d: int, dense: bool) -> None:
         local_blocks=2,
         dense_len=8192 if dense else 0,
     )
-    actual = infllmv2_decode(q, k, v, cu_k, max(kv_lengths), config=config)
+    actual = infllmv2_attention(q, k, v, cu_k, max(kv_lengths), stage="decode", config=config)
     expected = _reference_attention(
         q, k, v, cu_q, cu_k, 1, max(kv_lengths), config
     )
@@ -350,4 +350,4 @@ def test_invalid_decode_batch_is_rejected() -> None:
     _, k, v, _, cu_k = _packed_inputs((1, 1), (32, 64), d=64)
     bad_q = torch.empty((1, 32, 64), device="cuda", dtype=k.dtype)
     with pytest.raises(ValueError, match="decode q"):
-        infllmv2_decode(bad_q, k, v, cu_k, 64)
+        infllmv2_attention(bad_q, k, v, cu_k, 64, stage="decode")

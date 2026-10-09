@@ -30,7 +30,7 @@ try:
 except ModuleNotFoundError:  # Direct invocation from the benchmark directory.
     from recording import benchmark_metric, record_benchmark_result
 
-from flag_attn import InfLLMV2Config, infllmv2_attention, infllmv2_decode
+from flag_attn import InfLLMV2Config, infllmv2_attention
 
 
 pytestmark = [
@@ -360,12 +360,13 @@ def test_infllmv2_decode_benchmark(
     config = InfLLMV2Config(topk=64, dense_len=8192)
 
     def forward() -> torch.Tensor:
-        return infllmv2_decode(
+        return infllmv2_attention(
             q,
             k,
             v,
             cu_k,
             case.kv_length,
+            stage="decode",
             config=config,
         )
 

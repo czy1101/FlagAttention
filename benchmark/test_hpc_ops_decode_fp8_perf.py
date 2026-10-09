@@ -41,6 +41,7 @@ from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_static as fp8_qk_static,
     fp8_qpertoken_perhead_kvpertensor_static as fp8_kv_static,
 )
+from flag_attn.hpc_ops_attention import hy3_attention
 
 
 BLOCK_SIZE = 64
@@ -421,7 +422,12 @@ def test_attention_decode_fp8_perf(
         _cuda_task_map(hpc, panel, mtp, BENCH_MIN_PROCESS_LEN)
         if hpc is not None and schedule == "dynamic" else None
     )
-    tle_call = lambda: implementation.attention_decode_fp8(inputs, workspace)
+    tle_call = lambda: hy3_attention(
+        inputs,
+        workspace,
+        stage="decode",
+        variant=("fp8_qk_" if quant_type == "qkpertoken_perhead_vperhead" else "fp8_kv_") + schedule,
+    )
     cuda_call = (
         None if hpc is None else
         lambda: _run_cuda(hpc, panel, cuda_output, mtp, quant_type, task_map)

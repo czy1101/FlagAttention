@@ -20,4 +20,11 @@ else:
     from .attn_qk_int8_per_block import forward
     from .quant_per_block import per_block_int8
 
-__all__ = ["forward", "per_block_int8"]
+sage_attention = forward
+
+
+__all__ = [
+    "sage_attention",
+    "forward",
+    "per_block_int8",
+]

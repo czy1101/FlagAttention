@@ -38,6 +38,7 @@ from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
 from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
     fp8_qpertoken_perhead_kvpertensor_static as fp8_static,
 )
+from flag_attn.hpc_ops_attention import hy3_attention
 
 
 BLOCK_SIZE = fp8_static.BLOCK_SIZE
@@ -434,9 +435,7 @@ def test_attn_fp8_sm90(
     implementation = _implementation(schedule)
     inputs = _inputs(panel, implementation)
     workspace = implementation.prepare_decode_workspace(inputs)
-    actual = implementation.attention_decode_fp8(
-        inputs, workspace
-    ).detach().clone()
+    actual = hy3_attention(inputs, workspace, stage="decode", variant=f"fp8_kv_{schedule}").detach().clone()
     expected = _pytorch_reference(panel, num_seq_q, QUANT_TYPE)
     torch.cuda.synchronize()
 

@@ -42,6 +42,8 @@ SUPPORTED_TEST_MTP = (1, 2, 3) if HAS_TLE else (1,)
 from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
     bf16_static,
 )
+from flag_attn.hpc_ops_attention import hy3_attention
+from functools import partial
 
 
 BLOCK_SIZE = bf16_static.BLOCK_SIZE
@@ -68,12 +70,12 @@ _IMPLEMENTATIONS = {
     "static": _DecodeImplementation(
         bf16_static.StaticBF16Inputs,
         bf16_static.prepare_static_bf16_workspace,
-        bf16_static.attention_decode_bf16_static,
+        partial(hy3_attention, stage="decode", variant="bf16_static"),
     ),
     "dynamic": _DecodeImplementation(
         bf16_dynamic.DynamicBF16Inputs,
         bf16_dynamic.prepare_dynamic_bf16_workspace,
-        bf16_dynamic.attention_decode_bf16_dynamic,
+        partial(hy3_attention, stage="decode", variant="bf16_dynamic"),
     ),
 }
 
