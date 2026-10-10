@@ -8,7 +8,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _short_dqr_kernel(
+def _short_preprocess_kernel(
     q,
     r,
     k,
@@ -19,8 +19,6 @@ def _short_dqr_kernel(
     bart,
     m,
     grad_o,
-    grad_q,
-    grad_r,
     gl_ptr,
     gu_ptr,
     weights_ptr,
@@ -28,7 +26,7 @@ def _short_dqr_kernel(
     BM: tl.constexpr,
     BD: tl.constexpr,
 ):
-    """Compute dQ/dR and save row-wise weights for the key/value reduction."""
+    """Compute row-wise derivatives/weights for the parallel gradient kernels."""
     rows = tl.program_id(0) * BM + tl.arange(0, BM)
     cols = tl.arange(0, 128)
     ds = tl.arange(0, BD)
@@ -64,11 +62,6 @@ def _short_dqr_kernel(
     gu = -prob * delta
     weights = prob * (1.0 + correction)
 
-    gq = tl.dot(gl.to(kv.dtype), kv, out_dtype=tl.float32)
-    gr = tl.dot(gu.to(kv.dtype), kv, out_dtype=tl.float32)
-    tl.store(grad_q + rows[:, None] * BD + ds[None, :], gq, row_mask[:, None])
-    tl.store(grad_r + rows[:, None] * BD + ds[None, :], gr, row_mask[:, None])
-
     score_offsets = rows[:, None] * 128 + cols[None, :]
     tl.store(gl_ptr + score_offsets, gl, row_mask[:, None])
     tl.store(gu_ptr + score_offsets, gu, row_mask[:, None])
@@ -76,7 +69,34 @@ def _short_dqr_kernel(
 
 
 @triton.jit
-def _short_dkv_kernel(
+def _short_dqr_finalize(
+    k,
+    gl_ptr,
+    gu_ptr,
+    grad_q,
+    grad_r,
+    tile_id,
+    BM: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """Compute dQ/dR from saved BF16 row derivatives."""
+    rows = tile_id * BM + tl.arange(0, BM)
+    cols = tl.arange(0, 128)
+    ds = tl.arange(0, BD)
+    row_mask = rows < 128
+    kv = tl.load(k + cols[:, None] * BD + ds[None, :])
+    offsets = rows[:, None] * 128 + cols[None, :]
+    gl = tl.load(gl_ptr + offsets, row_mask[:, None], 0)
+    gu = tl.load(gu_ptr + offsets, row_mask[:, None], 0)
+    gq = tl.dot(gl, kv, out_dtype=tl.float32)
+    gr = tl.dot(gu, kv, out_dtype=tl.float32)
+    out_offsets = rows[:, None] * BD + ds[None, :]
+    tl.store(grad_q + out_offsets, gq, row_mask[:, None])
+    tl.store(grad_r + out_offsets, gr, row_mask[:, None])
+
+
+@triton.jit
+def _short_dkv_finalize(
     q,
     r,
     grad_o,
@@ -85,12 +105,13 @@ def _short_dkv_kernel(
     weights_ptr,
     grad_k,
     grad_v,
+    tile_id,
     BK: tl.constexpr,
     BD: tl.constexpr,
 ):
-    """Reduce the saved row derivatives over all queries for each key tile."""
+    """Reduce saved row derivatives over all queries for one key tile."""
     rows = tl.arange(0, 128)
-    cols = tl.program_id(0) * BK + tl.arange(0, BK)
+    cols = tile_id * BK + tl.arange(0, BK)
     ds = tl.arange(0, BD)
     col_mask = cols < 128
 
@@ -110,6 +131,35 @@ def _short_dkv_kernel(
     tl.store(grad_v + out_offsets, gv, col_mask[:, None])
 
 
+@triton.jit
+def _short_stage2_kernel(
+    q,
+    r,
+    k,
+    grad_o,
+    gl_ptr,
+    gu_ptr,
+    weights_ptr,
+    grad_q,
+    grad_r,
+    grad_k,
+    grad_v,
+    NDQR: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """Run dQ/dR and dK/dV CTA groups concurrently after row preprocessing."""
+    pid = tl.program_id(0)
+    if pid < NDQR:
+        _short_dqr_finalize(k, gl_ptr, gu_ptr, grad_q, grad_r, pid, BM, BD)
+    else:
+        _short_dkv_finalize(
+            q, r, grad_o, gl_ptr, gu_ptr, weights_ptr, grad_k, grad_v,
+            pid - NDQR, BK, BD,
+        )
+
+
 def short_parallax_backward(
     q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
     block_m=16, block_k=32, num_warps=4,
@@ -124,7 +174,7 @@ def short_parallax_backward(
     gu = torch.empty_like(gl)
     weights = torch.empty_like(gl)
     bm = block_m
-    _short_dqr_kernel[(triton.cdiv(128, bm),)](
+    _short_preprocess_kernel[(triton.cdiv(128, bm),)](
         q,
         r,
         k,
@@ -135,8 +185,6 @@ def short_parallax_backward(
         bart,
         m,
         grad_o,
-        grad_q,
-        grad_r,
         gl,
         gu,
         weights,
@@ -147,15 +195,20 @@ def short_parallax_backward(
         num_stages=1,
     )
     bk = block_k
-    _short_dkv_kernel[(triton.cdiv(128, bk),)](
+    _short_stage2_kernel[(triton.cdiv(128, bm) + triton.cdiv(128, bk),)](
         q,
         r,
+        k,
         grad_o,
         gl,
         gu,
         weights,
+        grad_q,
+        grad_r,
         grad_k,
         grad_v,
+        NDQR=triton.cdiv(128, bm),
+        BM=bm,
         BK=bk,
         BD=128,
         num_warps=num_warps,

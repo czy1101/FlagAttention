@@ -19,7 +19,7 @@ import triton.language as tl
 
 _LOG2E = tl.constexpr(1.4426950408889634)
 _BLOCK_N = 128
-_MAX_SPLITS = 32
+_MAX_SPLITS = 64
 _SPLIT_THRESHOLD = 512
 _AICORE_TARGET = 32
 
@@ -104,6 +104,61 @@ def _decode_single_kernel(
     tl.store(out + q_offset, result, mask=mask_d)
 
 
+@triton.jit
+def _decode_combined_pv_short_kernel(q, r, k, v, out, scale):
+    """Single-block short decode; combine the two PV states algebraically."""
+    offs_d = tl.arange(0, 64)
+    offs_n = tl.arange(0, 128)
+    b_q = tl.load(q + offs_d).to(tl.float32)
+    b_r = tl.load(r + offs_d).to(tl.float32)
+    offsets = offs_n[:, None] * 64 + offs_d[None, :]
+    b_k = tl.load(k + offsets).to(tl.float32)
+    scores = tl.sum(b_k * b_q[None, :], axis=1) * (scale * _LOG2E)
+    r_scores = tl.sum(b_k * b_r[None, :], axis=1)
+    m = tl.max(scores, axis=0)
+    p = _exp2(scores - m)
+    d1 = tl.sum(p, axis=0)
+    d2 = tl.sum(p * r_scores, axis=0)
+    inv_d1 = 1.0 / d1
+    weights = p * (1.0 + d2 * inv_d1 - r_scores) * inv_d1
+    b_v = tl.load(v + offsets).to(tl.float32)
+    result = tl.sum(weights[:, None] * b_v, axis=0)
+    tl.store(out + offs_d, result)
+
+
+@triton.jit
+def _decode_combined_pv_d128_short_kernel(q, r, k, v, out, scale):
+    """D=128 short decode with D64-streamed scores and a single PV state."""
+    offs_n = tl.arange(0, 128)
+    offs_d = tl.arange(0, 64)
+    q0 = tl.load(q + offs_d).to(tl.float32)
+    q1 = tl.load(q + 64 + offs_d).to(tl.float32)
+    r0 = tl.load(r + offs_d).to(tl.float32)
+    r1 = tl.load(r + 64 + offs_d).to(tl.float32)
+    offsets0 = offs_n[:, None] * 128 + offs_d[None, :]
+    offsets1 = offsets0 + 64
+    k0 = tl.load(k + offsets0).to(tl.float32)
+    s1 = tl.sum(k0 * q0[None, :], axis=1)
+    s2 = tl.sum(k0 * r0[None, :], axis=1)
+    k1 = tl.load(k + offsets1).to(tl.float32)
+    s1 += tl.sum(k1 * q1[None, :], axis=1)
+    s2 += tl.sum(k1 * r1[None, :], axis=1)
+    s1 *= scale * _LOG2E
+    m = tl.max(s1, axis=0)
+    p = _exp2(s1 - m)
+    d1 = tl.sum(p, axis=0)
+    d2 = tl.sum(p * s2, axis=0)
+    inv_d1 = 1.0 / d1
+    weights = p * (1.0 + d2 * inv_d1 - s2) * inv_d1
+
+    v0 = tl.load(v + offsets0).to(tl.float32)
+    o0 = tl.sum(weights[:, None] * v0, axis=0)
+    v1 = tl.load(v + offsets1).to(tl.float32)
+    o1 = tl.sum(weights[:, None] * v1, axis=0)
+    tl.store(out + offs_d, o0)
+    tl.store(out + 64 + offs_d, o1)
+
+
 @triton.jit(do_not_specialize=["Skv"])
 def _decode_split_kernel(
     q,
@@ -124,6 +179,7 @@ def _decode_split_kernel(
     BK: tl.constexpr,
     BN: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    MAX_BLOCKS_PER_SPLIT: tl.constexpr,
 ):
     """Compute the online-softmax state for one KV partition."""
     i_bh = tl.program_id(0).to(tl.int64)
@@ -149,12 +205,15 @@ def _decode_split_kernel(
     o1 = tl.zeros((BK,), tl.float32)
     o2 = tl.zeros((BK,), tl.float32)
 
-    for block_id in range(first_block, last_block):
+    for block_offset in tl.range(0, MAX_BLOCKS_PER_SPLIT, loop_unroll_factor=1):
+        block_id = first_block + block_offset
         cols = block_id * BN + tl.arange(0, BN)
-        mask_n = cols < Skv
+        mask_n = (cols < Skv) & (block_id < last_block)
         kv_offsets = ((i_b * Skv + cols[:, None]) * H + i_h) * K + offs_d[None, :]
         mask_kv = mask_n[:, None] & mask_d[None, :]
         b_k = tl.load(k + kv_offsets, mask=mask_kv, other=0.0)
+        # Load V before the QK reductions; backend IR does not establish async overlap.
+        b_v = tl.load(v + kv_offsets, mask=mask_kv, other=0.0).to(tl.float32)
         s1 = tl.sum(b_k.to(tl.float32) * b_q[None, :], axis=1) * scale_log2
         s2 = tl.sum(b_k.to(tl.float32) * b_r[None, :], axis=1)
         s1 = tl.where(mask_n, s1, -float("inf"))
@@ -164,7 +223,6 @@ def _decode_split_kernel(
         alpha = _exp2(m - m_safe)
         p1 = _exp2(s1 - m_safe)
         p2 = p1 * s2
-        b_v = tl.load(v + kv_offsets, mask=mask_kv, other=0.0).to(tl.float32)
         d1 = d1 * alpha + tl.sum(p1, axis=0)
         d2 = d2 * alpha + tl.sum(p2, axis=0)
         o1 = o1 * alpha + tl.sum(p1[:, None] * b_v, axis=0)
@@ -295,12 +353,21 @@ def _window_size_to_left(window_size) -> int:
     return int(left)
 
 
-def _choose_num_splits(batch_heads: int, kv_len: int, block_n: int) -> int:
+def _choose_num_splits(batch_heads: int, kv_len: int, block_n: int, dim: int) -> int:
     """Use split-KV for long, under-occupied decode launches."""
     blocks = triton.cdiv(kv_len, block_n)
+    if dim == 128 and kv_len >= 4096:
+        return max(1, min(triton.cdiv(16 * _AICORE_TARGET, batch_heads), blocks, _MAX_SPLITS))
     if kv_len < _SPLIT_THRESHOLD or batch_heads >= _AICORE_TARGET:
         return 1
     return max(1, min(triton.cdiv(2 * _AICORE_TARGET, batch_heads), blocks, _MAX_SPLITS))
+
+
+def _decode_large_mha_fullscore(q, r, k, v, *, scale, out, merge_kernel):
+    """Lazy-load the TLE path only for its narrowly validated BF16 shapes."""
+    from .large_decode import decode_large_mha_fullscore
+
+    return decode_large_mha_fullscore(q, r, k, v, scale=scale, out=out, merge_kernel=merge_kernel)
 
 
 def parallax_attn_with_kvcache(
@@ -332,13 +399,77 @@ def parallax_attn_with_kvcache(
     )
     result = torch.empty_like(q) if out is None else out
     block_k = triton.next_power_of_2(dim)
+    # Full-score plus split-wide Full-D PV is measured only for these three
+    # BF16 MHA decode tuples. Runtime lengths, windows, GQA, and all other
+    # shapes deliberately retain the existing path below.
+    if (
+        q.dtype == torch.bfloat16
+        and dim == 128
+        and query_heads == kv_heads
+        and seqused_k is None
+        and window_left < 0
+        and (
+            (batch == 1 and query_heads == 8 and length in (8192, 16384))
+            or (batch == 4 and query_heads == 16 and length == 16384)
+        )
+    ):
+        return _decode_large_mha_fullscore(
+            q, r, k_cache, v_cache,
+            scale=float(scale), out=result, merge_kernel=_decode_merge_kernel,
+        )
+
+    # This exact short BF16 shape is faster with one combined weighted-V
+    # reduction than maintaining both online PV vectors. Keep dispatch narrow:
+    # the algebraic form has only been measured for this official decode case.
+    if (
+        batch == 1
+        and length == 128
+        and query_heads == 1
+        and kv_heads == 1
+        and dim == 64
+        and q.dtype == torch.bfloat16
+        and seqused_k is None
+        and window_left < 0
+    ):
+        _decode_combined_pv_short_kernel[(1,)](
+            q,
+            r,
+            k_cache,
+            v_cache,
+            result,
+            float(scale),
+            num_warps=4,
+            num_stages=2,
+        )
+        return result
+    if (
+        batch == 1
+        and length == 128
+        and query_heads == 1
+        and kv_heads == 1
+        and dim == 128
+        and q.dtype == torch.bfloat16
+        and seqused_k is None
+        and window_left < 0
+    ):
+        _decode_combined_pv_d128_short_kernel[(1,)](
+            q,
+            r,
+            k_cache,
+            v_cache,
+            result,
+            float(scale),
+            num_warps=4,
+            num_stages=2,
+        )
+        return result
     # Bound the UB working set for the wider D=128 vector reductions. Keep
     # the D=64 selection unchanged: BN=128 won on longer caches there.
     block_n = 64 if dim > 64 or length <= 64 else _BLOCK_N
     batch_heads = batch * query_heads
     num_splits = 1
     if seqused_k is None and window_left < 0:
-        num_splits = _choose_num_splits(batch_heads, length, block_n)
+        num_splits = _choose_num_splits(batch_heads, length, block_n, dim)
 
     if num_splits == 1:
         _decode_single_kernel[(batch_heads,)](
@@ -385,6 +516,7 @@ def parallax_attn_with_kvcache(
         BK=block_k,
         BN=block_n,
         NUM_SPLITS=num_splits,
+        MAX_BLOCKS_PER_SPLIT=triton.cdiv(triton.cdiv(length, block_n), num_splits),
         num_warps=4,
         num_stages=2,
     )

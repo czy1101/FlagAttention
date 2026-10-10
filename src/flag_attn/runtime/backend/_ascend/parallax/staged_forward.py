@@ -25,6 +25,7 @@ def _parallax_fused_short_kernel(
     D: tl.constexpr,
     BM: tl.constexpr,
     BD: tl.constexpr,
+    DIRECT_OUTPUT: tl.constexpr = False,
 ):
     """Fuse full-length T=128 causal Parallax forward for tiny head counts."""
     pid_m = tl.program_id(0)
@@ -57,8 +58,12 @@ def _parallax_fused_short_kernel(
     correction_mean = tl.sum(weights * rk, axis=1, keep_dims=True) / denom
 
     mean_value = tl.dot(normalized.to(vv.dtype), vv, out_dtype=tl.float32)
-    correction_value = tl.dot((normalized * rk).to(vv.dtype), vv, out_dtype=tl.float32)
-    output = mean_value * (1.0 + correction_mean) - correction_value
+    if DIRECT_OUTPUT:
+        corrected_weights = normalized * (1.0 + correction_mean - rk)
+        output = tl.dot(corrected_weights.to(vv.dtype), vv, out_dtype=tl.float32)
+    else:
+        correction_value = tl.dot((normalized * rk).to(vv.dtype), vv, out_dtype=tl.float32)
+        output = mean_value * (1.0 + correction_mean) - correction_value
 
     out_offsets = ((batch * 128 + rows[:, None]) * HQ + hq) * D + ds[None, :]
     scalar_offsets = (batch * 128 + rows) * HQ + hq
@@ -504,6 +509,7 @@ def staged_parallax_forward_short(q, r, k, v, scale):
         D=dim,
         BM=bm,
         BD=triton.next_power_of_2(dim),
+        DIRECT_OUTPUT=(dim == 128),
         num_warps=4,
         num_stages=1,
     )
