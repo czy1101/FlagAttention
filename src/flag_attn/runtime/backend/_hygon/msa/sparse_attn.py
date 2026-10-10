@@ -1086,7 +1086,6 @@ def minimax_m3_sparse_attn(
         direct_num_q_loop = int(
             os.environ.get("FLAG_ATTN_HYGON_Q_LOOP", "4")
         )
-        direct_num_warps = 2 if block_size_h <= 8 else 4
         direct_grid = (
             triton.cdiv(max_query_len, direct_num_q_loop),
             num_kv_heads,

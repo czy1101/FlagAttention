@@ -27,7 +27,8 @@ limitations under the License.
 # Original complete source SHA256:
 # 6a71b9ebef4dbfaf489ca32fb4ad32ed51a3dc474b6d681c21ddf026eef1b5d2
 # This forward-only extraction retains the original forward operations and
-# launch configuration. Backward and standalone upstream tests are excluded.
+# launch configuration. Loads use .ca for legal 4/8/16-byte async copies.
+# Backward and standalone upstream tests are excluded.
 import math
 from collections import defaultdict
 from typing import Literal, Optional, Union
@@ -95,7 +96,7 @@ class ForgettingAttention(torch.autograd.Function):
         if adaptive_threshold is not None:
             if isinstance(adaptive_threshold, str):
                 assert adaptive_threshold == "auto", f'adaptive_threshold must be either the string "auto", a float, or a Tensor, but got {adaptive_threshold}.'
-                # Otherwise we could calculate the max L2 norms manually 
+                # Otherwise we could calculate the max L2 norms manually
                 max_q_norm = torch.linalg.vector_norm(q, dim=-1).max(dim=-1).values
                 max_k_norm = torch.linalg.vector_norm(k, dim=-1).max(dim=-1).values
                 assert max_q_norm.size() == max_k_norm.size() == (B, H)
@@ -104,7 +105,7 @@ class ForgettingAttention(torch.autograd.Function):
                 tolerance = -10
                 # Note we should use N instead of M here
                 adaptive_threshold = -(2 * logit_upper_bound + math.log(N)) + tolerance
-                
+
             adaptive_threshold = torch.as_tensor(adaptive_threshold, dtype=torch.float, device=q.device)
             try:
                 adaptive_threshold = torch.broadcast_to(adaptive_threshold, (B, H))
@@ -159,7 +160,7 @@ class ForgettingAttention(torch.autograd.Function):
             divisible_m = M % BLOCK_M == 0
             divisible_n = N % BLOCK_N == 0
 
-            
+
             start_index = torch.empty((B, H, triton.cdiv(M, BLOCK_M)), dtype=torch.long, device=q.device)
             if adaptive_threshold is not None:
                 grid = (H, B)
@@ -187,7 +188,8 @@ class ForgettingAttention(torch.autograd.Function):
             # Actual forward
             # consider using 3d grid to avoid div & rem
             # grid = (triton.cdiv(M, BLOCK_M), H, B)
-            grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), H, B)
+            def grid(META):
+                return (triton.cdiv(M, META["BLOCK_M"]), H, B)
             o = torch.empty_like(q)
             L = torch.empty((B, H, M), device=q.device, dtype=torch.float32)
             _fwd_kernel[grid](
@@ -249,7 +251,7 @@ def forgetting_attention(
     adaptive_threshold: Optional[Union[Literal["auto"], float, torch.Tensor]] = None,
 ):
     """
-    A FlashAttention-based implementation of Forgetting Attention. 
+    A FlashAttention-based implementation of Forgetting Attention.
 
     Note:
     - q, k, v should be in bfloat16/float16 and log_fgate should be in float32.
@@ -261,21 +263,21 @@ def forgetting_attention(
         - q: (batch_size, seqlen_q, num_heads, head_dim) unless head_first=True.
         - k: (batch_size, seqlen_k, num_heads, head_dim) unless head_first=True.
         - v: (batch_size, seqlen_k, num_heads, head_dim) unless head_first=True.
-        - log_fgate: (batch_size, seqlen_k, num_heads) unless head_first=True. 
-              This should be the **log** of the forget gates. This is typically the 
+        - log_fgate: (batch_size, seqlen_k, num_heads) unless head_first=True.
+              This should be the **log** of the forget gates. This is typically the
               output of torch.nn.functional.logsigmoid.
-        - head_first: if True, the order the num_heads and seqlen_* axis of the all 
+        - head_first: if True, the order the num_heads and seqlen_* axis of the all
               FloatTensor inputs and outputs should be (num_heads, seq_len_*) instead of
               (seq_len_*, num_heads)
-        - seq_start: If not None, should be LongTensor with shape (batch_size,) 
-              and range in [0, seq_len_k). For each batch index batch_id, no attention 
-              will be allocated to tokens before the token index seq_start[batch_id]. 
+        - seq_start: If not None, should be LongTensor with shape (batch_size,)
+              and range in [0, seq_len_k). For each batch index batch_id, no attention
+              will be allocated to tokens before the token index seq_start[batch_id].
               This is useful for left-padded inputs.
         - sm_scale: The scaling of attention scores before applying softmax. If
               None, it defaults to (1.0 / math.sqrt(head_dim))
         - adaptive_threshold: The threshold for adaptive computation pruning. This
-              should be either the string "auto", a float, or a Tensor that is 
-              broadcastable to (batch_size, num_heads). If "auto", the threshold would 
+              should be either the string "auto", a float, or a Tensor that is
+              broadcastable to (batch_size, num_heads). If "auto", the threshold would
               be computed automatically based on the L2 norms of queries and keys.
 
     Returns:
@@ -384,12 +386,13 @@ def _fwd_kernel(
 
     # load q
     if DIVISIBLE_M:
-        q = tl.load(q_ptrs, cache_modifier=".cg")
-        log_lambda_out = tl.load(log_lambda_out_ptrs, cache_modifier=".cg")
+        # .ca permits 4/8-byte async loads too; .cg requires 16-byte copies.
+        q = tl.load(q_ptrs, cache_modifier=".ca")
+        log_lambda_out = tl.load(log_lambda_out_ptrs, cache_modifier=".ca")
     else:
         mask_m = offs_m < M
-        q = tl.load(q_ptrs, mask=mask_m[:, None], cache_modifier=".cg")
-        log_lambda_out = tl.load(log_lambda_out_ptrs, mask=mask_m, cache_modifier=".cg")
+        q = tl.load(q_ptrs, mask=mask_m[:, None], cache_modifier=".ca")
+        log_lambda_out = tl.load(log_lambda_out_ptrs, mask=mask_m, cache_modifier=".ca")
 
     #Dot I trick: to place q in registers, it saves shared memory
     # if BLOCK_DMODEL < 128:
@@ -447,14 +450,14 @@ def _fwd_kernel(
 
         # -- load k, v --
         if DIVISIBLE_N:
-            k = tl.load(k_ptrs, cache_modifier=".cg")
-            v = tl.load(v_ptrs, cache_modifier=".cg")
-            log_lambda_in = tl.load(log_lambda_in_ptrs, cache_modifier=".cg")
+            k = tl.load(k_ptrs, cache_modifier=".ca")
+            v = tl.load(v_ptrs, cache_modifier=".ca")
+            log_lambda_in = tl.load(log_lambda_in_ptrs, cache_modifier=".ca")
         else:
             mask_n = offs_n < N
-            k = tl.load(k_ptrs, mask=mask_n[None, :], cache_modifier=".cg")
-            v = tl.load(v_ptrs, mask=mask_n[:, None], cache_modifier=".cg")
-            log_lambda_in = tl.load(log_lambda_in_ptrs, mask=mask_n, cache_modifier=".cg")
+            k = tl.load(k_ptrs, mask=mask_n[None, :], cache_modifier=".ca")
+            v = tl.load(v_ptrs, mask=mask_n[:, None], cache_modifier=".ca")
+            log_lambda_in = tl.load(log_lambda_in_ptrs, mask=mask_n, cache_modifier=".ca")
 
         # -- compute qk ---
         # s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -518,7 +521,7 @@ def _fwd_kernel(
 
 @triton.jit
 def _find_start_index_kernel(
-    LOG_LAMBDA, 
+    LOG_LAMBDA,
     START_INDEX,
     THRESHOLD,
     stride_log_lambda_z, stride_log_lambda_h, stride_log_lambda_n,

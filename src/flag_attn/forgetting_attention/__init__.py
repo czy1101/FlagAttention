@@ -1,29 +1,17 @@
-"""Forgetting Attention / ACP: reference and H100 TLE implementations."""
+"""Public Forgetting Attention exports."""
 import importlib
-import importlib.util
 
-
-def has_tle():
-    try:
-        return importlib.util.find_spec("triton.experimental.tle") is not None
-    except (ImportError, ModuleNotFoundError, ValueError):
-        return False
+from .parallel import forgetting_attention, parallel_forgetting_attn
 
 
 def __getattr__(name):
-    if name in {"forgetting_attention", "parallel_forgetting_attn"}:
-        if not has_tle():
-            raise RuntimeError(
-                "Forgetting Attention requires Triton 3.6 with compatible FlagTree/TLE"
-            )
-        module = ".parallel"
-    elif name == "naive_forgetting_attention":
-        module = ".naive"
-    else:
+    if name != "naive_forgetting_attention":
         raise AttributeError(name)
-    value = importlib.import_module(module, __name__).forgetting_attention
+    value = importlib.import_module(".naive", __name__).forgetting_attention
     globals()[name] = value
     return value
 
 
-__all__ = ["parallel_forgetting_attn", "forgetting_attention", "naive_forgetting_attention", "has_tle"]
+__all__ = [
+    "parallel_forgetting_attn", "forgetting_attention", "naive_forgetting_attention",
+]

@@ -1,4 +1,4 @@
-"""Official ACP vs V7.6 TLE. Full-call CUDA Event latency, never CUDA Graph.
+"""Official ACP vs the selected Forgetting Attention implementation. Full-call CUDA Event latency, never CUDA Graph.
 
 Run with pytest -m parallel_forgetting_attn. Latencies are in ms.
 The original reference adapters and input generation live in the single
@@ -15,16 +15,14 @@ import pytest
 import torch
 
 from flag_attn.testing import backend as test_backend
-from flag_attn.forgetting_attention import has_tle
 from test_forgetting_attention import (
     DEFAULT_CASES, case_id, make_inputs,
     call_optimized, call_official, assert_bitwise,
 )
 
-CUDA_SM90 = test_backend.is_available() and test_backend.cuda_capability() == (9, 0)
 pytestmark = [
     pytest.mark.parallel_forgetting_attn,
-    pytest.mark.skipif(not test_backend.supports_operator("parallel_forgetting_attn", exact_sm=(9, 0), tle=True), reason="selected Forgetting Attention implementation is unavailable"),
+    pytest.mark.skipif(not test_backend.supports_operator("parallel_forgetting_attn"), reason="selected Forgetting Attention implementation is unavailable"),
 ]
 
 
@@ -56,7 +54,7 @@ def benchmark_case(case, warmup=40, rep=400, rounds=3, seed=0):
     if rounds < 1:
         raise ValueError("rounds must be positive")
     inputs = make_inputs(case, seed)
-    providers = {"tle_v76": lambda: call_optimized(inputs, case)}
+    providers = {"flag_attn": lambda: call_optimized(inputs, case)}
     compare_official = test_backend.device == "cuda"
     if compare_official:
         expected = call_official(inputs, case)
@@ -75,7 +73,7 @@ def benchmark_case(case, warmup=40, rep=400, rounds=3, seed=0):
             result[name] = {"median_ms": statistics.median(values), "samples_ms": values}
         measurements.append(result)
     baseline = statistics.median(r["official"]["median_ms"] for r in measurements) if compare_official else None
-    candidate = statistics.median(r["tle_v76"]["median_ms"] for r in measurements)
+    candidate = statistics.median(r["flag_attn"]["median_ms"] for r in measurements)
     return {"case": case, "baseline": ("official_acp" if case["reference_kind"] == "native" else "official_acp_adapted") if compare_official else None,
             "latency_base": baseline, "latency": candidate, "speedup": baseline / candidate if baseline is not None else None,
             "accuracy": "bitwise_pass" if compare_official else "not_checked", "rounds": measurements}
@@ -91,7 +89,7 @@ def print_row(row):
 
 def detail_for(row):
     case = row["case"]
-    return {"op_name": "forgetting_attention", "dtype": case["dtype"], "mode": "forward", "level": "end_to_end",
+    return {"op_name": "parallel_forgetting_attn", "dtype": case["dtype"], "mode": "forward", "level": "end_to_end",
             "result": [{"shape_detail": [[case[k] for k in ("B", "M", "N", "HQ", "H", "D")],
                                          {"scale": case["scale"], "threshold": -10.0,
                                           "baseline_kind": row["baseline"]}],

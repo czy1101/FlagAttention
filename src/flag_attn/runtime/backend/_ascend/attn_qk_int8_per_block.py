@@ -264,7 +264,8 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
     else:
         lse = torch.empty([0], dtype=torch.float32, device='cpu')
 
-    grid = lambda meta: (triton.cdiv(qo_len, meta["BLOCK_M"]), h_qo, b)
+    def grid(meta):
+        return (triton.cdiv(qo_len, meta["BLOCK_M"]), h_qo, b)
     # Full-static experiment: specialize every shape by its KV block count.
     static_kv = True
     launch_options = {}

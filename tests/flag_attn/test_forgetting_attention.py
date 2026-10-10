@@ -16,8 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from flag_attn.testing import backend as test_backend
-from flag_attn.forgetting_attention import has_tle
-from flag_attn.forgetting_attention.naive import OFFICIAL_COMMIT
+from flag_attn.forgetting_attention.parallel import TLE_AVAILABLE
 
 # Inline pytest parameters: B, M, N, Hq, Hkv, D, dtype, scale, seed-0 SHA256.
 # Preserve all 90 historical configurations and their numerical regression oracle.
@@ -194,7 +193,7 @@ def assert_bitwise(actual, expected):
 CUDA_SM90 = test_backend.is_available() and test_backend.cuda_capability() == (9, 0)
 pytestmark = [
     pytest.mark.parallel_forgetting_attn,
-    pytest.mark.skipif(not test_backend.supports_operator("parallel_forgetting_attn", exact_sm=(9, 0), tle=True), reason="selected Forgetting Attention implementation is unavailable"),
+    pytest.mark.skipif(not test_backend.supports_operator("parallel_forgetting_attn"), reason="selected Forgetting Attention implementation is unavailable"),
 
 ]
 
@@ -209,13 +208,14 @@ def test_forgetting_attention_matches_official(case, seed):
     warm = call_optimized(inputs, case)
     assert_bitwise(cold, expected)
     assert_bitwise(warm, expected)
-    if seed == 0 and torch.__version__.startswith("2.10."):
+    if CUDA_SM90 and seed == 0 and torch.__version__.startswith("2.10."):
         assert fingerprint(warm) == case["v66_frozen_sha256"], "V7.6 frozen-output regression"
 
 
 @pytest.mark.parametrize("case", [c for c in CASES if c["id"] in
                                   ("S001", "S003", "S011", "S024", "S031", "S034", "S064")], ids=case_id)
 @torch.inference_mode()
+@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="prefix preparation requires SM90/TLE")
 def test_forgetting_attention_prefix_and_boundaries(case):
     from flag_attn.forgetting_attention.parallel import prepare, h100_config
     inputs = make_inputs(case)
@@ -240,7 +240,7 @@ def _reuse_case(dtype="bfloat16"):
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @torch.inference_mode()
-@pytest.mark.skipif(not CUDA_SM90 or not has_tle(), reason="generic ACP implementation contract requires SM90/TLE")
+@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="generic ACP implementation contract requires SM90/TLE")
 def test_forgetting_attention_launch_reuse(dtype):
     case = _reuse_case(dtype)
     inputs = make_inputs(case, 37)
@@ -257,7 +257,7 @@ def test_forgetting_attention_launch_reuse(dtype):
 
 @pytest.mark.parametrize("offset", [0, 1, 2, 3])
 @torch.inference_mode()
-@pytest.mark.skipif(not CUDA_SM90 or not has_tle(), reason="generic ACP implementation contract requires SM90/TLE")
+@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="generic ACP implementation contract requires SM90/TLE")
 def test_forgetting_attention_gate_alignment(offset):
     case = _reuse_case()
     q, k, v, gate = make_inputs(case, 5)
@@ -269,7 +269,7 @@ def test_forgetting_attention_gate_alignment(offset):
 
 
 @torch.inference_mode()
-@pytest.mark.skipif(not CUDA_SM90 or not has_tle(), reason="generic ACP implementation contract requires SM90/TLE")
+@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="generic ACP implementation contract requires SM90/TLE")
 def test_forgetting_attention_nondefault_stream_and_lifetime():
     case = _reuse_case()
     for _ in range(2):
@@ -289,7 +289,7 @@ def test_forgetting_attention_nondefault_stream_and_lifetime():
 @pytest.mark.parametrize("problem", ["head_first", "seq_start", "threshold_none", "threshold_positive",
                                     "threshold_nan", "scale_inf", "gate_dtype", "q_dtype", "noncontiguous"])
 @torch.inference_mode()
-@pytest.mark.skipif(not CUDA_SM90 or not has_tle(), reason="generic ACP implementation contract requires SM90/TLE")
+@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="generic ACP implementation contract requires SM90/TLE")
 def test_forgetting_attention_rejects_unsupported(problem):
     case = _reuse_case()
     q, k, v, gate = make_inputs(case)
@@ -318,7 +318,7 @@ def test_forgetting_attention_rejects_unsupported(problem):
 
 @pytest.mark.parametrize("id", ["S031", "S034", "S024"])
 @torch.inference_mode()
-@pytest.mark.skipif(not CUDA_SM90 or not has_tle(), reason="generic ACP implementation contract requires SM90/TLE")
+@pytest.mark.skipif(not CUDA_SM90 or not TLE_AVAILABLE, reason="generic ACP implementation contract requires SM90/TLE")
 def test_forgetting_attention_explicit_async_and_hot_launch(id):
     from flag_attn.forgetting_attention.parallel import capture
     case = next(c for c in CASES if c["id"] == id)

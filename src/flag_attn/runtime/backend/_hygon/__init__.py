@@ -15,7 +15,7 @@
 from types import SimpleNamespace
 
 import torch
-
+import importlib
 # Hygon PyTorch exposes its device through the CUDA-compatible API.
 device = SimpleNamespace(vendor_name="hygon", name="cuda")
 torch_device_fn = torch.cuda
@@ -30,7 +30,7 @@ class _Error:
 error = _Error()
 
 
-import importlib
+
 
 _OPERATOR_EXPORTS = {
     "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),

@@ -23,12 +23,12 @@ import triton
 import triton.language as tl
 
 from triton import autotune as fla_cache_autotune
-RCP_LN2 = 1.4426950408889634
+
 from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
 from flag_attn.FLA.utils import exp2
 from ..ops.softplus import softplus
 from flag_attn.FLA.utils import autotune_cache_kwargs
-
+RCP_LN2 = 1.4426950408889634
 
 
 # =============================================================================

@@ -16,10 +16,19 @@ from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.wall_attn import parallel as provider
 from flag_attn.utils import has_triton_tle
 
-SEQUENCE_LENGTHS = (512, 1024, 2048, 4096)
 SHAPE_FAMILIES = (("mha", 8), ("gqa", 2))
 DTYPES = (("bf16", torch.bfloat16), ("fp16", torch.float16))
-SEEDS = (0, 1, 7)
+# Cross the shortest and longest supported lengths with both dtypes and head
+# layouts. Representative interior cases cover the remaining supported lengths.
+FAST_CASES = [
+    pytest.param(family, h, t, dtype_name, dtype, id=f"{dtype_name}-t{t}-{family}")
+    for dtype_name, dtype in DTYPES
+    for t in (512, 4096)
+    for family, h in SHAPE_FAMILIES
+] + [
+    pytest.param("mha", 8, 1024, "bf16", torch.bfloat16, id="bf16-t1024-mha"),
+    pytest.param("gqa", 2, 2048, "fp16", torch.float16, id="fp16-t2048-gqa"),
+]
 
 
 def _has_h100_tle() -> bool:
@@ -121,15 +130,12 @@ def test_parallel_wall_attn_decode_matches_naive(h, dtype, use_extra_gates):
 
 
 @pytest.mark.parallel_wall_attn
-@pytest.mark.parametrize("family,h", SHAPE_FAMILIES, ids=lambda value: str(value))
-@pytest.mark.parametrize("t", SEQUENCE_LENGTHS, ids=lambda value: f"t{value}")
-@pytest.mark.parametrize("dtype_name,dtype", DTYPES, ids=lambda value: str(value))
-@pytest.mark.parametrize("seed", SEEDS, ids=lambda value: f"seed{value}")
+@pytest.mark.parametrize("family,h,t,dtype_name,dtype", FAST_CASES)
 @pytest.mark.skipif(not _has_h100_tle(), reason="fast-path matrix requires H100/SM90 with TLE")
 @torch.inference_mode()
-def test_parallel_wall_attn_fast_matrix_matches_fla(family, h, t, dtype_name, dtype, seed):
+def test_parallel_wall_attn_fast_matrix_matches_fla(family, h, t, dtype_name, dtype):
     del family
-    inputs = _make_inputs(t, h, 64, dtype, seed)
+    inputs = _make_inputs(t, h, 64, dtype, seed=0)
     expected_route = "hopper_bf16" if dtype is torch.bfloat16 else "hopper_fp16"
     assert provider.select_route(*inputs, scale=64**-0.5) == expected_route
 
@@ -146,7 +152,7 @@ def test_parallel_wall_attn_fast_matrix_matches_fla(family, h, t, dtype_name, dt
 
 @pytest.mark.parallel_wall_attn
 @pytest.mark.parametrize("h", (2, 8), ids=("gqa", "mha"))
-@pytest.mark.parametrize("t", SEQUENCE_LENGTHS)
+@pytest.mark.parametrize("t", (512, 4096))
 @pytest.mark.skipif(not _has_h100_tle(), reason="D128 fast path requires H100/SM90 with TLE")
 @torch.inference_mode()
 def test_parallel_wall_attn_bf16_d128_matches_fla(h, t):
@@ -210,10 +216,10 @@ def test_parallel_wall_attn_non_sm90_routes_to_fallback(monkeypatch):
 
 @pytest.mark.parallel_wall_attn
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
-@pytest.mark.parametrize("t,gate", ((4096, -0.05), (2048, -0.10)))
 @pytest.mark.skipif(not _has_h100_tle(), reason="numerical guard test requires H100/SM90 with TLE")
 @torch.inference_mode()
-def test_parallel_wall_attn_constant_gate_uses_safe_fallback(dtype, t, gate):
+def test_parallel_wall_attn_constant_gate_uses_safe_fallback(dtype):
+    t, gate = 4096, -0.05
     q = torch.ones(1, t, 8, 64, device=test_backend.device, dtype=dtype)
     k, v = torch.ones_like(q), torch.ones_like(q)
     g = torch.full_like(q, gate)

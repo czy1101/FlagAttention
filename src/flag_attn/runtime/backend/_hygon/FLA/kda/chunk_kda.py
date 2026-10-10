@@ -1408,7 +1408,8 @@ if HAS_TLE_KDA:
             else kg.new_empty(1, dtype=torch.float32)
         )
 
-        grid = lambda meta: (triton.cdiv(V, meta["BV"]), N * HV)
+        def grid(meta):
+            return (triton.cdiv(V, meta["BV"]), N * HV)
         _kda_fwd_state_output_direct_kernel[grid](
             v=v,
             beta=beta,
@@ -2127,7 +2128,8 @@ if HAS_STRICT_TLE_KDA:
                 num_stages=1,
             )
         else:
-            grid = lambda meta: (triton.cdiv(V, meta["BV"]), N * HV)
+            def grid(meta):
+                return (triton.cdiv(V, meta["BV"]), N * HV)
             _kda_fwd_state_output_direct_kernel[grid](
                 v=v,
                 beta=beta,

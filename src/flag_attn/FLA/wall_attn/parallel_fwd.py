@@ -172,110 +172,6 @@ def _wall_attn_consumer(
 
 
 @triton.jit
-def _wall_attn_consumer0(
-    output,
-    lse,
-    q0,
-    p0,
-    q0_full,
-    k_stages,
-    v_stages,
-    k_full,
-    v_full,
-    empty,
-    query_tile,
-    head,
-    scale_log2: tl.constexpr,
-    T_VALUE: tl.constexpr,
-    HQ_VALUE: tl.constexpr,
-    D_VALUE: tl.constexpr,
-    BM_VALUE: tl.constexpr,
-    BN_VALUE: tl.constexpr,
-    CAPACITY_VALUE: tl.constexpr,
-    QK_IS_BF16: tl.constexpr,
-    PV_IS_BF16: tl.constexpr,
-    OUTPUT_IS_BF16: tl.constexpr,
-):
-    _wall_attn_consumer(
-        output,
-        lse,
-        q0,
-        p0,
-        q0_full,
-        k_stages,
-        v_stages,
-        k_full,
-        v_full,
-        empty,
-        query_tile,
-        head,
-        0,
-        scale_log2,
-        T_VALUE,
-        HQ_VALUE,
-        D_VALUE,
-        BM_VALUE,
-        BN_VALUE,
-        CAPACITY_VALUE,
-        QK_IS_BF16,
-        PV_IS_BF16,
-        OUTPUT_IS_BF16,
-    )
-
-
-@triton.jit
-def _wall_attn_consumer1(
-    output,
-    lse,
-    q1,
-    p1,
-    q1_full,
-    k_stages,
-    v_stages,
-    k_full,
-    v_full,
-    empty,
-    query_tile,
-    head,
-    scale_log2: tl.constexpr,
-    T_VALUE: tl.constexpr,
-    HQ_VALUE: tl.constexpr,
-    D_VALUE: tl.constexpr,
-    BM_VALUE: tl.constexpr,
-    BN_VALUE: tl.constexpr,
-    CAPACITY_VALUE: tl.constexpr,
-    QK_IS_BF16: tl.constexpr,
-    PV_IS_BF16: tl.constexpr,
-    OUTPUT_IS_BF16: tl.constexpr,
-):
-    _wall_attn_consumer(
-        output,
-        lse,
-        q1,
-        p1,
-        q1_full,
-        k_stages,
-        v_stages,
-        k_full,
-        v_full,
-        empty,
-        query_tile,
-        head,
-        BM_VALUE,
-        scale_log2,
-        T_VALUE,
-        HQ_VALUE,
-        D_VALUE,
-        BM_VALUE,
-        BN_VALUE,
-        CAPACITY_VALUE,
-        QK_IS_BF16,
-        PV_IS_BF16,
-        OUTPUT_IS_BF16,
-    )
-
-
-@triton.jit
 def parallel_wall_attn_fwd_kernel(
     q_cache,
     k_cache,
@@ -390,6 +286,8 @@ def parallel_wall_attn_fwd_kernel(
         arrive_count=2,
         init=tle.gpu.READY,
     )
+    # Keep consumers as direct partition entries so TLE lowers their shared-memory
+    # synchronization to partition-local barriers rather than CTA-wide barriers.
     tle.gpu.warp_specialize(
         [
             (
@@ -416,7 +314,7 @@ def parallel_wall_attn_fwd_kernel(
                 ),
             ),
             (
-                _wall_attn_consumer0,
+                _wall_attn_consumer,
                 (
                     output,
                     lse,
@@ -430,6 +328,7 @@ def parallel_wall_attn_fwd_kernel(
                     empty,
                     query_tile,
                     head,
+                    0,
                     scale_log2,
                     T_VALUE,
                     HQ_VALUE,
@@ -443,7 +342,7 @@ def parallel_wall_attn_fwd_kernel(
                 ),
             ),
             (
-                _wall_attn_consumer1,
+                _wall_attn_consumer,
                 (
                     output,
                     lse,
@@ -457,6 +356,7 @@ def parallel_wall_attn_fwd_kernel(
                     empty,
                     query_tile,
                     head,
+                    BM_VALUE,
                     scale_log2,
                     T_VALUE,
                     HQ_VALUE,

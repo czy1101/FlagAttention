@@ -398,10 +398,12 @@ def test_public_api_rejects_invalid_paged_cache_inputs():
         )
 
 
-def test_unified_diffkv_is_lazily_exported_from_flag_attn():
-    import flag_attn
+def test_unified_diffkv_is_exported_from_operator_package():
+    package = importlib.import_module("flag_attn.diffkv_attention")
 
-    assert callable(flag_attn.unified_attention_diffkv)
+    assert "unified_attention_diffkv" in package.__all__
+    assert callable(package.unified_attention_diffkv)
+    assert package.unified_attention_diffkv is unified_attention_diffkv
 
 
 @pytest.mark.parametrize(

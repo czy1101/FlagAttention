@@ -12,77 +12,127 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pytest Log-Linear Attention benchmark with an optional TileLang baseline."""
+"""Log-Linear Attention performance tests for the selected implementation."""
 
+import math
+import statistics
 
 import pytest
+import torch
 
-import argparse
-import csv
-import importlib.util
-from pathlib import Path
+try:
+    from benchmark.recording import benchmark_metric, record_benchmark_result
+except ModuleNotFoundError:
+    from recording import benchmark_metric, record_benchmark_result
+
+from flag_attn import log_linear_attn
 from flag_attn.testing import backend as test_backend
-
 
 pytestmark = pytest.mark.log_linear_attn
 
+BENCHMARK_SHAPES = [
+    (1, 8192, 96, 128),
+    (2, 16384, 16, 128),
+    (4, 2048, 16, 128),
+    (4, 4096, 64, 128),
+    (8, 2048, 32, 256),
+    (8, 1024, 8, 64),
+]
+BENCHMARK_ROUNDS = 7
+BENCHMARK_WARMUP_MS = 1000
+BENCHMARK_REP_MS = 100
 
 
-def _load_benchmark_module():
-    # Reuse the baseline kept in the corresponding test script, rather than
-    # duplicating a TileLang kernel or introducing another baselines directory.
-    path = Path(__file__).resolve().parents[1] / "tests/flag_attn/test_log_linear_attn.py"
-    spec = importlib.util.spec_from_file_location("log_linear_attn_benchmark_support", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def run(args, module=None):
-    if module is None:
-        module = _load_benchmark_module()
-    if not module._tle_available():
-        raise RuntimeError("requires CUDA and a FlagTree/Triton build with triton.experimental.tle")
-    if args.provider == "both" and module.tilelang is None:
-        raise RuntimeError("--provider both requires TileLang (validated with 0.1.13)")
-    compare = args.provider != "tle" and module.tilelang is not None
-    if args.provider == "auto" and not compare:
-        print("TileLang is unavailable; measuring TLE only. Install tilelang for comparison.")
-    shapes = args.shape or module.BENCHMARK_SHAPES
-    print(f"GPU={module.torch.cuda.get_device_name()} dtype=BF16 provider={'both' if compare else 'tle'}")
-    print(f"Kernel-only timings: rounds={args.rounds}, warmup={args.warmup} ms, rep={args.rep} ms")
-    print("shape\ttilelang_ms\ttle_ms\tspeedup_vs_tilelang")
-    results = []
-    for shape in shapes:
-        result = module.benchmark_shape(
-            *shape, compare_tilelang=compare, rounds=args.rounds,
-            warmup=args.warmup, rep=args.rep,
+def _make_inputs(batch, sequence, heads, dim):
+    levels = math.ceil(math.log2(sequence)) + 1
+    q = torch.randn(batch, sequence, 1, dim, device=test_backend.device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn(batch, sequence, heads, dim, device=test_backend.device, dtype=torch.bfloat16)
+    g = -0.05 * torch.rand(batch, sequence, heads, device=test_backend.device, dtype=torch.float32)
+    level_scales = torch.sigmoid(
+        torch.randn(
+            batch,
+            sequence,
+            heads,
+            levels,
+            device=test_backend.device,
+            dtype=torch.float32,
         )
-        results.append(result)
-        baseline = f"{result['tilelang_ms']:.6f}" if compare else "N/A"
-        speedup = f"{result['speedup_vs_tilelang']:.3f}x" if compare else "N/A"
-        print(f"{result['shape']}\t{baseline}\t{result['tle_ms']:.6f}\t{speedup}", flush=True)
-    if args.csv:
-        with args.csv.open("w", newline="") as output:
-            writer = csv.DictWriter(output, fieldnames=list(results[0]))
-            writer.writeheader()
-            writer.writerows(results)
-        print(f"Saved results to {args.csv}")
+    ).to(torch.bfloat16)
+    return q, k, v, g, level_scales
 
 
-def test_log_linear_attn_benchmark():
-    module = _load_benchmark_module()
-    if not module._tle_available():
-        if not test_backend.supports_operator("log_linear_attn", tle=True):
-            pytest.skip("selected Log-Linear implementation is unavailable")
-        from flag_attn import log_linear_attn
+def _prepare_runner(inputs):
+    if test_backend.has_specialization("log_linear_attn"):
+        def run():
+            return log_linear_attn(*inputs)
 
-        for shape in module.BENCHMARK_SHAPES:
-            inputs = module._make_inputs(*shape)
-            latency = test_backend.do_bench(lambda: log_linear_attn(*inputs), warmup=1000, rep=100, return_mode="median")
-            print(f"{shape}: public API latency={latency:.6f} ms (full call)")
-        return
-    args = argparse.Namespace(
-        provider="auto", shape=None, rounds=7, warmup=1000, rep=100, csv=None,
+        return run, None, "public_api_forward"
+
+    from flag_attn.FLA.log_linear_attn.chunk_tle import _prepare_tle_forward
+
+    run, output = _prepare_tle_forward(*inputs)
+    return run, output, "prepared_kernel_forward"
+
+
+@torch.inference_mode()
+def run_benchmark(
+    *,
+    shapes=None,
+    rounds=BENCHMARK_ROUNDS,
+    warmup=BENCHMARK_WARMUP_MS,
+    rep=BENCHMARK_REP_MS,
+    record_property=None,
+):
+    if not test_backend.supports_operator("log_linear_attn", tle=True):
+        pytest.skip(test_backend.skip_reason("log_linear_attn"))
+    if rounds < 1 or warmup < 0 or rep <= 0:
+        raise ValueError("rounds and rep must be positive; warmup must be nonnegative")
+
+    shapes = BENCHMARK_SHAPES if shapes is None else shapes
+    print(f"Device={test_backend.get_device_name()} dtype=BF16", flush=True)
+    print(f"rounds={rounds}, warmup={warmup} ms, rep={rep} ms", flush=True)
+    print("shape\tscope\tlatency_ms", flush=True)
+    metrics = []
+    for batch, sequence, heads, dim in shapes:
+        torch.manual_seed(0)
+        inputs = _make_inputs(batch, sequence, heads, dim)
+        run, output, scope = _prepare_runner(inputs)
+        initial = run()
+        test_backend.device_fn.synchronize()
+        if output is None:
+            output = initial
+        assert torch.isfinite(output).all(), "Log-Linear Attention produced NaN/Inf"
+
+        samples = [
+            test_backend.do_bench(run, warmup=warmup, rep=rep, return_mode="median")
+            for _ in range(rounds)
+        ]
+        latency = statistics.median(samples)
+        shape = f"B{batch}_T{sequence}_H{heads}_D{dim}"
+        print(f"{shape}\t{scope}\t{latency:.6f}", flush=True)
+        metrics.append(
+            benchmark_metric(
+                shape_detail={"B": batch, "T": sequence, "H": heads, "D": dim},
+                latency=latency,
+                measurement_scope=scope,
+            )
+        )
+
+    record_benchmark_result(
+        record_property,
+        op_name="log_linear_attn",
+        dtype="bf16",
+        result=metrics,
+        mode="api" if test_backend.has_specialization("log_linear_attn") else "kernel",
+        baseline=None,
+        phase="forward",
+        rounds=rounds,
+        warmup_ms=warmup,
+        rep_ms=rep,
     )
-    run(args, module)
+    return metrics
+
+
+def test_log_linear_attn_benchmark(record_property):
+    run_benchmark(record_property=record_property)

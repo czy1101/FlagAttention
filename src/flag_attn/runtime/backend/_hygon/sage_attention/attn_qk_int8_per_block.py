@@ -15,7 +15,6 @@
 import torch
 import triton
 import triton.language as tl
-import triton.experimental.tle.language as tle
 
 _TILE_CONFIGS = [
     triton.Config({"BLOCK_M": block_m, "BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
@@ -262,7 +261,8 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
     else:
         lse = torch.empty([0], dtype=torch.float32, device='cpu')
 
-    grid = lambda meta: (triton.cdiv(qo_len, meta["BLOCK_M"]), h_qo, b)
+    def grid(meta):
+        return (triton.cdiv(qo_len, meta["BLOCK_M"]), h_qo, b)
     # Full-static experiment: specialize every shape by its KV block count.
     static_kv = True
     launch_options = {}

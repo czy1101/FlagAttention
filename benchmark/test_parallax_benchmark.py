@@ -114,7 +114,7 @@ ACCURACY_TOLERANCE = {
 MAD_WARNING_THRESHOLD_PCT = 1.0
 SHORT_LATENCY_THRESHOLD_MS = 0.2
 SHORT_LATENCY_MAD_WARNING_PCT = 2.0
-TABLE_WIDTH = 123
+TABLE_WIDTH = 91
 
 
 @dataclass(frozen=True)
@@ -723,9 +723,7 @@ def _print_header(
         f"{'dtype':>9} "
         f"{fla_column:>18} "
         f"{flag_attn_column:>23} "
-        f"{'speedup':>11} "
-        f"{'FLA-MAD(%)':>12} "
-        f"{'FlagAttention-MAD(%)':>18} "
+        f"{'speedup':>11}"
     )
 
     print("-" * TABLE_WIDTH)
@@ -740,7 +738,6 @@ def _print_result(
 
     fla_ms = "n/a" if result.fla_ms is None else f"{result.fla_ms:.6f}"
     speedup = "n/a" if result.speedup is None else f"{result.speedup:.3f}x"
-    fla_mad = "n/a" if result.fla_mad_pct is None else f"{result.fla_mad_pct:.3f}%"
     print(
         f"{case.B:>3} "
         f"{case.T:>7} "
@@ -750,9 +747,7 @@ def _print_result(
         f"{dtype_name:>9} "
         f"{fla_ms:>18} "
         f"{result.flag_attn_ms:>23.6f} "
-        f"{speedup:>11} "
-        f"{fla_mad:>12} "
-        f"{result.flag_attn_mad_pct:>17.3f}% "
+        f"{speedup:>11}"
     )
 
     mad_values = [result.flag_attn_mad_pct]
@@ -826,7 +821,6 @@ def test_perf_parallel_parallax() -> None:
         print("timing = CUDA Event batch elapsed time / calls per sample; latency values are milliseconds")
     if FLA_IMPORT_ERROR is None:
         print("baseline = FLA; speedup = FLA latency / FlagAttention latency; >1 means FlagAttention is faster")
-    print("MAD% = relative median absolute deviation; lower is more stable")
     print("fwd+bwd = forward + backward")
 
     _run_phase_table(

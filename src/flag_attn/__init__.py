@@ -15,6 +15,7 @@
 import importlib
 
 from flag_attn import runtime
+from flag_attn import testing  # noqa: F401
 
 # Match FlagGems and FlagGems-vllm: the package exposes strings, while
 # runtime.device retains the structured vendor/device metadata.
@@ -29,9 +30,6 @@ try:
 except ImportError:
     __version__ = "0.0.0"
     version_tuple = (0, 0, 0)
-
-
-from flag_attn import testing  # noqa: F401
 
 _OPERATOR_EXPORTS = {
     "piecewise_attention": ("flag_attn.piecewise", "attention"),
