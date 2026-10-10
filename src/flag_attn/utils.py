@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib
 import re
 from collections.abc import Callable
 from typing import Any
@@ -25,8 +26,15 @@ from typing import Any
 import torch
 
 
-def has_triton_tle(major: int = 0, minor: int = 0, patch: int = 0) -> bool:
-    """Return whether the installed Triton exposes the requested TLE API."""
+def has_triton_tle(
+    major: int = 0, minor: int = 0, patch: int = 0, *,
+    required_api: tuple[str, ...] = (),
+) -> bool:
+    """Check TLE availability/version and optional APIs relative to its language.
+
+    For example, required_api=("gpu.types.BlockEncoding", "gpu.set_layout")
+    checks the interfaces needed by a kernel without importing that kernel.
+    """
     try:
         import triton
         import triton.experimental.tle.language  # noqa: F401
@@ -35,7 +43,20 @@ def has_triton_tle(major: int = 0, minor: int = 0, patch: int = 0) -> bool:
     parts = re.findall(r"\d+", str(getattr(triton, "__version__", "0.0.0")))
     values = [int(part) for part in parts[:3]]
     values += [0] * (3 - len(values))
-    return tuple(values[:3]) >= (major, minor, patch)
+    if tuple(values[:3]) < (major, minor, patch):
+        return False
+    for name in required_api:
+        module_name, _, attribute = name.rpartition(".")
+        module_name = "triton.experimental.tle.language" + (
+            "." + module_name if module_name else ""
+        )
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            return False
+        if not hasattr(module, attribute):
+            return False
+    return True
 
 
 def is_sm90_device(device: torch.device | None = None) -> bool:

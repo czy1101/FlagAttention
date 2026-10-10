@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
 import torch
 import triton
+from flag_attn.testing import backend as test_backend
 import flag_attn
 
 try:
@@ -27,6 +29,8 @@ warmup = 200
 rep = 200
 
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("CUDA comparison is unavailable on the selected backend")
     from vllm._C import ops as vllm_ops
 
     HAS_VLLM = True
@@ -144,7 +148,7 @@ def paged_attention_benchmark_with_vllm(
     vllm_version,
     provider,
     dtype=torch.float16,
-    device="cuda",
+    device=test_backend.device,
 ):
     num_kv_heads = num_query_heads // query_group_size
 
@@ -182,7 +186,7 @@ def paged_attention_benchmark_with_vllm(
             attn_scale,
             context_len,
         )
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        ms = test_backend.do_bench(fn, warmup=warmup, rep=rep)
 
     if provider == "vllm":
         # Correctness error, does not affect performance results
@@ -200,7 +204,7 @@ def paged_attention_benchmark_with_vllm(
             PARTITION_SIZE=512,
             version=vllm_version,
         )
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        ms = test_backend.do_bench(fn, warmup=warmup, rep=rep)
 
     total_flops = 2.0 * num_seqs * num_query_heads * 2 * context_len * head_size
     return total_flops / ms * 1e-9

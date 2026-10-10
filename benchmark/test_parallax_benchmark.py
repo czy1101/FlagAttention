@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from __future__ import annotations
+
 import gc
 from dataclasses import dataclass
 from enum import Enum
@@ -28,7 +29,10 @@ import pytest
 import torch
 import triton
 
+from flag_attn.testing import backend as test_backend
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("external FLA CUDA comparison unavailable")
     from fla.ops.parallax.parallel import (
         _block_size as fla_block_size,
         parallel_parallax_bwd as fla_parallel_parallax_bwd,
@@ -48,6 +52,9 @@ from flag_attn.FLA.parallax.parallel import (
     parallel_parallax_bwd as flag_attn_parallel_parallax_bwd,
     parallel_parallax_fwd as flag_attn_parallel_parallax_fwd,
 )
+
+
+pytestmark = pytest.mark.parallel_parallax
 
 
 class BenchMode(Enum):
@@ -107,7 +114,7 @@ ACCURACY_TOLERANCE = {
 MAD_WARNING_THRESHOLD_PCT = 1.0
 SHORT_LATENCY_THRESHOLD_MS = 0.2
 SHORT_LATENCY_MAD_WARNING_PCT = 2.0
-TABLE_WIDTH = 123
+TABLE_WIDTH = 91
 
 
 @dataclass(frozen=True)
@@ -170,7 +177,7 @@ def _build_inputs(
     if case.HQ % case.H != 0:
         raise ValueError("HQ must be divisible by H")
 
-    device = "cuda"
+    device = test_backend.device
     generator = torch.Generator(device=device)
     generator.manual_seed(_case_seed(case, dtype))
 
@@ -309,11 +316,11 @@ def _bench_ms(fn: Callable[[], object]) -> float:
     count-based CUDA-event batch timing.
     """
 
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     if Config.mode.value == "kernel":
         result = float(
-            triton.testing.do_bench(
+            test_backend.do_bench(
                 fn,
                 # Re-stabilize clocks after every provider switch. ABBA/BAAB
                 # applies the same warm-up budget symmetrically to both paths.
@@ -322,12 +329,15 @@ def _bench_ms(fn: Callable[[], object]) -> float:
                 return_mode="median",
             )
         )
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         return result
 
+    if not hasattr(test_backend.device_fn, "Event"):
+        return test_backend.do_bench(fn, warmup=Config.warm_up, rep=Config.repetition, return_mode="median")
+
     repetitions = max(1, int(Config.repetition))
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = test_backend.device_fn.Event(enable_timing=True)
+    end = test_backend.device_fn.Event(enable_timing=True)
 
     start.record()
 
@@ -336,7 +346,7 @@ def _bench_ms(fn: Callable[[], object]) -> float:
 
     end.record()
 
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     return start.elapsed_time(end) / repetitions
 
@@ -362,7 +372,7 @@ def _warm_up_pair(
         for fn in _measurement_order(cycle, fla_fn, flag_attn_fn):
             fn()
 
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
 
 def _measurement_order(
@@ -444,7 +454,7 @@ def _bench_balanced_pair(
 
 def _bench_single(flag_attn_fn: Callable[[], object]) -> PhaseBenchmarkResult:
     flag_attn_fn()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     samples = [_bench_ms(flag_attn_fn) for _ in range(BALANCED_MEASUREMENT_CYCLES * 2)]
     for sample_ms in samples:
@@ -506,7 +516,7 @@ def _validate_pair(
     with torch.no_grad():
         fla_result = fla_fn()
         flag_attn_result = flag_attn_fn()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     if not isinstance(fla_result, tuple) or not isinstance(
         flag_attn_result,
@@ -563,6 +573,25 @@ def _benchmark_case(
         case,
         dtype,
     )
+
+    if test_backend.has_specialization("parallel_parallax"):
+        from flag_attn import parallel_parallax
+
+        if phase == "fwd":
+            def run_public():
+                with torch.no_grad():
+                    return parallel_parallax(q, r, k, v, scale=scale, cu_seqlens=cu_seqlens, window_size=window_size_left)
+        elif phase == "fwd_bwd":
+            tensors = tuple(t.detach().requires_grad_(True) for t in (q, r, k, v))
+            grad_output = torch.randn_like(q)
+
+            def run_public():
+                output = parallel_parallax(*tensors, scale=scale, cu_seqlens=cu_seqlens, window_size=window_size_left)
+                return torch.autograd.grad(output, tensors, grad_output)
+        else:
+            raise ValueError(f"Unsupported benchmark phase: {phase}")
+        print(f"{case}: selected public API, {phase}, full-call timing")
+        return _bench_single(run_public)
 
     (
         fla_chunk_indices,
@@ -694,9 +723,7 @@ def _print_header(
         f"{'dtype':>9} "
         f"{fla_column:>18} "
         f"{flag_attn_column:>23} "
-        f"{'speedup':>11} "
-        f"{'FLA-MAD(%)':>12} "
-        f"{'FlagAttention-MAD(%)':>18} "
+        f"{'speedup':>11}"
     )
 
     print("-" * TABLE_WIDTH)
@@ -711,7 +738,6 @@ def _print_result(
 
     fla_ms = "n/a" if result.fla_ms is None else f"{result.fla_ms:.6f}"
     speedup = "n/a" if result.speedup is None else f"{result.speedup:.3f}x"
-    fla_mad = "n/a" if result.fla_mad_pct is None else f"{result.fla_mad_pct:.3f}%"
     print(
         f"{case.B:>3} "
         f"{case.T:>7} "
@@ -721,9 +747,7 @@ def _print_result(
         f"{dtype_name:>9} "
         f"{fla_ms:>18} "
         f"{result.flag_attn_ms:>23.6f} "
-        f"{speedup:>11} "
-        f"{fla_mad:>12} "
-        f"{result.flag_attn_mad_pct:>17.3f}% "
+        f"{speedup:>11}"
     )
 
     mad_values = [result.flag_attn_mad_pct]
@@ -769,12 +793,11 @@ def _run_phase_table(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="parallel_parallax benchmark requires CUDA",
+    not test_backend.supports_operator("parallel_parallax"),
+    reason=test_backend.skip_reason("parallel_parallax"),
 )
 def test_perf_parallel_parallax() -> None:
     torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
     iter_unit = "ms/sample" if Config.mode.value == "kernel" else "calls/sample"
 
     print("\n[parallel_parallax benchmark]")
@@ -782,7 +805,7 @@ def test_perf_parallel_parallax() -> None:
         print(f"optional FLA baseline unavailable; running FlagAttention only: {FLA_IMPORT_ERROR}")
 
     print(
-        f"device={torch.cuda.get_device_name()} "
+        f"device={test_backend.get_device_name()} "
         f"mode={Config.mode.value} "
         f"warmup={Config.warm_up} "
         f"iter={Config.repetition} {iter_unit}"
@@ -798,7 +821,6 @@ def test_perf_parallel_parallax() -> None:
         print("timing = CUDA Event batch elapsed time / calls per sample; latency values are milliseconds")
     if FLA_IMPORT_ERROR is None:
         print("baseline = FLA; speedup = FLA latency / FlagAttention latency; >1 means FlagAttention is faster")
-    print("MAD% = relative median absolute deviation; lower is more stable")
     print("fwd+bwd = forward + backward")
 
     _run_phase_table(

@@ -1,3 +1,4 @@
+
 import importlib
 import math
 from pathlib import Path
@@ -5,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gdn2
 from flag_attn.gdn2.native.chunk_fwd import chunk_gdn2_fwd
 from flag_attn.gdn2.native.output import chunk_gla_fwd_kernel_o
@@ -32,7 +34,7 @@ GDN2_TEST_CASES = [
 
 
 def _cuda_available() -> bool:
-    return torch.cuda.is_available()
+    return test_backend.supports_operator("chunk_gdn2")
 
 
 pytestmark = [
@@ -107,7 +109,7 @@ def _native_gdn2_reference(
 
 
 def _make_inputs(*, B, T, H, K, V, dtype, state_v_first):
-    device = "cuda"
+    device = test_backend.device
     scale = K**-0.5
 
     q = torch.randn(B, T, H, K, device=device, dtype=dtype) / math.sqrt(K)
@@ -226,11 +228,11 @@ def output_composition_case(request):
     dtype = request.param
     B, T, H, K, V, BT = 1, 4096, 16, 64, 64, 64
     NT = T // BT
-    q = torch.randn(B, T, H, K, device="cuda", dtype=dtype) / math.sqrt(K)
-    g = -torch.rand(B, T, H, K, device="cuda", dtype=torch.float32) * 3
-    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
-    h = torch.randn(B, NT, H, K, V, device="cuda", dtype=dtype) * 0.01
-    scores = torch.randn(B, NT, H, BT, BT, device="cuda", dtype=dtype).tril() * 0.02
+    q = torch.randn(B, T, H, K, device=test_backend.device, dtype=dtype) / math.sqrt(K)
+    g = -torch.rand(B, T, H, K, device=test_backend.device, dtype=torch.float32) * 3
+    v = torch.randn(B, T, H, V, device=test_backend.device, dtype=dtype)
+    h = torch.randn(B, NT, H, K, V, device=test_backend.device, dtype=dtype) * 0.01
+    scores = torch.randn(B, NT, H, BT, BT, device=test_backend.device, dtype=dtype).tril() * 0.02
     A = scores.permute(0, 1, 3, 2, 4).contiguous().view(B, T, H, BT)
     scale = K**-0.5
 

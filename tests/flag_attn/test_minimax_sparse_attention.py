@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+
 import importlib
 from dataclasses import dataclass
 from typing import Sequence
@@ -24,14 +25,15 @@ import pytest
 import torch
 import triton.knobs
 
+from flag_attn.testing import backend as test_backend
+from flag_attn import minimax_m3_sparse_attn
 from flag_attn.minimax_sparse_attention import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_index_decode,
     minimax_m3_index_score,
     minimax_m3_index_topk,
-    minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode,
 )
+from flag_attn.minimax_sparse_attention import minimax_m3_sparse_attn_decode
 
 index_topk_module = importlib.import_module(minimax_m3_index_topk.__module__)
 
@@ -50,28 +52,33 @@ FP8_RTOL = 8e-2
 
 
 def _supports_fp8() -> bool:
-    if FP8_DTYPE is None or not torch.cuda.is_available():
+    if FP8_DTYPE is None or not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")):
         return False
     # NVIDIA FP8 Tensor Core support starts with Ada (8.9) and Hopper (9.0).
-    return torch.cuda.get_device_capability() >= (8, 9)
+    return not test_backend.is_nvidia() or test_backend.cuda_capability() >= (8, 9)
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="MSA v1 tests require CUDA"
+    not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")), reason="requires an available accelerator"
 )
 
 
 @pytest.mark.minimax_m3_sparse_attn
 def test_public_exports_use_active_backend() -> None:
-    from flag_attn.runtime.backend import is_metax_backend
+    from flag_attn import runtime
 
-    module_name = minimax_m3_sparse_attn.__module__
-    if is_metax_backend():
-        assert module_name.startswith(
-            "flag_attn.runtime.backend._metax.minimax_sparse_attention"
-        )
+    try:
+        backend = importlib.import_module(f"flag_attn.runtime.backend._{runtime.device.vendor_name}")
+    except ModuleNotFoundError as exc:
+        if exc.name != f"flag_attn.runtime.backend._{runtime.device.vendor_name}":
+            raise
+        backend = None
+    if backend is not None and "minimax_m3_sparse_attn_decode" in vars(backend).get("_OPERATOR_EXPORTS", {}):
+        assert minimax_m3_sparse_attn_decode is backend.minimax_m3_sparse_attn_decode
     else:
-        assert module_name.startswith("flag_attn.minimax_sparse_attention")
+        from flag_attn.minimax_sparse_attention.sparse_attn import minimax_m3_sparse_attn_decode as generic_decode
+
+        assert minimax_m3_sparse_attn_decode is generic_decode
 
 
 @pytest.mark.minimax_m3_sparse_attn
@@ -85,7 +92,7 @@ def test_metax_public_exports() -> None:
     from flag_attn.runtime.backend import _metax
 
     assert flag_attn.chunk_gdn2 is _metax.chunk_gdn2
-    assert flag_attn.minimax_m3_sparse_attn is _metax.minimax_m3_sparse_attn
+    assert flag_attn.minimax_m3_sparse_attn_decode is _metax.minimax_m3_sparse_attn_decode
 
 
 @dataclass
@@ -135,7 +142,7 @@ def make_data(
     if mode not in {"bf16", "fp8_index", "fp8_kv", "fp8_full"}:
         raise ValueError(f"unsupported mode: {mode}")
     if mode != "bf16" and not _supports_fp8():
-        pytest.skip("FP8 tests require an NVIDIA GPU with FP8 support")
+        pytest.skip("FP8 tests require accelerator FP8 support")
     if not seq_lens or any(length <= 0 for length in seq_lens):
         raise ValueError("seq_lens must contain positive lengths")
     if num_kv_heads <= 0 or group_size <= 0:
@@ -144,7 +151,7 @@ def make_data(
         raise ValueError("decode_qlen must not exceed the shortest sequence")
 
     torch.manual_seed(seed)
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
     batch = len(seq_lens)
     max_seq_len = max(seq_lens)
     if decode:
@@ -582,7 +589,7 @@ def _run_prefill(case: tuple, mode: str) -> None:
         output,
         **sparse_kwargs,
     )
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     ref_scores = _ref_index_score(data)
     ref_topk = _ref_topk(ref_scores, data, topk, init_blocks, local_blocks)
@@ -621,7 +628,7 @@ def _run_decode(case: tuple, mode: str) -> None:
     sparse_kwargs = {}
     if data.k_scale is not None:
         sparse_kwargs = {"k_scale": data.k_scale, "v_scale": data.v_scale}
-    minimax_m3_sparse_attn_decode(
+    minimax_m3_sparse_attn(
         data.q,
         data.kv_cache,
         topk_idx,
@@ -631,9 +638,10 @@ def _run_decode(case: tuple, mode: str) -> None:
         data.sm_scale,
         output,
         decode_qlen,
+        stage="decode",
         **sparse_kwargs,
     )
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     ref_topk = _ref_decode_index(data, topk, init_blocks, local_blocks, decode_qlen)
     ref_output = _ref_decode_attn(data, ref_topk, decode_qlen)
@@ -642,7 +650,7 @@ def _run_decode(case: tuple, mode: str) -> None:
 
 
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_sparse_attention_topk
+@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn"), reason=test_backend.skip_reason("minimax_m3_sparse_attn"))
 def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
     """Invalid lanes must lose even when every valid score is negative infinity."""
     num_score_blocks = 96
@@ -651,12 +659,12 @@ def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
     score = torch.full(
         (1, 1, num_score_blocks),
         -float("inf"),
-        device="cuda",
+        device=test_backend.device,
         dtype=torch.float32,
     )
-    cu_seqlens_q = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 1], device=test_backend.device, dtype=torch.int32)
     prefix_lens = torch.tensor(
-        [(valid_blocks - 1) * BLOCK], device="cuda", dtype=torch.int32
+        [(valid_blocks - 1) * BLOCK], device=test_backend.device, dtype=torch.int32
     )
 
     assert index_topk_module._select_prefill_topk_path(score, topk, 1) == "streaming"
@@ -669,9 +677,9 @@ def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
         0,
         0,
     )
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
-    expected = torch.arange(topk, device="cuda", dtype=torch.int32).view(1, 1, topk)
+    expected = torch.arange(topk, device=test_backend.device, dtype=torch.int32).view(1, 1, topk)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -680,22 +688,22 @@ def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
     reason="requires a backend with TLE radix top-k support",
 )
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_sparse_attention_topk
+@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn"), reason=test_backend.skip_reason("minimax_m3_sparse_attn"))
 def test_prefill_topk_radix_path() -> None:
     """Exercise the actual wide-row TLE path instead of accepting fallback."""
     num_score_blocks = 1024
     topk = 16
-    generator = torch.Generator(device="cuda")
+    generator = torch.Generator(device=test_backend.device)
     generator.manual_seed(123)
     score = torch.randn(
         (1, 1, num_score_blocks),
         generator=generator,
-        device="cuda",
+        device=test_backend.device,
         dtype=torch.float32,
     )
-    cu_seqlens_q = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 1], device=test_backend.device, dtype=torch.int32)
     prefix_lens = torch.tensor(
-        [(num_score_blocks - 1) * BLOCK], device="cuda", dtype=torch.int32
+        [(num_score_blocks - 1) * BLOCK], device=test_backend.device, dtype=torch.int32
     )
     block_size_k, _ = index_topk_module._radix_prefill_launch_config(num_score_blocks)
     config_key = (block_size_k, topk)
@@ -711,7 +719,7 @@ def test_prefill_topk_radix_path() -> None:
         0,
         0,
     )
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     assert config_key not in index_topk_module._FAILED_RADIX_CONFIGS
     expected = torch.topk(score, topk, dim=-1).indices.to(torch.int32)
@@ -751,8 +759,8 @@ DECODE_K16_CASES = [
 @pytest.mark.parametrize(
     "case", PREFILL_CASES, ids=("boundary", "selection", "long_ragged")
 )
-@pytest.mark.minimax_sparse_attention_prefill
 @pytest.mark.minimax_m3_sparse_attn
+@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn"), reason=test_backend.skip_reason("minimax_m3_sparse_attn"))
 def test_prefill_bf16(case: tuple) -> None:
     _run_prefill(case, "bf16")
 
@@ -761,7 +769,7 @@ def test_prefill_bf16(case: tuple) -> None:
     "case", DECODE_CASES, ids=("boundary", "selection", "long_gqa")
 )
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_sparse_attention_decode
+@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn_decode"), reason=test_backend.skip_reason("minimax_m3_sparse_attn_decode"))
 def test_decode_bf16(case: tuple) -> None:
     _run_decode(case, "bf16")
 
@@ -770,7 +778,7 @@ def test_decode_bf16(case: tuple) -> None:
     "case", DECODE_SELECTION_CASES, ids=("split_k", "single_chunk")
 )
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_sparse_attention_decode
+@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn_decode"), reason=test_backend.skip_reason("minimax_m3_sparse_attn_decode"))
 def test_decode_topk_selection_bf16(case: tuple) -> None:
     """Cover N > K for both multi-chunk and single-chunk selection."""
     _run_decode(case, "bf16")
@@ -780,14 +788,14 @@ def test_decode_topk_selection_bf16(case: tuple) -> None:
     "case", DECODE_K16_CASES, ids=("identity_ragged", "spec_causal")
 )
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_sparse_attention_decode
+@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn_decode"), reason=test_backend.skip_reason("minimax_m3_sparse_attn_decode"))
 def test_decode_topk_k16_bf16(case: tuple) -> None:
     """Cover the configured K=16 Identity and causal selection paths."""
     _run_decode(case, "bf16")
 
 
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_sparse_attention_decode
+@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn_decode"), reason=test_backend.skip_reason("minimax_m3_sparse_attn_decode"))
 def test_decode_topk_identity_out_and_score_out_bf16() -> None:
     """Identity must preserve out aliasing and populate an explicit score buffer."""
     seq_lens = (2048, 1025)
@@ -807,13 +815,13 @@ def test_decode_topk_identity_out_and_score_out_bf16() -> None:
     out = torch.full(
         (num_kv_heads, total_q + 1, topk),
         -2,
-        device="cuda",
+        device=test_backend.device,
         dtype=torch.int32,
     )
     score_out = torch.full(
         (num_kv_heads, total_q, max_blocks),
         float("nan"),
-        device="cuda",
+        device=test_backend.device,
         dtype=torch.float32,
     )
 
@@ -832,7 +840,7 @@ def test_decode_topk_identity_out_and_score_out_bf16() -> None:
         out=out,
         score_out=score_out,
     )
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     expected = _ref_decode_index(data, topk, 1, 2, decode_qlen)
     _assert_topk_match(actual, expected, data, topk, decode=True)
@@ -848,23 +856,23 @@ def test_decode_topk_identity_out_and_score_out_bf16() -> None:
 
 @pytest.mark.skipif(
     not _supports_fp8(),
-    reason="FP8 tests require an NVIDIA GPU with FP8 support",
+    reason="FP8 tests require accelerator FP8 support",
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
 @pytest.mark.parametrize("case", PREFILL_CASES[:2], ids=("boundary", "selection"))
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_sparse_attention_prefill
+@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn"), reason=test_backend.skip_reason("minimax_m3_sparse_attn"))
 def test_prefill_fp8(mode: str, case: tuple) -> None:
     _run_prefill(case, mode)
 
 
 @pytest.mark.skipif(
     not _supports_fp8(),
-    reason="FP8 tests require an NVIDIA GPU with FP8 support",
+    reason="FP8 tests require accelerator FP8 support",
 )
 @pytest.mark.parametrize("mode", ("fp8_index", "fp8_kv", "fp8_full"))
 @pytest.mark.parametrize("case", DECODE_CASES[:2], ids=("boundary", "selection"))
 @pytest.mark.minimax_m3_sparse_attn
-@pytest.mark.minimax_sparse_attention_decode
+@pytest.mark.skipif(not test_backend.supports_operator("minimax_m3_sparse_attn_decode"), reason=test_backend.skip_reason("minimax_m3_sparse_attn_decode"))
 def test_decode_fp8(mode: str, case: tuple) -> None:
     _run_decode(case, mode)

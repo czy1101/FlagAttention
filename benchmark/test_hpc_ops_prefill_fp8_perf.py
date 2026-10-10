@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
 from dataclasses import dataclass
 from importlib import import_module
@@ -23,11 +24,12 @@ import torch
 bsa_ops = import_module(
     "flag_attn.hpc_ops_attention.prefill.attention_blocksparse_prefill_fp8"
 )
-attention_with_kvcache_blocksparse_prefill_fp8 = (
-    bsa_ops.attention_with_kvcache_blocksparse_prefill_fp8
-)
+from flag_attn.testing import backend as test_backend
+from flag_attn import hy3_attention
 
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("hpc is an optional NVIDIA comparison")
     import hpc
 except (ImportError, OSError, RuntimeError) as exc:
     # hpc-ops is an optional CUDA baseline.  Its absence must not suppress the
@@ -215,8 +217,8 @@ def _make_block_mask(q_len, kv_len, masked, device):
 
 def _make_inputs(q_len, kv_len, quant_type, masked, kv_layout):
     torch.manual_seed(SEED)
-    torch.cuda.manual_seed(SEED)
-    device = torch.device("cuda")
+    torch.manual_seed(SEED)
+    device = torch.device(test_backend.device)
     fp8 = torch.float8_e4m3fn
     requested_pages = math.ceil(kv_len / PAGE_SIZE)
     physical_pages = max(requested_pages * 2, requested_pages + 8)
@@ -299,35 +301,37 @@ def _requested_count(request, option, default):
 
 def _selected_flagattention_impl():
     has_tle = bool(getattr(bsa_ops, "_HAS_TLE_HOPPER", False))
-    if has_tle and torch.cuda.get_device_capability() == (9, 0):
+    if has_tle and test_backend.cuda_capability() == (9, 0):
         return "TLE"
     return "Triton"
 
 
 def _bench_cuda_graph(call_fn, warmup, repetitions):
     """Measure CUDA Graph replay with CUDA events, matching hpc-ops-sc."""
+    if not test_backend.graph_available() or not hasattr(test_backend.device_fn, "Event"):
+        return test_backend.do_bench(call_fn, warmup=warmup, rep=repetitions, return_mode="median")
     # Compile/autotune and initialize both provider dispatch paths before
     # capture.  None of this host-side setup belongs to kernel timing.
     call_fn()
     for _ in range(warmup):
         call_fn()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
-    capture_stream = torch.cuda.Stream()
-    capture_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(capture_stream):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=capture_stream):
+    capture_stream = test_backend.device_fn.Stream()
+    capture_stream.wait_stream(test_backend.device_fn.current_stream())
+    with test_backend.device_fn.stream(capture_stream):
+        graph = test_backend.device_fn.CUDAGraph()
+        with test_backend.device_fn.graph(graph, stream=capture_stream):
             call_fn()
-    torch.cuda.current_stream().wait_stream(capture_stream)
+    test_backend.device_fn.current_stream().wait_stream(capture_stream)
     for _ in range(warmup):
         graph.replay()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
 
     events = [
         (
-            torch.cuda.Event(enable_timing=True),
-            torch.cuda.Event(enable_timing=True),
+            test_backend.device_fn.Event(enable_timing=True),
+            test_backend.device_fn.Event(enable_timing=True),
         )
         for _ in range(repetitions)
     ]
@@ -335,12 +339,12 @@ def _bench_cuda_graph(call_fn, warmup, repetitions):
         start.record()
         graph.replay()
         end.record()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     return float(median(start.elapsed_time(end) for start, end in events))
 
 
-@pytest.mark.attention_with_kvcache_blocksparse_prefill_fp8
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.hy3_attention
+@pytest.mark.skipif(not test_backend.supports_operator("hy3_attention"), reason=test_backend.skip_reason("hy3_attention"))
 @pytest.mark.parametrize("q_len,kv_len", CASES)
 @pytest.mark.parametrize("quant_type", [0, 1])
 @pytest.mark.parametrize("masked", [False, True])
@@ -357,7 +361,7 @@ def test_attention_blocksparse_prefill_fp8_perf(
     flagattention_output = torch.empty_like(inputs.q, dtype=torch.bfloat16)
 
     def run_flagattention():
-        return attention_with_kvcache_blocksparse_prefill_fp8(
+        return hy3_attention(
             inputs.q,
             inputs.k_cache,
             inputs.v_cache,

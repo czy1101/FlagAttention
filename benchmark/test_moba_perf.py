@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from itertools import accumulate
 
 import pytest
 import torch
 import triton
 
-from flag_attn.FLA.moba.parallel import parallel_moba
+from flag_attn.testing import backend as test_backend
+from flag_attn import parallel_moba
 from flag_attn.FLA.moba.routing import (
     _build_dense_chunk_metadata_triton,
     _compute_dense_chunk_means_triton,
@@ -26,6 +28,8 @@ from flag_attn.FLA.moba.routing import (
 )
 
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("CUDA comparison is unavailable on the selected backend")
     from flash_moba import flash_moba_varlen_func
     from flash_moba.flash_moba_interface import (
         flash_moba_gpu,
@@ -61,7 +65,7 @@ def generate_data(seq_lens, num_heads, head_dim, dtype):
         raise ValueError(f"seq_lens must contain positive lengths, got {seq_lens}")
 
     torch.manual_seed(42)
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
     total_tokens = sum(seq_lens)
     shape = (total_tokens, num_heads, head_dim)
     q = torch.randn(shape, dtype=dtype, device=device)
@@ -85,7 +89,7 @@ def _validate_routing_contract():
     sets and the number of valid routes to match exactly for every query/head.
     """
     seq_lens, num_heads, head_dim, chunk_size, topk, dtype = BENCHMARK_CASES[0]
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
     total_tokens = sum(seq_lens)
     batch_size = len(seq_lens)
     max_seqlen = max(seq_lens)
@@ -217,7 +221,7 @@ def benchmark_kernel(func, args):
     def run():
         return func(*args)
 
-    return triton.testing.do_bench(
+    return test_backend.do_bench(
         run,
         warmup=WARMUP_MS,
         rep=REPETITION_MS,
@@ -239,20 +243,22 @@ def _format_shape(seq_lens, num_heads, head_dim, chunk_size, topk, dtype):
 
 def _print_results(results):
     print(f"\n{'=' * TABLE_WIDTH}")
-    print("MoBA benchmark: Triton MoBA vs FlashMoBA CUDA")
-    print(f"device: {torch.cuda.get_device_name()}")
+    print("MoBA benchmark: FlagAttention with optional FlashMoBA comparison")
+    print(f"device: {test_backend.get_device_name()}")
     print(f"timing: warmup={WARMUP_MS}ms  rep={REPETITION_MS}ms")
     print(f"{'-' * TABLE_WIDTH}")
     print(
-        f"{'Shape':<38} {'Tri ms':>8} {'CUDA ms':>7} {'Speedup':>8}"
+        f"{'Shape':<38} {'Flag ms':>8} {'CUDA ms':>7} {'Speedup':>8}"
     )
     print(f"{'-' * TABLE_WIDTH}")
 
     for shape, triton_ms, cuda_ms in results:
-        triton_speedup = cuda_ms / triton_ms
+        triton_speedup = None if cuda_ms is None else cuda_ms / triton_ms
+        cuda_text = "N/A" if cuda_ms is None else f"{cuda_ms:.3f}"
+        speedup_text = "N/A" if triton_speedup is None else f"{triton_speedup:.2f}x"
         print(
-            f"{shape:<38} {triton_ms:>8.3f} {cuda_ms:>7.3f} "
-            f"{triton_speedup:>7.2f}x"
+            f"{shape:<38} {triton_ms:>8.3f} {cuda_text:>7} "
+            f"{speedup_text:>8}"
         )
 
     print(f"{'-' * TABLE_WIDTH}")
@@ -262,12 +268,13 @@ def _print_results(results):
 
 @pytest.mark.parallel_moba
 def test_attn_varlen_moba_speed():
-    if not torch.cuda.is_available():
-        pytest.skip("MoBA benchmark requires CUDA")
-    if flash_moba_varlen_func is None:
-        pytest.skip("FlashMoBA is required for the CUDA comparison")
-
-    _validate_routing_contract()
+    if not test_backend.supports_operator("parallel_moba"):
+        pytest.skip("MoBA benchmark requires an available accelerator")
+    compare_flash = test_backend.is_nvidia() and flash_moba_varlen_func is not None
+    if compare_flash:
+        _validate_routing_contract()
+    else:
+        print("FlashMoBA comparison unavailable; measuring FlagAttention only")
 
     results = []
     for (
@@ -299,21 +306,24 @@ def test_attn_varlen_moba_speed():
         # a handful of queries to different chunks and inflate max error.
         with torch.no_grad():
             triton_output = _triton_moba(*args)
-            cuda_output = _flash_moba(*args)
-            assert triton_output.shape == cuda_output.shape == q.shape
-            assert triton_output.dtype == cuda_output.dtype == dtype
+            assert triton_output.shape == q.shape
+            assert triton_output.dtype == dtype
             assert torch.isfinite(triton_output).all()
-            assert torch.isfinite(cuda_output).all()
-            mean_abs_diff = (
-                (triton_output.float() - cuda_output.float()).abs().mean().item()
-            )
-        assert mean_abs_diff < MAX_MEAN_ABS_DIFF, (
-            f"{shape}: mean absolute difference {mean_abs_diff:.3e} exceeds "
-            f"{MAX_MEAN_ABS_DIFF:.1e}"
-        )
+            if compare_flash:
+                cuda_output = _flash_moba(*args)
+                assert cuda_output.shape == q.shape
+                assert cuda_output.dtype == dtype
+                assert torch.isfinite(cuda_output).all()
+                mean_abs_diff = (
+                    (triton_output.float() - cuda_output.float()).abs().mean().item()
+                )
+                assert mean_abs_diff < MAX_MEAN_ABS_DIFF, (
+                    f"{shape}: mean absolute difference {mean_abs_diff:.3e} exceeds "
+                    f"{MAX_MEAN_ABS_DIFF:.1e}"
+                )
 
         triton_ms = benchmark_kernel(_triton_moba, args)
-        cuda_ms = benchmark_kernel(_flash_moba, args)
+        cuda_ms = benchmark_kernel(_flash_moba, args) if compare_flash else None
         results.append((shape, triton_ms, cuda_ms))
 
     _print_results(results)

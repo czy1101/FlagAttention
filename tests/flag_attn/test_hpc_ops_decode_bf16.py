@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+
 import math
 import sys
 from collections.abc import Callable
@@ -32,6 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
+from flag_attn.testing import backend as test_backend
 from flag_attn.hpc_ops_attention.decode import HAS_TLE  # noqa: E402
 from flag_attn.hpc_ops_attention.decode.dynamic import (  # noqa: E402
     bf16_dynamic,
@@ -42,6 +44,8 @@ SUPPORTED_TEST_MTP = (1, 2, 3) if HAS_TLE else (1,)
 from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
     bf16_static,
 )
+from flag_attn import hy3_attention
+from functools import partial
 
 
 BLOCK_SIZE = bf16_static.BLOCK_SIZE
@@ -68,12 +72,12 @@ _IMPLEMENTATIONS = {
     "static": _DecodeImplementation(
         bf16_static.StaticBF16Inputs,
         bf16_static.prepare_static_bf16_workspace,
-        bf16_static.attention_decode_bf16_static,
+        partial(hy3_attention, stage="decode", variant="bf16_static"),
     ),
     "dynamic": _DecodeImplementation(
         bf16_dynamic.DynamicBF16Inputs,
         bf16_dynamic.prepare_dynamic_bf16_workspace,
-        bf16_dynamic.attention_decode_bf16_dynamic,
+        partial(hy3_attention, stage="decode", variant="bf16_dynamic"),
     ),
 }
 
@@ -107,25 +111,25 @@ def _make_inputs(
 ) -> _Panel:
     """Reproduce the official BF16 test's random-number call order."""
     torch.manual_seed(41)
-    torch.cuda.manual_seed(41)
+    torch.manual_seed(41)
 
     q = torch.randn(
         (num_batch * num_seq_q, num_head_q, HEAD_DIM),
         dtype=torch.bfloat16,
-        device="cuda",
+        device=test_backend.device,
     ) / math.sqrt(HEAD_DIM)
     new_k = torch.randn(
         (num_batch * num_seq_q, num_head_kv, HEAD_DIM),
         dtype=torch.bfloat16,
-        device="cuda",
+        device=test_backend.device,
     ) / math.sqrt(HEAD_DIM)
     new_v = torch.randn(
         (num_batch * num_seq_q, num_head_kv, HEAD_DIM),
         dtype=torch.bfloat16,
-        device="cuda",
+        device=test_backend.device,
     )
     history = torch.randint(
-        1, max_seq_kv, (num_batch,), dtype=torch.int32, device="cuda",
+        1, max_seq_kv, (num_batch,), dtype=torch.int32, device=test_backend.device,
     )
     kv_lens = history + num_seq_q
     block_counts = (
@@ -136,7 +140,7 @@ def _make_inputs(
     storage = torch.randn(
         (max_num_blocks, 2, BLOCK_SIZE, num_head_kv, HEAD_DIM),
         dtype=torch.bfloat16,
-        device="cuda",
+        device=test_backend.device,
     )
     if kvcache_shape == "HND":
         storage = (
@@ -145,12 +149,12 @@ def _make_inputs(
             .permute(0, 1, 3, 2, 4)
         )
     packed_ids = torch.randperm(max_num_blocks)[:total_blocks].to(
-        dtype=torch.int32, device="cuda",
+        dtype=torch.int32, device=test_backend.device,
     )
     block_ids = torch.empty(
         (num_batch, int(block_counts.max().item())),
         dtype=torch.int32,
-        device="cuda",
+        device=test_backend.device,
     )
     new_k = new_k.reshape(
         num_batch, num_seq_q, num_head_kv, HEAD_DIM,
@@ -226,11 +230,9 @@ def _pytorch_reference(panel: _Panel, num_seq_q: int) -> torch.Tensor:
     return output.reshape_as(panel.q)
 
 
-@pytest.mark.attention_decode_bf16_static
-@pytest.mark.attention_decode_bf16_dynamic
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] < 9,
+    not (test_backend.supports_operator("hy3_attention_decode_bf16_static", min_sm=(9, 0))
+         or test_backend.supports_operator("hy3_attention_decode_bf16_dynamic", min_sm=(9, 0))),
     reason="BF16 decode validation requires Hopper",
 )
 @pytest.mark.parametrize("num_batch", [1, 16, 200])
@@ -244,6 +246,7 @@ def _pytorch_reference(panel: _Panel, num_seq_q: int) -> torch.Tensor:
 @pytest.mark.parametrize("new_kv_included", [True])
 @pytest.mark.parametrize("use_output", [False])
 @pytest.mark.parametrize("splitk", [True])
+@pytest.mark.hy3_attention
 @pytest.mark.parametrize("use_dynamic_sched", [False, True])
 @pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
 @torch.no_grad()
@@ -260,8 +263,11 @@ def test_attn_bf16_sm90(
     use_dynamic_sched: bool,
     kvcache_shape: str,
 ):
+    variant = "bf16_dynamic" if use_dynamic_sched else "bf16_static"
+    if not test_backend.supports_operator(f"hy3_attention_decode_{variant}", min_sm=(9, 0)):
+        pytest.skip("selected Hy3 decode variant is unavailable on this device")
     triton.set_allocator(lambda size, _align, _stream: torch.empty(
-        size, dtype=torch.int8, device="cuda",
+        size, dtype=torch.int8, device=test_backend.device,
     ))
     assert block_size == BLOCK_SIZE
     assert head_dim == HEAD_DIM
@@ -286,5 +292,5 @@ def test_attn_bf16_sm90(
 
     actual = actual.detach().clone()
     expected = _pytorch_reference(panel, num_seq_q)
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     torch.testing.assert_close(actual, expected, atol=0.016, rtol=1e-5)

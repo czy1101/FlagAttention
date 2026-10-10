@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from collections.abc import Callable
 
 import pytest
@@ -24,7 +25,8 @@ try:
 except ModuleNotFoundError:  # Direct script execution.
     from recording import BenchmarkRecorder
 
-from flag_attn.FLA.gated_linear_attention import chunk_gla as flag_attn_chunk_gla
+from flag_attn.testing import backend as test_backend
+from flag_attn import chunk_gla as flag_attn_chunk_gla
 
 DEFAULT_WARMUP = 10
 DEFAULT_REP = 20
@@ -34,6 +36,8 @@ _HAS_FLA_CHUNK = False
 _fla_chunk_gla = None
 
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("external FLA CUDA comparison unavailable")
     from fla.ops.gla import chunk_gla as _fla_chunk_gla
 
     _HAS_FLA_CHUNK = True
@@ -55,11 +59,10 @@ def _fla_chunk_wrapper(q, k, v, g, **kwargs):
     )
 
 
-
 def _bench_ms(fn, warmup: int, rep: int) -> float:
     # do_bench performs an untimed first call and warmup before recording events,
     # so JIT/autotune work is excluded from the reported steady-state latency.
-    return triton.testing.do_bench(
+    return test_backend.do_bench(
         fn,
         warmup=warmup,
         rep=rep,
@@ -68,7 +71,7 @@ def _bench_ms(fn, warmup: int, rep: int) -> float:
 
 
 def _build_inputs(B, T, H, D, dtype, requires_grad=False):
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
     q = torch.randn(B, T, H, D, device=device, dtype=dtype, requires_grad=requires_grad)
     k = torch.randn(B, T, H, D, device=device, dtype=dtype, requires_grad=requires_grad)
     v = torch.randn(B, T, H, D, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -115,7 +118,7 @@ def _bench_fwd_bwd_ms(fn, q, k, v, g_logit, kwargs, warmup: int, rep: int) -> fl
         loss = out.sum()
         loss.backward()
 
-    return triton.testing.do_bench(
+    return test_backend.do_bench(
         _fwd_bwd,
         warmup=warmup,
         rep=rep,
@@ -180,8 +183,8 @@ def run_benchmark(
     rep: int = DEFAULT_REP,
     record_property: Callable[[str, object], None] | None = None,
 ) -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("chunk_gla benchmark requires CUDA")
+    if not test_backend.supports_operator("chunk_gla"):
+        raise RuntimeError("chunk_gla benchmark requires an available accelerator")
 
     # ============================================================
     # Part 1: forward only
@@ -282,11 +285,7 @@ def run_benchmark(
 
 @pytest.mark.chunk_gla
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="chunk_gla benchmark requires CUDA"
+    not test_backend.supports_operator("chunk_gla"), reason=test_backend.skip_reason("chunk_gla")
 )
 def test_chunk_gla_benchmark(record_property) -> None:
     run_benchmark(record_property=record_property)
-
-
-if __name__ == "__main__":
-    run_benchmark()

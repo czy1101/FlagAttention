@@ -21,11 +21,13 @@ Only unavailable hardware or the optional TLE dependency cause skips.
 
 from __future__ import annotations
 
+
 from functools import partial
 
 import pytest
 import torch
 
+from flag_attn.testing import backend as test_backend
 from flag_attn import inkling_fa4_rel_attention
 from flag_attn.inkling_fa4 import tle_available
 from flag_attn.testing.inkling_fa4 import ref_rel_attn
@@ -38,7 +40,7 @@ BACKENDS = ("triton", "tle")
 
 pytestmark = [
     pytest.mark.inkling_fa4_rel_attention,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    pytest.mark.skipif(not test_backend.supports_operator("inkling_fa4_rel_attention"), reason=test_backend.skip_reason("inkling_fa4_rel_attention")),
 ]
 
 CASES = [
@@ -53,8 +55,8 @@ CASES = [
 
 @pytest.fixture(params=BACKENDS)
 def operator(request):
-    capability = torch.cuda.get_device_capability()
-    if capability < (8, 0):
+    capability = test_backend.cuda_capability()
+    if test_backend.is_nvidia() and capability < (8, 0):
         pytest.skip(f"Tensor Core tests require SM80+, got {capability}")
     if request.param == "tle":
         if capability[0] != 9:
@@ -79,7 +81,7 @@ def run_case(
     use_out: bool = True,
 ) -> None:
     torch.manual_seed(0)
-    device = "cuda"
+    device = test_backend.device
     q_lens = [ql for ql, _ in seq_lens]
     kv_lens = [kl for _, kl in seq_lens]
     total_q = sum(q_lens)

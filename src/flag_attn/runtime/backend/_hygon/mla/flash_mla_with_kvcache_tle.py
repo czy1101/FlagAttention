@@ -1133,9 +1133,10 @@ def _sparse_decode_dispatch(
     is_fp8_kvcache,
 ):
     """Launch sparse decode kernel."""
-    grid = lambda META: (
-        batch_size * seq_q * triton.cdiv(num_heads_q, META["BH"]),
-    )
+    def grid(META):
+        return (
+            batch_size * seq_q * triton.cdiv(num_heads_q, META["BH"]),
+        )
 
     skv = kv.shape[0] * page_block_size
 
@@ -1316,10 +1317,11 @@ def _dense_decode_dispatch(
         )
         return
 
-    grid = lambda META: (
-        triton.cdiv(num_heads_q, META["BLOCK_H"]),
-        batch_size * seq_q,
-    )
+    def grid(META):
+        return (
+            triton.cdiv(num_heads_q, META["BLOCK_H"]),
+            batch_size * seq_q,
+        )
 
     _dense_decode_kernel[grid](
         q,

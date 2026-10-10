@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+
 import logging
 import os
 import warnings
@@ -16,7 +17,8 @@ from itertools import accumulate
 import pytest
 import torch
 
-from flag_attn.FLA.parallax import parallel_parallax
+from flag_attn.testing import backend as test_backend
+from flag_attn import parallel_parallax
 
 
 DTYPES = (torch.float16, torch.bfloat16)
@@ -30,10 +32,11 @@ logger = logging.getLogger(__name__)
 
 
 def _cuda_available() -> bool:
-    return torch.cuda.is_available()
+    return test_backend.supports_operator("parallel_parallax")
 
 
 pytestmark = [
+    pytest.mark.parallel_parallax,
     pytest.mark.skipif(
         not _cuda_available(),
         reason="parallel_parallax tests require CUDA",
@@ -302,7 +305,7 @@ def _make_inputs(
 
     query_shape = (case.B, case.T, case.HQ, case.D)
     kv_shape = (case.B, case.T, case.H, case.D)
-    device = "cuda"
+    device = test_backend.device
     return (
         torch.randn(query_shape, dtype=dtype, device=device),
         torch.randn(query_shape, dtype=dtype, device=device),
@@ -410,7 +413,7 @@ def _make_cu_seqlens(
     return torch.tensor(
         (0, *accumulate(case.seq_lens)),
         dtype=torch.long,
-        device="cuda",
+        device=test_backend.device,
     )
 
 
@@ -439,7 +442,7 @@ def test_parallel_parallax_forward_backward(
     grad_output = torch.randn(
         (case.B, case.T, case.HQ, case.D),
         dtype=dtype,
-        device="cuda",
+        device=test_backend.device,
     )
 
     # Finish and release the much larger PyTorch reference graph before
@@ -517,7 +520,7 @@ def test_parallel_parallax_rejects_float32() -> None:
         torch.randn(
             (1, 8, 1, 64),
             dtype=torch.float32,
-            device="cuda",
+            device=test_backend.device,
         )
         for _ in range(4)
     )
@@ -530,14 +533,14 @@ def test_parallel_parallax_varlen_requires_batch_one() -> None:
         torch.randn(
             (2, 8, 1, 64),
             dtype=torch.bfloat16,
-            device="cuda",
+            device=test_backend.device,
         )
         for _ in range(4)
     )
     cu_seqlens = torch.tensor(
         [0, 8],
         dtype=torch.long,
-        device="cuda",
+        device=test_backend.device,
     )
     with pytest.raises(
         ValueError,

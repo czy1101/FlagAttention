@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+
 import gc
 import os
 from typing import Any, Generator
@@ -23,6 +24,7 @@ from typing import Any, Generator
 import pytest
 import torch
 import triton
+from flag_attn.testing import backend as test_backend
 
 try:
     from benchmark.recording import benchmark_metric, record_benchmark_result
@@ -98,7 +100,7 @@ class Benchmark:
     def get_latency(op, *args, **kwargs) -> float:
         warmup_ms = int(os.getenv("FLAG_ATTN_KDA_BENCH_WARMUP_MS", "100"))
         repetition_ms = int(os.getenv("FLAG_ATTN_KDA_BENCH_REP_MS", "500"))
-        return triton.testing.do_bench(
+        return test_backend.do_bench(
             lambda: op(*args, **kwargs),
             warmup=warmup_ms,
             rep=repetition_ms,

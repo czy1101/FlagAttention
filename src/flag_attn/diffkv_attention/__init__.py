@@ -15,15 +15,21 @@
 
 """DiffKV attention with standard Triton and optional TLE backends."""
 
-from .api import (
-    DEFAULT_LAYOUT,
-    DiffKVLayout,
-    OP_NAME,
-    diffkv_attention,
-    unified_attention_diffkv,
-    unified_attention_diffkv_fallback,
-    unified_attention_diffkv_tle,
-)
+from importlib import import_module
+
+from flag_attn.runtime.backend import resolve_operator
+
+
+def __getattr__(name: str):
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name == "diffkv_attention":
+        value = resolve_operator(name, "flag_attn.diffkv_attention.api")
+    else:
+        value = getattr(import_module("flag_attn.diffkv_attention.api"), name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "OP_NAME",

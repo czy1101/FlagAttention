@@ -16,4 +16,10 @@
 
 from flag_attn.FLA.log_linear_attn.chunk_tle import chunk_log_linear_attn
 
-__all__ = ["chunk_log_linear_attn"]
+log_linear_attn = chunk_log_linear_attn
+
+
+__all__ = [
+    "log_linear_attn",
+    "chunk_log_linear_attn",
+]

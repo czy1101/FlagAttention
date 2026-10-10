@@ -14,8 +14,9 @@
 
 """Gated delta rule speedup benchmark against the FLA implementation."""
 
+
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Callable
 
 import pytest
@@ -27,6 +28,7 @@ try:
 except ModuleNotFoundError:  # Direct script execution.
     from recording import BenchmarkRecorder
 
+from flag_attn.testing import backend as test_backend
 from flag_attn import chunk_gated_delta_rule
 from flag_attn.utils import has_triton_tle
 
@@ -63,7 +65,7 @@ FLA_CHUNK_GDN, FLA_IMPORT_ERROR = _load_fla_reference()
 
 
 def _cuda_tle_available() -> bool:
-    return torch.cuda.is_available() and has_triton_tle(3, 6, 0)
+    return test_backend.is_nvidia() and has_triton_tle(3, 6, 0)
 
 
 def _require_fla_reference():
@@ -99,11 +101,11 @@ def _use_optimized_tle():
 
 def _make_inputs(shape: tuple[int, int, int, int, int], dtype: torch.dtype):
     B, T, H, K, V = shape
-    q = torch.randn(B, T, H, K, device="cuda", dtype=dtype) / (K**0.5)
-    k = torch.randn(B, T, H, K, device="cuda", dtype=dtype) / (K**0.5)
-    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
-    g = (-torch.rand(B, T, H, device="cuda", dtype=torch.float32) * 0.1).to(dtype)
-    beta = torch.rand(B, T, H, device="cuda", dtype=dtype).sigmoid()
+    q = torch.randn(B, T, H, K, device=test_backend.device, dtype=dtype) / (K**0.5)
+    k = torch.randn(B, T, H, K, device=test_backend.device, dtype=dtype) / (K**0.5)
+    v = torch.randn(B, T, H, V, device=test_backend.device, dtype=dtype)
+    g = (-torch.rand(B, T, H, device=test_backend.device, dtype=torch.float32) * 0.1).to(dtype)
+    beta = torch.rand(B, T, H, device=test_backend.device, dtype=dtype).sigmoid()
     return q, k, v, g, beta, K**-0.5
 
 
@@ -160,24 +162,20 @@ def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
 def _benchmark_case(dtype: torch.dtype, shape: tuple[int, int, int, int, int]):
     torch.manual_seed(42)
     inputs = _make_inputs(shape, dtype)
-
-    expected_o, expected_final_state = _call_fla_reference(inputs)
-    fla_ms = triton.testing.do_bench(
-        lambda: _call_fla_reference(inputs),
-        warmup=WARMUP,
-        rep=REPETITIONS,
-        return_mode="median",
-    )
-    with _use_optimized_tle():
+    compare_fla = test_backend.is_nvidia() and FLA_CHUNK_GDN is not None
+    fla_ms = None
+    if compare_fla:
+        expected_o, expected_final_state = _call_fla_reference(inputs)
+        fla_ms = test_backend.do_bench(lambda: _call_fla_reference(inputs), warmup=WARMUP, rep=REPETITIONS, return_mode="median")
+    with _use_optimized_tle() if _cuda_tle_available() else nullcontext():
         actual_o, actual_final_state = _call_flag_attn(inputs)
-        _assert_close("o", actual_o, expected_o)
-        _assert_close("final_state", actual_final_state, expected_final_state)
-        flag_attn_ms = triton.testing.do_bench(
-            lambda: _call_flag_attn(inputs),
-            warmup=WARMUP,
-            rep=REPETITIONS,
-            return_mode="median",
-        )
+        if compare_fla:
+            _assert_close("o", actual_o, expected_o)
+            _assert_close("final_state", actual_final_state, expected_final_state)
+        else:
+            assert torch.isfinite(actual_o).all()
+            assert torch.isfinite(actual_final_state).all()
+        flag_attn_ms = test_backend.do_bench(lambda: _call_flag_attn(inputs), warmup=WARMUP, rep=REPETITIONS, return_mode="median")
     return fla_ms, flag_attn_ms
 
 
@@ -189,8 +187,8 @@ def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-def _speedup(fla_ms: float, flag_attn_ms: float) -> float:
-    return fla_ms / flag_attn_ms if flag_attn_ms > 0 else float("inf")
+def _speedup(fla_ms: float | None, flag_attn_ms: float):
+    return fla_ms / flag_attn_ms if fla_ms is not None and flag_attn_ms > 0 else None
 
 
 def _print_header() -> None:
@@ -208,18 +206,12 @@ def _print_header() -> None:
     )
 
 
-def _print_row(
-    dtype: torch.dtype,
-    shape: tuple[int, int, int, int, int],
-    fla_ms: float,
-    flag_attn_ms: float,
-) -> None:
+def _print_row(dtype, shape, fla_ms, flag_attn_ms) -> None:
     B, T, H, K, V = shape
-    speedup = _speedup(fla_ms, flag_attn_ms)
-    print(
-        f"{B:>3} {T:>6} {H:>4} {K:>4} {V:>4} {_dtype_name(dtype):>8} "
-        f"{fla_ms:>10.3f} {flag_attn_ms:>14.3f} {speedup:>14.2f}x"
-    )
+    baseline = "N/A" if fla_ms is None else f"{fla_ms:.3f}"
+    ratio = _speedup(fla_ms, flag_attn_ms)
+    speedup = "N/A" if ratio is None else f"{ratio:.2f}x"
+    print(f"{B:>3} {T:>6} {H:>4} {K:>4} {V:>4} {_dtype_name(dtype):>8} {baseline:>10} {flag_attn_ms:>14.3f} {speedup:>14}")
 
 
 def _print_footer() -> None:
@@ -244,14 +236,7 @@ def _record_result(
 
 
 @pytest.mark.chunk_gated_delta_rule
-@pytest.mark.chunk_gated_delta_rule_fwd
-@pytest.mark.skipif(
-    not _cuda_tle_available(), reason="GDN external benchmark requires CUDA/TLE"
-)
-@pytest.mark.skipif(
-    FLA_CHUNK_GDN is None,
-    reason=f"external FLA GDN implementation is unavailable: {FLA_IMPORT_ERROR}",
-)
+@pytest.mark.skipif(not test_backend.supports_operator("chunk_gated_delta_rule"), reason="requires an available accelerator")
 def test_chunk_gated_delta_rule_benchmark(
     record_property: Callable[[str, object], None],
 ) -> None:
@@ -261,15 +246,13 @@ def test_chunk_gated_delta_rule_benchmark(
 def run_benchmark(
     record_property: Callable[[str, object], None] | None = None,
 ) -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("GDN benchmark requires CUDA")
-    if not has_triton_tle(3, 6, 0):
-        raise RuntimeError("GDN benchmark requires a compatible Triton TLE build")
-    _require_fla_reference()
+    if not test_backend.is_available():
+        raise RuntimeError("GDN benchmark requires an available accelerator")
+    compare_fla = test_backend.is_nvidia() and FLA_CHUNK_GDN is not None
 
     if record_property is not None:
         record_property("scope", "operator_only")
-        record_property("baseline", "FLA")
+        record_property("baseline", "FLA" if compare_fla else None)
 
     _print_header()
     for dtype in DTYPES:
@@ -277,7 +260,7 @@ def run_benchmark(
             record_property,
             op_name="chunk_gated_delta_rule",
             dtype=str(dtype),
-            baseline="FLA",
+            baseline="FLA" if compare_fla else None,
             phase="forward",
         )
         print("\ndtype:", dtype)
@@ -292,10 +275,6 @@ def run_benchmark(
                 fla_ms,
                 flag_attn_ms,
             )
-            torch.cuda.empty_cache()
+            test_backend.device_fn.empty_cache()
         recorder.record()
     _print_footer()
-
-
-if __name__ == "__main__":
-    run_benchmark()

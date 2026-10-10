@@ -14,13 +14,34 @@
 
 """Parameterized local linear attention implemented with Triton kernels."""
 
+from typing import Literal
+
+from flag_attn.runtime.backend import resolve_operator
+
 from .decode import HAS_TLE, parallax_attn_with_kvcache, parallax_decode
 from .parallel import (
     ParallaxFunction,
-    parallel_parallax,
     parallel_parallax_bwd,
     parallel_parallax_fwd,
 )
+
+
+def parallel_parallax(*args, stage: Literal["prefill", "decode", "kvcache"] = "prefill", **kwargs):
+    """Run Parallax attention through a single public entry.
+
+    Arguments and return values follow parallel.parallel_parallax for
+    prefill (the default), parallax_decode for decode, and
+    parallax_attn_with_kvcache for KV-cache decode. Each interface retains
+    its original scale, window and output-buffer conventions.
+    """
+    if stage == "prefill":
+        return resolve_operator("parallel_parallax", "flag_attn.FLA.parallax.parallel")(*args, **kwargs)
+    if stage == "decode":
+        return resolve_operator("parallax_decode", "flag_attn.FLA.parallax.decode")(*args, **kwargs)
+    if stage == "kvcache":
+        return resolve_operator("parallax_attn_with_kvcache", "flag_attn.FLA.parallax.decode")(*args, **kwargs)
+    raise ValueError(f"Unsupported Parallax stage: {stage!r}; expected 'prefill', 'decode' or 'kvcache'")
+
 
 __all__ = [
     "HAS_TLE",

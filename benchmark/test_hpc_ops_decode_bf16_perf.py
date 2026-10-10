@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+
 import gc
 import math
 import statistics
@@ -33,9 +34,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
+from flag_attn.testing import backend as test_backend
 from flag_attn.hpc_ops_attention.decode.dynamic.bf16_dynamic import (  # noqa: E402
     DynamicBF16Inputs,
-    attention_decode_bf16_dynamic,
     bf16_dynamic_workspace_is_reset,
     prepare_dynamic_bf16_workspace,
 )
@@ -45,9 +46,9 @@ from flag_attn.hpc_ops_attention.decode.static.bf16_static import (  # noqa: E40
     HEAD_DIM,
     OFFICIAL_CASES,
     StaticBF16Inputs,
-    attention_decode_bf16_static,
     prepare_static_bf16_workspace,
 )
+from flag_attn import hy3_attention
 
 
 # Fixed pytest benchmark matrix.  Use pytest node IDs or ``-k`` to select a
@@ -77,6 +78,8 @@ class Panel:
 
 
 def _load_hpc():
+    if not test_backend.is_nvidia():
+        return None
     try:
         import hpc
         return hpc
@@ -138,8 +141,8 @@ def make_inputs(
     lengths, mtp: int, num_head_kv: int, num_head_q: int, layout: str,
 ) -> Panel:
     torch.manual_seed(41)
-    torch.cuda.manual_seed(41)
-    kv_lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    torch.manual_seed(41)
+    kv_lens = torch.tensor(lengths, device=test_backend.device, dtype=torch.int32)
     history = kv_lens - mtp
     if bool(torch.any(history < 0).item()):
         raise ValueError("every final KV length must be at least MTP")
@@ -148,20 +151,20 @@ def make_inputs(
     capacity = int(total_blocks * 1.2) + len(lengths) + 8
     q = torch.randn(
         (len(lengths) * mtp, num_head_q, HEAD_DIM),
-        device="cuda", dtype=torch.bfloat16,
+        device=test_backend.device, dtype=torch.bfloat16,
     ) / math.sqrt(HEAD_DIM)
     k = torch.randn(
         (capacity, BLOCK_SIZE, num_head_kv, HEAD_DIM),
-        device="cuda", dtype=torch.bfloat16,
+        device=test_backend.device, dtype=torch.bfloat16,
     ) / math.sqrt(HEAD_DIM)
     v = torch.randn(
         (capacity, BLOCK_SIZE, num_head_kv, HEAD_DIM),
-        device="cuda", dtype=torch.bfloat16,
+        device=test_backend.device, dtype=torch.bfloat16,
     )
-    packed = torch.randperm(capacity, device="cuda")[:total_blocks].int()
+    packed = torch.randperm(capacity, device=test_backend.device)[:total_blocks].int()
     block_ids = torch.empty(
         (len(lengths), int(block_counts.max().item())),
-        device="cuda", dtype=torch.int32,
+        device=test_backend.device, dtype=torch.int32,
     )
     cursor = 0
     for batch, count in enumerate(block_counts.cpu().tolist()):
@@ -201,30 +204,32 @@ def pytorch_reference(panel: Panel, mtp: int) -> torch.Tensor:
 
 
 def _bench_ms(call, warmup: int, iters: int, graph_mode: bool) -> float:
+    if not test_backend.graph_available() or not hasattr(test_backend.device_fn, "Event"):
+        return test_backend.do_bench(call, warmup=warmup, rep=iters, return_mode="median")
     for _ in range(warmup):
         call()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     if graph_mode:
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
+        stream = test_backend.device_fn.Stream()
+        stream.wait_stream(test_backend.device_fn.current_stream())
+        with test_backend.device_fn.stream(stream):
+            graph = test_backend.device_fn.CUDAGraph()
+            with test_backend.device_fn.graph(graph, stream=stream):
                 call()
-        torch.cuda.current_stream().wait_stream(stream)
+        test_backend.device_fn.current_stream().wait_stream(stream)
         for _ in range(warmup):
             graph.replay()
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         call = graph.replay
     events = [
-        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        (test_backend.device_fn.Event(enable_timing=True), test_backend.device_fn.Event(enable_timing=True))
         for _ in range(iters)
     ]
     for start, end in events:
         start.record()
         call()
         end.record()
-    torch.cuda.synchronize()
+    test_backend.device_fn.synchronize()
     samples = sorted(start.elapsed_time(end) for start, end in events)
     return samples[len(samples) // 2]
 
@@ -249,7 +254,7 @@ def _measure(calls, warmup, iters, repeat, graph_mode):
 @pytest.fixture(scope="module")
 def hpc_baseline():
     triton.set_allocator(lambda size, _align, _stream: torch.empty(
-        size, dtype=torch.int8, device="cuda",
+        size, dtype=torch.int8, device=test_backend.device,
     ))
     return _load_hpc()
 
@@ -321,14 +326,16 @@ def report_performance_results():
     _print_performance_table()
 
 
-@pytest.mark.attention_decode_bf16_static
-@pytest.mark.attention_decode_bf16_dynamic
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not test_backend.is_available(), reason="requires an available accelerator")
 @pytest.mark.parametrize("mtp", BENCH_MTP, ids=lambda value: f"mtp{value}")
 @pytest.mark.parametrize("case", BENCH_CASES)
+@pytest.mark.hy3_attention
 @pytest.mark.parametrize("method", BENCH_METHODS)
 @pytest.mark.parametrize("layout", BENCH_LAYOUTS)
 def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
+    variant = f"bf16_{method}"
+    if not test_backend.supports_operator(f"hy3_attention_decode_{variant}", min_sm=(9, 0)):
+        pytest.skip("selected Hy3 decode variant is unavailable on this device")
     if not HAS_TLE and mtp != 1:
         pytest.skip("pure Triton fallback supports MTP=1 only")
 
@@ -353,7 +360,7 @@ def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
                 output=cuda_out,
             )
         )
-        tle_call = lambda: attention_decode_bf16_static(inputs, workspace)
+        tle_call = lambda: hy3_attention(inputs, workspace, stage="decode", variant="bf16_static")
     else:
         inputs = DynamicBF16Inputs(
             panel.q, panel.k, panel.v, panel.block_ids, panel.kv_lens, layout,
@@ -375,11 +382,11 @@ def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
                 task_map=cuda_task_map, output=cuda_out,
             )
         )
-        tle_call = lambda: attention_decode_bf16_dynamic(inputs, workspace)
+        tle_call = lambda: hy3_attention(inputs, workspace, stage="decode", variant="bf16_dynamic")
 
     if BENCH_CHECK:
         actual = tle_call().detach().clone()
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         torch.testing.assert_close(actual, reference, atol=0.016, rtol=1e-5)
         assert torch.isfinite(actual).all()
         if cuda_call is not None:
@@ -409,4 +416,4 @@ def test_attention_decode_bf16_perf(hpc_baseline, mtp, case, method, layout):
 
     del panel, reference, inputs, workspace, cuda_out, cuda_task_map
     gc.collect()
-    torch.cuda.empty_cache()
+    test_backend.device_fn.empty_cache()

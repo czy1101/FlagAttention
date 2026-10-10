@@ -169,7 +169,6 @@ def _stage1_kernel(
     k1_len = k1_end - k1_start
     k2_len = k2_end - k2_start
     q_len = q_end - q_start
-    k_len = tl.load(cu_k_ptr + batch + 1) - tl.load(cu_k_ptr + batch)
     offs_q = tl.arange(0, block_q)
     q_local = q_local_start + offs_q
     q_index = q_start + q_local
@@ -339,11 +338,12 @@ def stage1(
             num_stages=2,
         )
         return out
-    grid = lambda meta: (
-        triton.cdiv(max_seqlen_q, meta["block_q"]),
-        hkv,
-        cu_seqlens_q.numel() - 1,
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(max_seqlen_q, meta["block_q"]),
+            hkv,
+            cu_seqlens_q.numel() - 1,
+        )
     _stage1_kernel[grid](
         q,
         k1,
@@ -1252,7 +1252,6 @@ def _stage1_tle_hopper_kernel(
     k1_len = k1_end - k1_start
     k2_len = k2_end - k2_start
     q_len = q_end - q_start
-    k_len = tl.load(cu_k_ptr + batch + 1) - tl.load(cu_k_ptr + batch)
 
     offs_q = tl.arange(0, block_q)
     offs_g = tl.arange(0, group)
@@ -1399,7 +1398,8 @@ def stage1_tle_hopper(
             k2[:, hk, :], shape=[total_k2, d], strides=[hkv * d, 1], block_shape=[128, d]
         )
         tune_key = triton.next_power_of_2(max_seqlen_q)
-        grid = lambda meta: (triton.cdiv(max_seqlen_q, meta["block_q"]), batch)
+        def grid(meta):
+            return (triton.cdiv(max_seqlen_q, meta["block_q"]), batch)
         _stage1_tle_hopper_kernel[grid](
             q[:, hk * group :, :], desc_k1, desc_k2, out[hk],
             cu_seqlens_q, cu_seqlens_k1, cu_seqlens_k2, cu_seqlens_k,

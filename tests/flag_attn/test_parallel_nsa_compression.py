@@ -17,20 +17,19 @@ import os
 import pytest
 import torch
 
-torch_gcu = pytest.importorskip("torch_gcu")
+from flag_attn import runtime
 
-from flag_attn.runtime.backend._enflame.FLA.nsa.parallel_nsa_compression import (
-    parallel_nsa_compression,
-)
+from flag_attn import parallel_nsa
 
 
 def _device():
+    if runtime.device.name == "cpu":
+        pytest.skip("NSA requires an accelerator")
     index = int(
         os.environ.get("S60_TEST_DEVICE", "0")
     )
-    torch.gcu.set_device(index)
-    return torch.device(f"gcu:{index}")
-
+    runtime.torch_device_fn.set_device(index)
+    return torch.device(f"{runtime.device.name}:{index}")
 
 
 def naive_nsa_compression_fwd(q, k, v, scale, block_size):
@@ -95,7 +94,7 @@ def naive_nsa_compression_fwd(q, k, v, scale, block_size):
     return o, lse
 
 
-@pytest.mark.parallel_nsa_compression
+@pytest.mark.parallel_nsa
 @pytest.mark.parametrize("B", [1])
 @pytest.mark.parametrize("T", [64, 128])
 @pytest.mark.parametrize("H", [4])
@@ -122,7 +121,8 @@ def test_parallel_nsa_compression_fwd_accuracy(B, T, H, HQ, K, V, block_size, dt
     ref_o, ref_lse = naive_nsa_compression_fwd(q, k, v, scale, block_size)
 
     # triton forward
-    res_o, res_lse = parallel_nsa_compression(
+    res_o, res_lse = parallel_nsa(
+        mode="compression",
         q=q,
         k=k,
         v=v,
@@ -135,7 +135,7 @@ def test_parallel_nsa_compression_fwd_accuracy(B, T, H, HQ, K, V, block_size, dt
     torch.testing.assert_close(res_lse.float(), ref_lse, rtol=1e-1, atol=2e-1)
 
 
-@pytest.mark.parallel_nsa_compression
+@pytest.mark.parallel_nsa
 @pytest.mark.parametrize("T", [128, 256])
 @pytest.mark.parametrize("block_size", [64])
 def test_parallel_nsa_compression_bwd_accuracy(T, block_size):
@@ -155,7 +155,8 @@ def test_parallel_nsa_compression_bwd_accuracy(T, block_size):
     if T % block_size != 0:
         pytest.skip("T must be a multiple of block_size")
 
-    o, lse = parallel_nsa_compression(
+    o, lse = parallel_nsa(
+        mode="compression",
         q=q,
         k=k,
         v=v,
@@ -176,7 +177,7 @@ def test_parallel_nsa_compression_bwd_accuracy(T, block_size):
     assert torch.isfinite(v.grad).all(), "dv has non-finite values"
 
 
-@pytest.mark.parallel_nsa_compression
+@pytest.mark.parallel_nsa
 @pytest.mark.parametrize("T", [64, 128])
 def test_parallel_nsa_compression_no_grad(T):
     """Test forward-only (no grad) path for various shapes."""
@@ -197,7 +198,8 @@ def test_parallel_nsa_compression_no_grad(T):
         pytest.skip("T must be a multiple of block_size")
 
     with torch.no_grad():
-        o, lse = parallel_nsa_compression(
+        o, lse = parallel_nsa(
+            mode="compression",
             q=q,
             k=k,
             v=v,

@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import torch
 import pytest
 import logging
 
+from flag_attn.testing import backend as test_backend
 import flag_attn
 
 torch.random.manual_seed(10086)
@@ -23,11 +25,11 @@ torch.random.manual_seed(10086)
 def max_diff(a, b):
     return (a - b).abs().max().item()
 
-@pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
+@pytest.mark.parametrize('device_id', list(range(test_backend.device_fn.device_count())))
 @pytest.mark.parametrize('scale', [1.0, 2.0, 3.0, 4.0])
 @pytest.mark.parametrize('B, H, M, N, D', [
     (2, 4, 512, 612, 128),
-    (2, 4, 1024, 1034, 64), 
+    (2, 4, 1024, 1034, 64),
     (2, 4, 2048, 2048, 32),
     (2, 4, 4096, 4096, 16),
     (2, 4, 4096, 4001, 16),
@@ -39,7 +41,7 @@ def max_diff(a, b):
 @pytest.mark.parametrize('stride_order', ['BHTD', 'BTHD'])
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 def test_attention_fwd(B, H, M, N, D, causal, stride_order, dtype, scale, device_id):
-    device = f"cuda:{device_id}"
+    device = f"{test_backend.device}:{device_id}"
     if stride_order == "BHTD":
         q1 = torch.empty((B, H, M, D), dtype=dtype, device=device).normal_(mean=0., std=scale)
         q2 = torch.empty((B, H, M, D), dtype=dtype, device=device).normal_(mean=0., std=scale)
@@ -65,12 +67,11 @@ def test_attention_fwd(B, H, M, N, D, causal, stride_order, dtype, scale, device
     # assert torch.testing.assert_close(o_hyp, o_ref)
 
 
-
-@pytest.mark.parametrize('device_id', list(range(torch.cuda.device_count())))
+@pytest.mark.parametrize('device_id', list(range(test_backend.device_fn.device_count())))
 @pytest.mark.parametrize('scale', [1.0, 2.0, 3.0, 4.0])
 @pytest.mark.parametrize('B, H, M, N, D', [
     (2, 4, 512, 612, 128),
-    (2, 4, 1024, 1034, 64), 
+    (2, 4, 1024, 1034, 64),
     (2, 4, 2048, 2048, 32),
     (2, 4, 4096, 4096, 16),
     (2, 4, 4096, 4001, 16),
@@ -82,7 +83,7 @@ def test_attention_fwd(B, H, M, N, D, causal, stride_order, dtype, scale, device
 @pytest.mark.parametrize('stride_order', ['BHTD', 'BTHD'])
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 def test_attention_bwd(B, H, M, N, D, causal, stride_order, dtype, scale, device_id):
-    device = f"cuda:{device_id}"
+    device = f"{test_backend.device}:{device_id}"
     if stride_order == "BHTD":
         q1 = torch.empty((B, H, M, D), dtype=dtype, device=device).normal_(mean=0., std=scale).requires_grad_()
         q2 = torch.empty((B, H, M, D), dtype=dtype, device=device).normal_(mean=0., std=scale).requires_grad_()
@@ -97,7 +98,7 @@ def test_attention_bwd(B, H, M, N, D, causal, stride_order, dtype, scale, device
         k2 = torch.empty((B, N, H, D), dtype=dtype, device=device).normal_(mean=0., std=scale).transpose(1, 2).requires_grad_()
         v = torch.empty((B, N, H, D), dtype=dtype, device=device).normal_(mean=0., std=scale).transpose(1, 2).requires_grad_()
         do = torch.empty((B, M, H, D), dtype=dtype, device=device).normal_(mean=0., std=scale).transpose(1, 2)
-    
+
     w = (M // 2) if M < N else (M - N // 2)
 
     o_ref = flag_attn.testing.piecewise_attention(q1, k1, q2, k2, v, w, causal=causal, upcast=True)

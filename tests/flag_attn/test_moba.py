@@ -1,12 +1,14 @@
 """Correctness tests for the Triton MoBA implementation."""
 
+
 from itertools import accumulate
 
 import pytest
 import torch
 
+from flag_attn.testing import backend as test_backend
 from flag_attn.FLA.moba.naive_moba import moba_attn_varlen_naive
-from flag_attn.FLA.moba.parallel import parallel_moba
+from flag_attn import parallel_moba
 from flag_attn.FLA.moba.routing import (
     _compute_chunk_means_triton,
     _compute_selected_chunks_streaming_triton,
@@ -16,6 +18,8 @@ from flag_attn.FLA.moba.routing import (
 )
 
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("CUDA comparison is unavailable on the selected backend")
     from flash_moba import flash_moba_varlen_func
 except ImportError:
     flash_moba_varlen_func = None
@@ -24,8 +28,8 @@ except ImportError:
 pytestmark = [
     pytest.mark.parallel_moba,
     pytest.mark.skipif(
-        not torch.cuda.is_available(),
-        reason="Triton MoBA requires CUDA",
+        not test_backend.supports_operator("parallel_moba"),
+        reason=test_backend.skip_reason("parallel_moba"),
     ),
 ]
 
@@ -76,25 +80,25 @@ def generate_data(seq_lens, num_q_heads, num_kv_heads, head_dim, dtype):
     total_tokens = sum(seq_lens)
     q = torch.randn(
         (total_tokens, num_q_heads, head_dim),
-        device="cuda",
+        device=test_backend.device,
         dtype=dtype,
         requires_grad=True,
     )
     k = torch.randn(
         (total_tokens, num_kv_heads, head_dim),
-        device="cuda",
+        device=test_backend.device,
         dtype=dtype,
         requires_grad=True,
     )
     v = torch.randn(
         (total_tokens, num_kv_heads, head_dim),
-        device="cuda",
+        device=test_backend.device,
         dtype=dtype,
         requires_grad=True,
     )
     cu_seqlens = torch.tensor(
         [0, *accumulate(seq_lens)],
-        device="cuda",
+        device=test_backend.device,
         dtype=torch.int32,
     )
     return q, k, v, cu_seqlens, max(seq_lens)
@@ -195,6 +199,7 @@ def test_inference_path_matches_autograd_path(
     )
 
 
+@pytest.mark.skipif(not test_backend.graph_available(), reason="backend does not expose CUDA-compatible graph capture")
 def test_inference_path_is_cuda_graph_capturable():
     q, k, v, cu_seqlens, max_seqlen = generate_data(
         (384,), 4, 2, 64, torch.bfloat16
@@ -204,28 +209,28 @@ def test_inference_path_is_cuda_graph_capturable():
             eager = parallel_moba(
                 q, k, v, cu_seqlens, max_seqlen, 128, 2
             )
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        test_backend.device_fn.synchronize()
+        graph = test_backend.device_fn.CUDAGraph()
+        with test_backend.device_fn.graph(graph):
             captured = parallel_moba(
                 q, k, v, cu_seqlens, max_seqlen, 128, 2
             )
         graph.replay()
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
     torch.testing.assert_close(captured, eager, atol=4e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("num_experts", [1, 1024, 1025, 65537, 131072])
 @torch.no_grad()
 def test_hierarchical_exclusive_prefix_sum(num_experts):
-    counts = (torch.arange(num_experts, device="cuda") % 7).to(torch.int32)
+    counts = (torch.arange(num_experts, device=test_backend.device) % 7).to(torch.int32)
     offsets = torch.empty(
-        (num_experts + 1,), device="cuda", dtype=torch.int32
+        (num_experts + 1,), device=test_backend.device, dtype=torch.int32
     )
     _exclusive_prefix_sum_triton(counts, offsets)
     expected = torch.cat(
         [
-            torch.zeros((1,), device="cuda", dtype=torch.int32),
+            torch.zeros((1,), device=test_backend.device, dtype=torch.int32),
             torch.cumsum(counts, dim=0, dtype=torch.int32),
         ]
     )
@@ -386,16 +391,16 @@ def test_moba_rejects_invalid_configuration():
         parallel_moba(q, k, v, cu_seqlens, 64, 128, 1)
 
     with pytest.raises(ValueError, match="start at 0"):
-        bad_start = torch.tensor([1, 128], device="cuda", dtype=torch.int32)
+        bad_start = torch.tensor([1, 128], device=test_backend.device, dtype=torch.int32)
         parallel_moba(q, k, v, bad_start, max_seqlen, 128, 1)
 
     with pytest.raises(ValueError, match="packed token count"):
-        bad_end = torch.tensor([0, 127], device="cuda", dtype=torch.int32)
+        bad_end = torch.tensor([0, 127], device=test_backend.device, dtype=torch.int32)
         parallel_moba(q, k, v, bad_end, max_seqlen, 128, 1)
 
     with pytest.raises(ValueError, match="non-empty increasing"):
         empty_sequence = torch.tensor(
-            [0, 0, 128], device="cuda", dtype=torch.int32
+            [0, 0, 128], device=test_backend.device, dtype=torch.int32
         )
         parallel_moba(
             q, k, v, empty_sequence, max_seqlen, 128, 1
@@ -491,14 +496,14 @@ def test_noncontiguous_inputs_match_naive():
     def make_input():
         base = torch.randn(
             (seqlen, heads, head_dim * 2),
-            device="cuda",
+            device=test_backend.device,
             dtype=torch.float16,
         )
         return base[..., ::2].detach().requires_grad_(True)
 
     q, k, v = make_input(), make_input(), make_input()
     assert not q.is_contiguous()
-    cu_seqlens = torch.tensor([0, seqlen], device="cuda", dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, seqlen], device=test_backend.device, dtype=torch.int32)
     output = parallel_moba(q, k, v, cu_seqlens, seqlen, 96, 3)
     reference = moba_attn_varlen_naive(q, k, v, cu_seqlens, seqlen, 96, 3)
     output_grad = torch.randn_like(output)
@@ -597,10 +602,10 @@ def test_streaming_topk_across_chunk_tiles(routed_topk):
     seqlen = 32768
     chunk_size = 128
     head_dim = 64
-    q = torch.ones((seqlen, 1, head_dim), device="cuda", dtype=torch.bfloat16)
-    token_chunk = torch.arange(seqlen, device="cuda") // chunk_size + 1
+    q = torch.ones((seqlen, 1, head_dim), device=test_backend.device, dtype=torch.bfloat16)
+    token_chunk = torch.arange(seqlen, device=test_backend.device) // chunk_size + 1
     k = token_chunk[:, None, None].expand(-1, 1, head_dim).to(torch.bfloat16)
-    cu_seqlens = torch.tensor([0, seqlen], device="cuda", dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, seqlen], device=test_backend.device, dtype=torch.int32)
 
     cu_chunk, filtered_indices, num_filtered, _ = calc_chunks(
         cu_seqlens,

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import datetime
 import logging
 import math
@@ -19,6 +20,7 @@ import pathlib
 import torch
 import triton
 
+from flag_attn.testing import backend as test_backend
 import flag_attn
 
 try:
@@ -28,10 +30,14 @@ except ModuleNotFoundError:  # Direct execution from the benchmark directory.
 
 
 try:
+    if not test_backend.is_nvidia():
+        raise ImportError("CUDA comparison is unavailable on the selected backend")
     from flash_attn import flash_attn_func
     FLASH_VER = 2
 except BaseException:
     try:
+        if not test_backend.is_nvidia():
+            raise ImportError("CUDA comparison is unavailable on the selected backend")
         from flash_attn.flash_attn_interface import flash_attn_func
         FLASH_VER = 1
     except BaseException:
@@ -58,27 +64,27 @@ def bench_flash_attention(N_CTX, D_HEAD, provider, dtype=torch.float16):
     H = 2048 // D_HEAD
     causal = False
     if provider == "flag_attn":
-        q = torch.randn((BATCH, H, 1, D_HEAD), dtype=dtype, device="cuda")
-        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda")
-        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda")
+        q = torch.randn((BATCH, H, 1, D_HEAD), dtype=dtype, device=test_backend.device)
+        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device)
+        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device)
         fn = lambda: flag_attn.flash_attention(q, k, v, causal=causal)
-        ms = triton.testing.do_bench(fn)
+        ms = test_backend.do_bench(fn)
     if provider == "torch":
-        q = torch.randn((BATCH, H, 1, D_HEAD), dtype=dtype, device="cuda")
-        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda")
-        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda")
+        q = torch.randn((BATCH, H, 1, D_HEAD), dtype=dtype, device=test_backend.device)
+        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device)
+        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=test_backend.device)
         try:
             fn = lambda: flag_attn.testing.flash_attention(q, k, v, causal=causal, upcast=False)
-            ms = triton.testing.do_bench(fn)
-        except torch.cuda.OutOfMemoryError as e:
+            ms = test_backend.do_bench(fn)
+        except torch.OutOfMemoryError as e:
             logging.info(f"torch OOM for batch_size: {BATCH}, num_heads: {H}, seqlen: {N_CTX}, headdim: {D_HEAD}")
             ms = float("inf")
     if provider == "flash":
-        q = torch.randn((BATCH, 1, H, D_HEAD), dtype=dtype, device="cuda")
-        k = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device="cuda")
-        v = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device="cuda")
+        q = torch.randn((BATCH, 1, H, D_HEAD), dtype=dtype, device=test_backend.device)
+        k = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device=test_backend.device)
+        v = torch.randn((BATCH, N_CTX, H, D_HEAD), dtype=dtype, device=test_backend.device)
         fn = lambda: flash_attn_func(q, k, v, causal=causal)
-        ms = triton.testing.do_bench(fn)
+        ms = test_backend.do_bench(fn)
 
     return ms
     # # total TFLOPS: following Flash Attention v2, only gemms are counted.

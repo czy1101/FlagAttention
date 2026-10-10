@@ -17,6 +17,7 @@ Examples:
 
 from __future__ import annotations
 
+
 from dataclasses import dataclass
 import os
 from typing import Callable
@@ -30,14 +31,16 @@ try:
 except ModuleNotFoundError:  # Direct invocation from the benchmark directory.
     from recording import benchmark_metric, record_benchmark_result
 
-from flag_attn import InfLLMV2Config, infllmv2_attention, infllmv2_decode
+from flag_attn.testing import backend as test_backend
+from flag_attn import InfLLMV2Config, infllmv2_attention
 
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is required for performance tests"
-)
-ATTENTION = pytest.mark.infllmv2_attention
-DECODE = pytest.mark.infllmv2_decode
+pytestmark = [
+    pytest.mark.infllmv2_attention,
+    pytest.mark.skipif(
+        not test_backend.is_available(), reason="requires an available accelerator"
+    ),
+]
 WARMUP_MS = int(os.getenv("INFLLMV2_BENCH_WARMUP_MS", "20"))
 REP_MS = int(os.getenv("INFLLMV2_BENCH_REP_MS", "100"))
 _RESULTS: list[dict[str, object]] = []
@@ -172,34 +175,34 @@ def _packed_data(
     *,
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    generator = torch.Generator(device="cuda")
+    generator = torch.Generator(device=test_backend.device)
     generator.manual_seed(31)
     q = torch.randn(
         (batch * q_length, 32, head_dim),
         generator=generator,
-        device="cuda",
+        device=test_backend.device,
         dtype=torch.bfloat16,
     ).requires_grad_(requires_grad)
     k = torch.randn(
         (batch * kv_length, 2, head_dim),
         generator=generator,
-        device="cuda",
+        device=test_backend.device,
         dtype=torch.bfloat16,
     ).requires_grad_(requires_grad)
     v = torch.randn(
         (batch * kv_length, 2, head_dim),
         generator=generator,
-        device="cuda",
+        device=test_backend.device,
         dtype=torch.bfloat16,
     ).requires_grad_(requires_grad)
-    cu_q = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * q_length
-    cu_k = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * kv_length
+    cu_q = torch.arange(batch + 1, device=test_backend.device, dtype=torch.int32) * q_length
+    cu_k = torch.arange(batch + 1, device=test_backend.device, dtype=torch.int32) * kv_length
     return q, k, v, cu_q, cu_k
 
 
 def _measure(fn: Callable[[], object]) -> float:
     return float(
-        triton.testing.do_bench(
+        test_backend.do_bench(
             fn,
             warmup=WARMUP_MS,
             rep=REP_MS,
@@ -264,8 +267,8 @@ def _report(
     )
 
 
-@ATTENTION
 @pytest.mark.parametrize("case", PREFILL_CASES, ids=lambda case: case.name)
+@pytest.mark.skipif(not test_backend.supports_operator("infllmv2_attention"), reason=test_backend.skip_reason("infllmv2_attention"))
 def test_infllmv2_attention_benchmark(
     case: AttentionCase, record_property
 ) -> None:
@@ -306,8 +309,8 @@ def test_infllmv2_attention_benchmark(
     )
 
 
-@ATTENTION
 @pytest.mark.parametrize("case", BACKWARD_CASES, ids=lambda case: case.name)
+@pytest.mark.skipif(not test_backend.supports_operator("infllmv2_attention"), reason=test_backend.skip_reason("infllmv2_attention"))
 def test_infllmv2_attention_backward_benchmark(
     case: AttentionCase, record_property
 ) -> None:
@@ -351,8 +354,8 @@ def test_infllmv2_attention_backward_benchmark(
     )
 
 
-@DECODE
 @pytest.mark.parametrize("case", DECODE_CASES, ids=lambda case: case.name)
+@pytest.mark.skipif(not test_backend.supports_operator("infllmv2_decode"), reason=test_backend.skip_reason("infllmv2_decode"))
 def test_infllmv2_decode_benchmark(
     case: DecodeCase, record_property
 ) -> None:
@@ -362,12 +365,13 @@ def test_infllmv2_decode_benchmark(
     config = InfLLMV2Config(topk=64, dense_len=8192)
 
     def forward() -> torch.Tensor:
-        return infllmv2_decode(
+        return infllmv2_attention(
             q,
             k,
             v,
             cu_k,
             case.kv_length,
+            stage="decode",
             config=config,
         )
 

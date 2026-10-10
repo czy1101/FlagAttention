@@ -19,6 +19,7 @@
 #   fla/ops/utils/op.py (exp only)
 #   fla/utils.py (autocast, input_guard, autotune_cache_kwargs)
 
+
 import contextlib
 import functools
 import inspect
@@ -32,7 +33,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from flag_attn.FLA.gated_linear_attention import chunk_gla
+from flag_attn.testing import backend as test_backend
+from flag_attn import chunk_gla
 from flag_attn.FLA.index import (
     prepare_chunk_indices as _prepare_chunk_indices,
 )
@@ -53,8 +55,8 @@ else:
     _autotune_cache_kwargs = {}
 
 # --- From fla/utils.py: autocast helpers ---
-_autocast_custom_fwd = torch.amp.custom_fwd(device_type="cuda")
-_autocast_custom_bwd = torch.amp.custom_bwd(device_type="cuda")
+_autocast_custom_fwd = torch.amp.custom_fwd(device_type=test_backend.device)
+_autocast_custom_bwd = torch.amp.custom_bwd(device_type=test_backend.device)
 
 
 # --- From fla/utils.py: input_guard (minimal) ---
@@ -104,7 +106,7 @@ def _input_guard(fn=None, *, no_guard_contiguous=False):
                         break
 
             if tensor is not None and tensor.device.type == "cuda":
-                ctx = torch.cuda.device(tensor.device.index)
+                ctx = test_backend.device_fn.device(tensor.device.index)
             else:
                 ctx = contextlib.nullcontext()
             with ctx:
@@ -887,11 +889,11 @@ def fused_recurrent_gla(
 
 
 def _cuda_available() -> bool:
-    return torch.cuda.is_available()
+    return test_backend.supports_operator("chunk_gla")
 
 
 pytestmark = [
-    pytest.mark.skipif(not _cuda_available(), reason="CUDA required"),
+    pytest.mark.skipif(not _cuda_available(), reason=test_backend.skip_reason("chunk_gla")),
 ]
 
 
@@ -932,7 +934,6 @@ def _assert_close(name, actual, expected, ratio, err_atol=1e-6):
 
 
 @pytest.mark.chunk_gla
-@pytest.mark.chunk_gla_chunk
 @pytest.mark.parametrize(
     ("B", "T", "H", "D", "gate_logit_normalizer", "dtype"),
     [
@@ -950,7 +951,7 @@ def _assert_close(name, actual, expected, ratio, err_atol=1e-6):
 def test_chunk(B, T, H, D, dtype, gate_logit_normalizer):
     torch.manual_seed(42)
     os.environ["TRITON_F32_DEFAULT"] = "ieee"
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
 
     q = torch.rand(B, T, H, D, dtype=dtype, device=device).requires_grad_()
     k = torch.rand(B, T, H, D, dtype=dtype, device=device).requires_grad_()
@@ -1000,7 +1001,6 @@ def test_chunk(B, T, H, D, dtype, gate_logit_normalizer):
 
 
 @pytest.mark.chunk_gla
-@pytest.mark.chunk_gla_state_v_first
 @pytest.mark.parametrize(
     ("B", "T", "H", "D", "dtype"),
     [
@@ -1014,7 +1014,7 @@ def test_chunk(B, T, H, D, dtype, gate_logit_normalizer):
 def test_chunk_state_v_first(B, T, H, D, dtype):
     torch.manual_seed(42)
     os.environ["TRITON_F32_DEFAULT"] = "ieee"
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
 
     q = torch.rand(B, T, H, D, dtype=dtype, device=device)
     k = torch.rand(B, T, H, D, dtype=dtype, device=device)
@@ -1058,7 +1058,6 @@ def test_chunk_state_v_first(B, T, H, D, dtype):
 
 
 @pytest.mark.chunk_gla
-@pytest.mark.chunk_gla_varlen
 @pytest.mark.parametrize(
     ("H", "D", "cu_seqlens", "dtype"),
     [
@@ -1073,7 +1072,7 @@ def test_chunk_state_v_first(B, T, H, D, dtype):
 def test_chunk_varlen(H, D, cu_seqlens, dtype):
     torch.manual_seed(42)
     os.environ["TRITON_F32_DEFAULT"] = "ieee"
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
 
     N = len(cu_seqlens) - 1
     T = cu_seqlens[-1]

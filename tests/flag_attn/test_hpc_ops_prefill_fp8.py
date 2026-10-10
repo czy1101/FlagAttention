@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
 
 import pytest
 import torch
 
-from flag_attn.hpc_ops_attention.prefill import (
-    attention_with_kvcache_blocksparse_prefill_fp8,
-)
+from flag_attn.testing import backend as test_backend
+from flag_attn import hy3_attention
 
 BLOCK = 128
 HEAD_DIM = 128
@@ -27,14 +27,14 @@ Q_HEADS = 8
 KV_HEADS = 2
 
 
-@pytest.mark.attention_with_kvcache_blocksparse_prefill_fp8
+@pytest.mark.hy3_attention
 def test_attention_blocksparse_prefill_fp8_rejects_cpu():
     q = torch.empty(1, 1, HEAD_DIM)
     cache = torch.empty(1, 32, 1, HEAD_DIM)
     scale = torch.empty(1)
     metadata = torch.empty(1, dtype=torch.int32)
     with pytest.raises(ValueError, match="must be a CUDA tensor"):
-        attention_with_kvcache_blocksparse_prefill_fp8(
+        hy3_attention(
             q,
             cache,
             cache,
@@ -62,7 +62,7 @@ def _make_mask(q_len, kv_len, masked, device):
 
 
 def _make_inputs(quant_type, kv_layout, masked, page_size):
-    device = torch.device("cuda")
+    device = torch.device(test_backend.device)
     fp8 = torch.float8_e4m3fn
     q_len, kv_len = 129, 257
     pages = math.ceil(kv_len / page_size)
@@ -212,18 +212,18 @@ def _reference(args):
     return output
 
 
-@pytest.mark.attention_with_kvcache_blocksparse_prefill_fp8
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.hy3_attention
+@pytest.mark.skipif(not test_backend.supports_operator("hy3_attention"), reason=test_backend.skip_reason("hy3_attention"))
 @pytest.mark.parametrize("quant_type", [0, 1])
 @pytest.mark.parametrize("kv_layout", ["nhd", "hnd"])
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("page_size", [32, 64])
 def test_attention_blocksparse_prefill_fp8(quant_type, kv_layout, masked, page_size):
     torch.manual_seed(10086)
-    torch.cuda.manual_seed(10086)
+    torch.manual_seed(10086)
     args = _make_inputs(quant_type, kv_layout, masked, page_size)
     reference = _reference(args)
-    output = attention_with_kvcache_blocksparse_prefill_fp8(
+    output = hy3_attention(
         *args[:-1],
         block_mask=args[-1],
         sparsity_bucket=2 if masked else None,

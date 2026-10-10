@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+
 # Run the DiffKV correctness tests from the repository root:
 #   pytest -q -m diffkv_attention \\
 #     tests/flag_attn/test_diffkv_attention.py
@@ -38,19 +39,15 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from flag_attn.diffkv_attention.api import (
-    OP_NAME,
-    diffkv_attention,
-    unified_attention_diffkv,
-)
+from flag_attn.testing import backend as test_backend
+from flag_attn import diffkv_attention
+from flag_attn.diffkv_attention.api import OP_NAME, unified_attention_diffkv
 
-diffkv_impl = importlib.import_module(
-    "flag_attn.diffkv_attention.diffkv"
-)
+diffkv_impl = importlib.import_module("flag_attn.diffkv_attention.diffkv")
 
 
 CUDA_REQUIRED = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="DiffKV Triton tests require CUDA"
+    not test_backend.supports_operator("diffkv_attention"), reason="DiffKV Triton tests require CUDA"
 )
 
 
@@ -113,7 +110,7 @@ def _make_case(
     identity order.  Using a seeded permutation here exercises the page-table
     address calculation while keeping every test case exactly reproducible.
     """
-    device = "cuda"
+    device = test_backend.device
     blocks_per_seq = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
     num_blocks = batch * blocks_per_seq
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -401,10 +398,12 @@ def test_public_api_rejects_invalid_paged_cache_inputs():
         )
 
 
-def test_unified_diffkv_is_lazily_exported_from_flag_attn():
-    import flag_attn
+def test_unified_diffkv_is_exported_from_operator_package():
+    package = importlib.import_module("flag_attn.diffkv_attention")
 
-    assert callable(flag_attn.unified_attention_diffkv)
+    assert "unified_attention_diffkv" in package.__all__
+    assert callable(package.unified_attention_diffkv)
+    assert package.unified_attention_diffkv is unified_attention_diffkv
 
 
 @pytest.mark.parametrize(

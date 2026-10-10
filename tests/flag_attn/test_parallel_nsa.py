@@ -10,19 +10,20 @@ import pytest
 import torch
 import triton
 
-torch_gcu = pytest.importorskip("torch_gcu")
+from flag_attn import runtime
 
-from flag_attn.runtime.backend._enflame.FLA.index import (
-    prepare_token_indices_enflame as prepare_token_indices,
-)
-from flag_attn.runtime.backend._enflame.FLA.nsa import parallel_nsa
+from flag_attn.parallel_nsa.index import prepare_token_indices
+from flag_attn import parallel_nsa
+
 
 def _device():
+    if runtime.device.name == "cpu":
+        pytest.skip("NSA requires an accelerator")
     index = int(
         os.environ.get("S60_TEST_DEVICE", "0")
     )
-    torch.gcu.set_device(index)
-    return torch.device(f"gcu:{index}")
+    runtime.torch_device_fn.set_device(index)
+    return torch.device(f"{runtime.device.name}:{index}")
 
 
 logger = logging.getLogger(__name__)
@@ -335,7 +336,7 @@ def test_parallel_large_smoke(
     )
 
     output.backward(do)
-    torch.gcu.synchronize()
+    runtime.torch_device_fn.synchronize()
 
     tensors = (
         ("output", output),

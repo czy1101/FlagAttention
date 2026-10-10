@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Terminal-only benchmark for local Inkling FA4 relative attention.
+"""Pytest benchmark for local Inkling FA4 relative attention.
 
 Uses the same triton.testing.perf_report / do_bench convention as the other
 FlagAttention benchmarks. Providers share inputs, split counts and timing.
@@ -20,6 +20,9 @@ CuTe is an optional comparison baseline; no vLLM installation is required.
 """
 
 from __future__ import annotations
+
+
+import pytest
 
 import argparse
 import importlib
@@ -35,7 +38,11 @@ import torch
 import torch.nn.functional as F
 import triton.testing as triton_testing
 
+from flag_attn.testing import backend as test_backend
 from flag_attn.inkling_fa4 import get_backend, tle_available
+
+
+pytestmark = pytest.mark.inkling_fa4_rel_attention
 
 HEAD_DIM = 128
 BLOCK_SIZE = 16
@@ -168,7 +175,7 @@ def prepare_case(
     backends: tuple[str, ...] = BACKEND_NAMES,
 ) -> Prepared:
     torch.manual_seed(seed)
-    device = "cuda"
+    device = test_backend.device
 
     q_lens = [ql for ql, _ in config.seq_lens]
     kv_lens = [kl for _, kl in config.seq_lens]
@@ -267,17 +274,20 @@ def make_runner(backend: Backend, prep: Prepared) -> Callable[[], Any]:
 def resolve_backends(names: list[str], flash_root: str | None) -> dict[str, Backend]:
     """Skip unavailable optional providers; propagate local implementation bugs."""
     resolved = {}
-    capability = torch.cuda.get_device_capability()
+    capability = test_backend.cuda_capability()
     for name in dict.fromkeys(names):
         if name == "official_cute":
-            fn, reason = _load_official_cute(flash_root)
+            fn, reason = _load_official_cute(flash_root) if test_backend.is_nvidia() else (None, "CuTe requires NVIDIA")
         elif name == "tle":
             available, reason = tle_available()
             if capability[0] != 9:
                 available, reason = False, "Hopper TLE requires SM90"
             fn = get_backend(name) if available else None
         else:
-            fn, reason = get_backend(name), ""
+            from flag_attn import inkling_fa4_rel_attention
+            from functools import partial
+
+            fn, reason = partial(inkling_fa4_rel_attention, backend=name), ""
         if fn is None:
             print(f"SKIP {name}: {reason}")
         else:
@@ -285,32 +295,16 @@ def resolve_backends(names: list[str], flash_root: str | None) -> dict[str, Back
     return resolved
 
 
-def positive_int(value: str) -> int:
-    result = int(value)
-    if result <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return result
 
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cases", nargs="+", choices=[c.name for c in build_cases()])
-    parser.add_argument("--providers", nargs="+", choices=BACKEND_NAMES, default=list(BACKEND_NAMES))
-    parser.add_argument("--num-splits", nargs="+", type=positive_int, default=[1])
-    parser.add_argument("--warmup", type=positive_int, default=25, help="warmup duration in milliseconds")
-    parser.add_argument("--rep", type=positive_int, default=100, help="measurement duration in milliseconds")
-    parser.add_argument("--rel", choices=("real", "zeros"), default="real")
-    parser.add_argument("--flash-attn-root", default=os.getenv("FLASH_ATTN_ROOT"))
-    args = parser.parse_args()
-
-    if not torch.cuda.is_available():
-        parser.error("this benchmark requires CUDA")
-    if torch.cuda.get_device_capability() < (8, 0):
-        parser.error("the BF16 benchmark requires SM80 or newer")
+def run_benchmark(args) -> None:
+    if not test_backend.supports_operator("inkling_fa4_rel_attention"):
+        pytest.skip("this benchmark requires an available accelerator")
+    if test_backend.is_nvidia() and test_backend.cuda_capability() < (8, 0):
+        pytest.skip("the BF16 benchmark requires SM80 or newer")
 
     backends = resolve_backends(args.providers, args.flash_attn_root)
     if not backends:
-        parser.error("none of the requested providers is available")
+        pytest.skip("none of the requested providers is available")
     cases = [c for c in build_cases() if args.cases is None or c.name in args.cases]
     # Reuse the exact same tensors across providers and split configurations.
     prepared = {
@@ -340,9 +334,9 @@ def main() -> None:
         # Compile and initialize the provider before entering timed measurement.
         for _ in range(3):
             run()
-        torch.cuda.synchronize()
+        test_backend.device_fn.synchronize()
         return float(
-            triton_testing.do_bench(
+            test_backend.do_bench(
                 run,
                 warmup=args.warmup,
                 rep=args.rep,
@@ -350,11 +344,15 @@ def main() -> None:
             )
         )
 
-    print(f"GPU: {torch.cuda.get_device_name()} | dtype: bf16 | latency: median ms")
+    print(f"GPU: {test_backend.get_device_name()} | dtype: bf16 | latency: median ms")
     print(f"warmup={args.warmup} ms | rep={args.rep} ms | relative logits={args.rel}")
     with torch.inference_mode():
         bench_relative_attention.run(print_data=True, show_plots=False, save_path="")
 
 
-if __name__ == "__main__":
-    main()
+def test_inkling_fa4_rel_attention_benchmark():
+    args = argparse.Namespace(
+        cases=None, providers=list(BACKEND_NAMES), num_splits=[1],
+        warmup=25, rep=100, rel="real", flash_attn_root=os.getenv("FLASH_ATTN_ROOT"),
+    )
+    run_benchmark(args)

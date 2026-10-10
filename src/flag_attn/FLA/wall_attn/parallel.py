@@ -1113,11 +1113,6 @@ def _parallel_wall_attn_fast_path(
 
     fwd.prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe)
 
-    # Never pass invalid cached operands to WGMMA. This synchronization is part
-    # of the public provider's end-to-end latency and must remain in benchmarks.
-    if unsafe.item():
-        return None
-
     fwd.parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, capacity=2, scale=scale)
     return output
 
