@@ -232,6 +232,92 @@ def test_parallel_wall_attn_constant_gate_uses_safe_fallback(dtype):
 
 @pytest.mark.parallel_wall_attn
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("t", (512, 1024, 2048, 4096))
+@pytest.mark.parametrize("h", (2, 8), ids=("gqa", "mha"))
+@pytest.mark.skipif(not _has_h100_tle(), reason="device safety dispatch requires H100/SM90 with TLE")
+@torch.inference_mode()
+def test_parallel_wall_attn_device_guard_rechecks_mutated_gate(dtype, t, h, monkeypatch):
+    # Fixed addresses must not cache safety decisions. The value-one oracle
+    # checks the selected branch without relying on an external FLA package.
+    q = torch.ones(1, t, 8, 64, device=test_backend.device, dtype=dtype)
+    k = torch.ones(1, t, h, 64, device=test_backend.device, dtype=dtype)
+    v = torch.ones_like(k)
+    g = torch.full_like(q, -0.001)
+    original_item = torch.Tensor.item
+
+    def forbid_safety_host_read(tensor, *args, **kwargs):
+        if tensor.is_cuda:
+            raise AssertionError("public D64 API must not read its device safety flag")
+        return original_item(tensor, *args, **kwargs)
+
+    expected_fast = "hopper_bf16" if dtype is torch.bfloat16 else "hopper_fp16"
+    for gate, expected_route in ((-0.001, expected_fast), (-204.8 / t, "official_fallback"),
+                                 (-0.001, expected_fast)):
+        g.fill_(gate)
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.Tensor, "item", forbid_safety_host_read)
+            actual = parallel_wall_attn(q, k, v, g)
+        assert provider.get_last_route() == expected_route
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, torch.ones_like(actual), atol=0.01, rtol=0.01)
+
+
+@pytest.mark.parallel_wall_attn
+@pytest.mark.parametrize("t", (512, 4096))
+@pytest.mark.skipif(not _has_h100_tle(), reason="large-logit guard requires H100/SM90 with TLE")
+@torch.inference_mode()
+def test_parallel_wall_attn_device_fallback_rounds_large_finite_scores(t):
+    q = torch.full((1, t, 8, 64), 1e30, device=test_backend.device, dtype=torch.bfloat16)
+    k, v = torch.ones_like(q), torch.ones_like(q)
+    g = torch.full_like(q, -204.8 / t)
+    actual = parallel_wall_attn(q, k, v, g)
+    assert provider.get_last_route() == "official_fallback"
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, torch.ones_like(actual), atol=0.01, rtol=0.01)
+
+
+@pytest.mark.parallel_wall_attn
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("unsafe_gate", (False, True), ids=("safe", "unsafe"))
+@pytest.mark.skipif(not _has_h100_tle(), reason="stream dispatch requires H100/SM90 with TLE")
+@torch.inference_mode()
+def test_parallel_wall_attn_device_dispatch_honors_current_stream(dtype, unsafe_gate):
+    q = torch.ones(1, 512, 8, 64, device=test_backend.device, dtype=dtype)
+    k, v = torch.ones_like(q), torch.ones_like(q)
+    g = torch.full_like(q, -0.001)
+    parallel_wall_attn(q, k, v, g)  # Populate launchers on the default stream.
+    provider.get_last_route()
+    stream = torch.cuda.Stream(device=q.device)
+    with torch.cuda.stream(stream):
+        g.fill_(-0.4 if unsafe_gate else -0.001)
+        actual = parallel_wall_attn(q, k, v, g)
+    expected_route = "official_fallback" if unsafe_gate else ("hopper_bf16" if dtype is torch.bfloat16 else "hopper_fp16")
+    assert provider.get_last_route() == expected_route
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, torch.ones_like(actual), atol=0.01, rtol=0.01)
+
+
+@pytest.mark.parallel_wall_attn
+@pytest.mark.parametrize("t,h,dtype", (
+    pytest.param(512, 8, torch.bfloat16, id="bf16-512-mha"),
+    pytest.param(1024, 2, torch.float16, id="fp16-1024-gqa"),
+    pytest.param(2048, 2, torch.bfloat16, id="bf16-2048-gqa"),
+    pytest.param(4096, 8, torch.float16, id="fp16-4096-mha"),
+))
+@pytest.mark.skipif(not _has_h100_tle(), reason="fallback accuracy requires H100/SM90 with TLE")
+@torch.inference_mode()
+def test_parallel_wall_attn_device_fallback_matches_fla_random_values(t, h, dtype):
+    q, k, v, g = _make_inputs(t, h, 64, dtype, seed=7)
+    g.fill_(-204.8 / t)
+    expected = _fla_reference()(q, k, v, g, scale=0.125)
+    actual = parallel_wall_attn(q, k, v, g, scale=0.125)
+    assert provider.get_last_route() == "official_fallback"
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+
+
+@pytest.mark.parallel_wall_attn
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("t", (512, 4096))
 @pytest.mark.skipif(not _has_h100_tle(), reason="weak-gate fast path requires H100/SM90 with TLE")
 @torch.inference_mode()
