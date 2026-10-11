@@ -5,11 +5,14 @@
 
 BF16 inputs use BF16 QK/PV operands. FP16 inputs use BF16 QK and FP16 PV
 operands. Both paths use FP32 softmax and accumulation, BM=BN=64, and a
-two-slot K/V pipeline. The host API validates cached operands before launching
-attention and includes validation synchronization in its end-to-end latency.
+two-slot K/V pipeline. Device guards protect D64 inference without a host
+read; other supported dimensions retain host validation.
 """
 
 from __future__ import annotations
+
+from collections import OrderedDict
+from functools import lru_cache
 
 import torch
 import triton
@@ -23,6 +26,58 @@ BT = 128
 BM = 64
 BN = 64
 RCP_LN2 = 1.4426950216
+
+_COMPILED_LAUNCHERS = OrderedDict()
+_COMPILED_LAUNCHER_LIMIT = 256
+
+
+def can_cache_launch():
+    """Use ordinary JIT dispatch when instrumentation or ABI requires it."""
+    knobs = getattr(triton, "knobs", None)
+    runtime = getattr(knobs, "runtime", None)
+    compilation = getattr(knobs, "compilation", None)
+    if (getattr(runtime, "debug", True)
+            or getattr(compilation, "instrumentation_mode", True)):
+        return False
+    context_type = getattr(triton.runtime.jit, "DistributedRtContext", None)
+    return context_type is None or not context_type().is_lite_mode
+
+
+def launch_cached(kernel, grid, args, **kwargs):
+    """Cache compiled launchers, never tensor contents, streams, or flags."""
+    if kernel.pre_run_hooks:
+        return kernel[grid](*args, **kwargs)
+    tensor_signature = tuple((arg.dtype, arg.data_ptr() % 16) for arg in args)
+    key = (kernel, args[0].device, grid, tensor_signature, tuple(kwargs.items()))
+    entry = _COMPILED_LAUNCHERS.get(key)
+    if entry is not None:
+        compiled, runner, scalar_args = entry
+        runner(*args, *scalar_args)
+        return compiled
+    compiled = kernel[grid](*args, **kwargs)
+    if compiled is not None and hasattr(compiled, "__getitem__"):
+        runner = compiled[(*grid, *(1 for _ in range(3 - len(grid))))]
+        scalar_args = tuple(kwargs[name] for name in kernel.arg_names[len(args):])
+        _COMPILED_LAUNCHERS[key] = (compiled, runner, scalar_args)
+        if len(_COMPILED_LAUNCHERS) > _COMPILED_LAUNCHER_LIMIT:
+            _COMPILED_LAUNCHERS.popitem(last=False)
+    return compiled
+
+
+class _CachedKernel:
+    def __init__(self, kernel):
+        self.kernel = kernel
+
+    @lru_cache(maxsize=16)
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            return launch_cached(self.kernel, grid, args, **kwargs)
+        return launch
+
+
+@lru_cache(maxsize=8)
+def cached_kernel(kernel):
+    return _CachedKernel(kernel)
 
 
 def allocate_descriptor(size: int, alignment: int, stream: int | None):
@@ -190,9 +245,10 @@ def parallel_wall_attn_fwd_kernel(
     QK_IS_BF16: tl.constexpr,
     PV_IS_BF16: tl.constexpr,
     OUTPUT_IS_BF16: tl.constexpr,
+    GRID_3D: tl.constexpr = False,
 ):
-    query_tile = tl.program_id(0)
-    head = tl.program_id(1)
+    query_tile = tl.program_id(1) if GRID_3D else tl.program_id(0)
+    head = tl.program_id(2) if GRID_3D else tl.program_id(1)
     tile_count = (query_tile + 1) * 2
     q_desc = tl.make_tensor_descriptor(
         q_cache + head * T_VALUE * D_VALUE,
@@ -375,17 +431,69 @@ def parallel_wall_attn_fwd_kernel(
     )
 
 
-def parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, capacity: int, scale=None):
+@triton.jit
+def _parallel_wall_attn_guarded_fwd_kernel(
+    unsafe, q, k, prefix, q_cache, k_cache, v, output, lse,
+    scale_log2: tl.constexpr,
+    T_VALUE: tl.constexpr, HQ_VALUE: tl.constexpr,
+    H_VALUE: tl.constexpr, G_VALUE: tl.constexpr,
+    D_VALUE: tl.constexpr, BM_VALUE: tl.constexpr,
+    BN_VALUE: tl.constexpr, CAPACITY_VALUE: tl.constexpr,
+    QK_IS_BF16: tl.constexpr, PV_IS_BF16: tl.constexpr,
+    OUTPUT_IS_BF16: tl.constexpr,
+    SCALE: tl.constexpr,
+    FALLBACK_IMPL: tl.constexpr,
+    FLAG_COUNT: tl.constexpr,
+    FUSED_FALLBACK: tl.constexpr,
+):
+    # CTA-uniform and before any TMA/WGMMA/barrier activity. Consumer
+    # functions remain direct entries of warp_specialize in the main body.
+    flag_values = tl.load(unsafe + tl.arange(0, FLAG_COUNT))
+    if tl.max(flag_values, axis=0) != 0:
+        if FUSED_FALLBACK:
+            # Two sequential 64-row tiles cover the same 128 output rows,
+            # reducing fallback live ranges inside a warp-specialized kernel.
+            for query_slot in tl.static_range(2):
+                FALLBACK_IMPL(
+                    q=q, k=k, v=v, o=output, g_cumsum=prefix,
+                    g_scalar_cumsum=None, sink_bias=None, lse=lse,
+                    scale=SCALE, cu_seqlens=None, chunk_indices=None,
+                    T=T_VALUE, W=None, B=1, H=H_VALUE, HQ=HQ_VALUE, G=G_VALUE,
+                    K=D_VALUE, V=D_VALUE, BT=64, BS=64, BK=D_VALUE, BV=D_VALUE,
+                    USE_SINK_BIAS=False, USE_WINDOW=False,
+                    IS_VARLEN=False, USE_SCALAR_G=False,
+                    SAFE_SCORE_ROUNDING=True, FALLBACK_QUERY_SLOT=query_slot,
+                )
+    else:
+        parallel_wall_attn_fwd_kernel(
+            q_cache, k_cache, v, output, lse, scale_log2,
+            T_VALUE, HQ_VALUE, H_VALUE, G_VALUE, D_VALUE,
+            BM_VALUE, BN_VALUE, CAPACITY_VALUE,
+            QK_IS_BF16, PV_IS_BF16, OUTPUT_IS_BF16,
+            True,
+        )
+
+
+def parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, capacity: int, scale=None,
+                          unsafe=None, cache_launch=False, raw_q=None, raw_k=None,
+                          prefix=None, fallback_impl=None):
     _, hq, t, d = q_cache.shape
     h = v.shape[2]
     if scale is None:
         scale = d**-0.5
-    return parallel_wall_attn_fwd_kernel[(t // BT, hq)](
-        q_cache,
-        k_cache,
-        v,
-        output,
-        lse,
+    kernel = parallel_wall_attn_fwd_kernel if unsafe is None else _parallel_wall_attn_guarded_fwd_kernel
+    args = (q_cache, k_cache, v, output, lse)
+    grid = (t // BT, hq)
+    options = {}
+    if unsafe is not None:
+        args = (unsafe, raw_q, raw_k, prefix, *args)
+        grid = (1, t // BT, hq)
+        options = {"SCALE": scale, "FALLBACK_IMPL": fallback_impl, "FLAG_COUNT": unsafe.numel(),
+                   "FUSED_FALLBACK": t <= 1024}
+    if cache_launch:
+        kernel = cached_kernel(kernel)
+    return kernel[grid](
+        *args,
         scale_log2=scale * RCP_LN2,
         T_VALUE=t,
         HQ_VALUE=hq,
@@ -400,6 +508,7 @@ def parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, capacity: int, scal
         OUTPUT_IS_BF16=output.dtype == torch.bfloat16,
         num_warps=4,
         num_stages=1,
+        **options,
     )
 
 
@@ -412,6 +521,7 @@ def parallel_wall_attn_fwd_kernel_preprocess(
     k_cache,
     anchor,
     unsafe,
+    prefix_out,
     T_VALUE: tl.constexpr,
     HQ_VALUE: tl.constexpr,
     H_VALUE: tl.constexpr,
@@ -420,6 +530,8 @@ def parallel_wall_attn_fwd_kernel_preprocess(
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
     SCALE: tl.constexpr,
+    WRITE_PREFIX: tl.constexpr,
+    FLAG_VECTOR: tl.constexpr,
 ):
     batch = tl.program_id(0)
     channel_block = tl.program_id(1)
@@ -461,6 +573,8 @@ def parallel_wall_attn_fwd_kernel_preprocess(
         values = tl.load(g + qg_offsets, mask=mask, other=0.0).to(tl.float32)
         raw_prefix = tl.cumsum(values, axis=0) + carry
         prefix = raw_prefix * SCALE
+        if WRITE_PREFIX:
+            tl.store(prefix_out + qg_offsets, prefix, mask=mask)
         q_value = tl.load(q + qg_offsets, mask=mask, other=0.0).to(tl.float32)
         k_value = tl.load(k + k_offsets, mask=mask, other=0.0).to(tl.float32)
         q_operand = q_value * tl.exp2(prefix - reference)
@@ -485,14 +599,20 @@ def parallel_wall_attn_fwd_kernel_preprocess(
         tl.store(q_cache + cache_offsets, q_stored, mask=mask)
         tl.store(k_cache + cache_offsets, k_stored, mask=mask)
         carry += tl.sum(values, axis=0)[None, :]
-    if invalid:
+    if FLAG_VECTOR:
+        tl.store(unsafe + batch * tl.cdiv(HQ_VALUE * D_VALUE, BLOCK_C) + channel_block, invalid.to(tl.int32))
+    elif invalid:
         tl.atomic_or(unsafe, 1, sem="relaxed")
 
 
-def _prepare_fused_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe, bt=128, bc=8, warps=4):
+def _prepare_fused_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe, bt=128, bc=8, warps=4,
+                          cache_launch=False, prefix=None):
     b, t, hq, d = q.shape
     h = k.shape[2]
-    return parallel_wall_attn_fwd_kernel_preprocess[(b, triton.cdiv(hq * d, bc))](
+    kernel = parallel_wall_attn_fwd_kernel_preprocess
+    if cache_launch:
+        kernel = cached_kernel(kernel)
+    return kernel[(b, triton.cdiv(hq * d, bc))](
         q,
         k,
         g,
@@ -500,6 +620,7 @@ def _prepare_fused_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe, bt=128, b
         k_cache,
         anchor,
         unsafe,
+        prefix,
         T_VALUE=t,
         HQ_VALUE=hq,
         H_VALUE=h,
@@ -508,6 +629,8 @@ def _prepare_fused_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe, bt=128, b
         BLOCK_T=bt,
         BLOCK_C=bc,
         SCALE=RCP_LN2,
+        WRITE_PREFIX=prefix is not None,
+        FLAG_VECTOR=unsafe.ndim != 0,
         num_warps=warps,
         num_stages=1,
     )
@@ -551,6 +674,7 @@ def _wall_attn_cache_kernel(
     D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FLAG_VECTOR: tl.constexpr,
 ):
     block_t = tl.program_id(0)
     block_d = tl.program_id(1)
@@ -599,7 +723,11 @@ def _wall_attn_cache_kernel(
         & ((q_value == 0.0) | (q_stored != 0.0))
         & ((k_value == 0.0) | (k_stored != 0.0))
     )
-    if tl.sum(tl.sum((mask & ~valid).to(tl.int32), axis=0), axis=0) > 0:
+    invalid = tl.sum(tl.sum((mask & ~valid).to(tl.int32), axis=0), axis=0) > 0
+    if FLAG_VECTOR:
+        flag_index = block_t + tl.cdiv(T, BLOCK_T) * (block_d + tl.cdiv(D, BLOCK_D) * bhq)
+        tl.store(unsafe + flag_index, invalid.to(tl.int32))
+    elif invalid:
         tl.atomic_or(unsafe, 1, sem="relaxed")
     output_offset = ((bhq * T + tokens[:, None]) * D) + dims[None, :]
     tl.store(q_cache + output_offset, q_stored, mask=mask)
@@ -636,17 +764,23 @@ def _build_qk_cache(q, k, g, prefix, q_cache, k_cache, anchor, unsafe):
         BLOCK_T=64,
         BLOCK_D=32,
         num_warps=4,
+        FLAG_VECTOR=unsafe.ndim != 0,
         num_stages=2,
     )
 
 
-def prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe):
-    """Construct gated operands and set the device flag for unsafe data."""
+def prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe, cache_launch=False):
+    """Check gated operands and return FP32 prefix for device-dispatched D64."""
     if q.shape[1] <= 2048:
-        _prepare_fused_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe, bt=128, bc=8, warps=4)
+        prefix = torch.empty(g.shape, dtype=torch.float32, device=g.device) if q.shape[-1] == 64 else None
+        _prepare_fused_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe, bt=128, bc=8, warps=4,
+                              cache_launch=cache_launch, prefix=prefix)
+        return prefix
     else:
         prefix = chunk_global_cumsum(g, scale=RCP_LN2)
         _build_qk_cache(q, k, g, prefix, q_cache, k_cache, anchor, unsafe)
+        return prefix
+    return None
 
 
 __all__ = ["allocate_descriptor", "parallel_wall_attn_fwd", "prepare_qk_cache"]

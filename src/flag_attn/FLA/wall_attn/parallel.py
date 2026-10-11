@@ -41,6 +41,7 @@ from numbers import Real
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.index import prepare_chunk_indices
@@ -122,8 +123,12 @@ def parallel_wall_attn_fwd_kernel(
     USE_WINDOW: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_SCALAR_G: tl.constexpr,
+    SAFE_SCORE_ROUNDING: tl.constexpr = False,
+    FALLBACK_QUERY_SLOT: tl.constexpr = -1,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if FALLBACK_QUERY_SLOT >= 0:
+        i_t = i_t * 2 + FALLBACK_QUERY_SLOT
     i_b, i_hq = i_bh // HQ, i_bh % HQ
     i_h = i_hq // G
 
@@ -178,7 +183,12 @@ def parallel_wall_attn_fwd_kernel(
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_pk = tl.load(p_pk, boundary_check=(0, 1)).to(tl.float32)
         b_k_til = (b_k.to(tl.float32) * exp2(b_R_t - b_pk)).to(b_k.dtype)
-        b_s = tl.dot(b_q_til, b_k_til) * scale * RCP_LN2
+        if SAFE_SCORE_ROUNDING:
+            # Preserve the rounded score before subtracting the rounded row
+            # maximum, without disabling fusion in the WGMMA fast branch.
+            b_s = libdevice.mul_rn(tl.dot(b_q_til, b_k_til) * scale, RCP_LN2)
+        else:
+            b_s = tl.dot(b_q_til, b_k_til) * scale * RCP_LN2
 
         o_k = i_s + tl.arange(0, BS)
         m_k = o_k < T
@@ -221,7 +231,10 @@ def parallel_wall_attn_fwd_kernel(
         # q_til in local frame; clamp exp for Q before sub-block (masked by causality).
         b_exp_q = tl.minimum(b_pq - b_R_local_bc, tl.zeros([BT, BK], dtype=tl.float32))
         b_q_til_local = b_q.to(tl.float32) * exp2(b_exp_q)
-        b_s = tl.dot(b_q_til_local, b_k_til) * scale * RCP_LN2
+        if SAFE_SCORE_ROUNDING:
+            b_s = libdevice.mul_rn(tl.dot(b_q_til_local, b_k_til) * scale, RCP_LN2)
+        else:
+            b_s = tl.dot(b_q_til_local, b_k_til) * scale * RCP_LN2
 
         if USE_SCALAR_G:
             b_ck = tl.load(g_scalar_cumsum + (bos + o_k) * HQ + i_hq, mask=m_k, other=0).to(tl.float32)
@@ -248,6 +261,28 @@ def parallel_wall_attn_fwd_kernel(
     b_m += log2(b_acc)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_lse, b_m.to(p_lse.dtype.element_ty), boundary_check=(0,))
+
+
+_general_wall_attn_fwd_jit = parallel_wall_attn_fwd_kernel.fn.fn
+
+
+@triton.jit
+def _parallel_wall_attn_guarded_fallback_kernel(
+    unsafe, q, k, v, output, prefix, lse,
+    scale, T: tl.constexpr, H: tl.constexpr, HQ: tl.constexpr, D: tl.constexpr,
+    FLAG_COUNT: tl.constexpr,
+):
+    flags = tl.load(unsafe + tl.arange(0, FLAG_COUNT))
+    if tl.max(flags, axis=0) != 0:
+        _general_wall_attn_fwd_jit(
+            q=q, k=k, v=v, o=output, g_cumsum=prefix,
+            g_scalar_cumsum=None, sink_bias=None, lse=lse,
+            scale=scale, cu_seqlens=None, chunk_indices=None,
+            T=T, W=None, B=1, H=H, HQ=HQ, G=HQ // H, K=D, V=D,
+            BT=128, BS=64, BK=D, BV=D,
+            USE_SINK_BIAS=False, USE_WINDOW=False,
+            IS_VARLEN=False, USE_SCALAR_G=False, SAFE_SCORE_ROUNDING=True,
+        )
 
 
 @triton.autotune(
@@ -1009,10 +1044,21 @@ _FAST_T = frozenset((512, 1024, 2048, 4096))
 _FAST_H = frozenset((2, 8))
 _FAST_BF16_D = frozenset((64, 128))
 _LAST_ROUTE: ContextVar[str | None] = ContextVar("wall_attn_route", default=None)
+_LAST_UNSAFE: ContextVar[torch.Tensor | None] = ContextVar("wall_attn_unsafe", default=None)
 
 
 def get_last_route() -> str | None:
-    """Return the completed call's route in this context, for benchmark reporting."""
+    """Resolve the actual branch, synchronizing its device only on request.
+
+    This diagnostic belongs outside API latency measurements and also works
+    when the completed call was submitted on a non-default CUDA stream.
+    """
+    unsafe = _LAST_UNSAFE.get()
+    if unsafe is not None:
+        torch.cuda.synchronize(unsafe.device)
+        if unsafe.any().item():
+            _LAST_ROUTE.set("official_fallback")
+        _LAST_UNSAFE.set(None)
     return _LAST_ROUTE.get()
 
 
@@ -1080,8 +1126,8 @@ def select_route(
         return "official_fallback"
     if _requires_backward(q, k, v, g):
         return "official_fallback"
-    # Numerical validation reads a device flag. Keep graph capture on the
-    # general implementation, which does not require a device-to-host read.
+    # Retain the established graph-capture fallback until device-dispatched
+    # inference and launcher caching have a separate graph-capture contract.
     with torch.cuda.device(q.device):
         if torch.cuda.is_current_stream_capturing():
             return "official_fallback"
@@ -1109,10 +1155,35 @@ def _parallel_wall_attn_fast_path(
     anchor = torch.empty((b, hq, d), device=q.device, dtype=torch.float32)
     output = torch.empty((b, t, hq, d), device=q.device, dtype=v.dtype)
     lse = torch.empty((b, t, hq), device=q.device, dtype=torch.float32)
-    unsafe = torch.zeros((), device=q.device, dtype=torch.int32)
+    if d == 64:
+        flag_count = triton.cdiv(hq * d, 8) if t <= 2048 else triton.cdiv(t, 64) * triton.cdiv(d, 32) * b * hq
+        # Every preprocessing CTA overwrites its own flag, including safe
+        # calls. No initialization launch or contended atomic is needed.
+        unsafe = torch.empty((flag_count,), device=q.device, dtype=torch.int32)
+    else:
+        unsafe = torch.zeros((), device=q.device, dtype=torch.int32)
 
-    fwd.prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe)
-
+    cache_launch = d == 64 and fwd.can_cache_launch()
+    prefix = fwd.prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe,
+                                cache_launch=cache_launch)
+    if d == 64:
+        # Short sequences fuse both mutually exclusive branches. Long ones
+        # isolate fallback code so it does not alter the WGMMA kernel's budget.
+        fwd.parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, capacity=2, scale=scale,
+                                  unsafe=unsafe, cache_launch=cache_launch,
+                                  raw_q=q, raw_k=k, prefix=prefix,
+                                  fallback_impl=_general_wall_attn_fwd_jit)
+        if t >= 2048:
+            kernel = fwd.cached_kernel(_parallel_wall_attn_guarded_fallback_kernel) if cache_launch else _parallel_wall_attn_guarded_fallback_kernel
+            kernel[(1, triton.cdiv(t, 128), b * hq)](
+                unsafe, q, k, v, output, prefix, lse,
+                scale=scale, T=t, H=k.shape[2], HQ=hq, D=d, FLAG_COUNT=unsafe.numel(),
+                num_warps=8, num_stages=2,
+            )
+        _LAST_UNSAFE.set(unsafe)
+        return output
+    if unsafe.item():
+        return None
     fwd.parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, capacity=2, scale=scale)
     return output
 
@@ -1133,10 +1204,11 @@ def parallel_wall_attn(
 
     Fast paths require nonpositive gates and finite, non-underflowing BF16 Q/K
     operands with gauge exponents within +/-125. Other data use the general
-    implementation. Validation synchronizes with the host; graph capture uses
-    the general implementation instead.
+    implementation. D64 inference uses device-side safety dispatch; other fast
+    dimensions retain host validation. Graph capture uses the general path.
     """
     _LAST_ROUTE.set(None)
+    _LAST_UNSAFE.set(None)
     route = select_route(
         q,
         k,
