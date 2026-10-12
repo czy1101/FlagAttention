@@ -37,6 +37,7 @@ def install_msa_prefill(use_tle: bool = False) -> None:
         "minimax_m3_index_score_topk": minimax_m3_index_score_topk,
         "minimax_m3_index_topk": minimax_m3_index_topk,
         "minimax_m3_index_decode": minimax_m3_index_decode,
+        "minimax_m3_index_decode_score": minimax_m3_index_decode_score,
         "minimax_m3_sparse_attn": (minimax_m3_sparse_attn),
         "minimax_m3_sparse_attn_decode": (minimax_m3_sparse_attn_decode),
     }

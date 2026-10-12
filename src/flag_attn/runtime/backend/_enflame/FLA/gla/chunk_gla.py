@@ -2249,7 +2249,7 @@ def chunk_gla(
     output_final_state: bool = False,
     state_v_first: bool = False,
     cu_seqlens: torch.Tensor | None = None,
-    # cu_seqlens_cpu: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -2277,6 +2277,9 @@ def chunk_gla(
         cu_seqlens (torch.Tensor):
             Int32 cumulative sequence lengths of shape `[N+1]` used for
             variable-length training, consistent with the FlashAttention API.
+        cu_seqlens_cpu (torch.Tensor, optional):
+            Optional CPU copy accepted for public API compatibility. Index
+            preparation uses `cu_seqlens` on the device.
 
     Returns:
         o (torch.Tensor):
@@ -2313,6 +2316,9 @@ def chunk_gla(
             cu_seqlens=cu_seqlens
         )
     """
+    # The CPU copy is an optional hint; device lengths remain authoritative,
+    # matching the generic index helper's handling of this argument.
+    del cu_seqlens_cpu
     if cu_seqlens is not None:
         if cu_seqlens.dtype != torch.int32:
             raise TypeError(
@@ -2348,6 +2354,5 @@ def chunk_gla(
         output_final_state,
         state_v_first,
         cu_seqlens,
-        # cu_seqlens_cpu,
     )
     return o, final_state

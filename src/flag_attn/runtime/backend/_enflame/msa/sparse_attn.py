@@ -891,7 +891,6 @@ def _gqa_sparse_decode_kernel_enflame(
     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
     DIRECT_OUTPUT: tl.constexpr,
-    USE_PDL: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # split-K over the topk dimension: pid(0) folds (query-token, chunk).
@@ -905,8 +904,6 @@ def _gqa_sparse_decode_kernel_enflame(
     chunk_start_topk = pid_c * chunk_size_topk
     chunk_end_compiletime = chunk_start_topk + chunk_size_topk
 
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
 
     seq_len = tl.load(seq_lens + req_id)
     query_pos = seq_len - decode_query_len + q_offset
@@ -1001,8 +998,6 @@ def _gqa_sparse_decode_kernel_enflame(
         m_i = m_ij
         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
 
-    if USE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
     # Empty chunks for active rows must store zero output; otherwise the merge
     # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
@@ -1055,14 +1050,9 @@ def _merge_topk_attn_out_kernel_enflame(
     stride_out_d,
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
-    USE_PDL: tl.constexpr,
 ):
     pid_b, pid_h = tl.program_id(0), tl.program_id(1)
 
-    # NOTE: assume seq_lens is safe to load before gdc_wait()
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
     off_c = tl.arange(0, NUM_TOPK_CHUNKS)
     off_d = tl.arange(0, BLOCK_SIZE_D)
@@ -1327,7 +1317,6 @@ def minimax_m3_sparse_attn_decode(
         USE_FP8=use_fp8,
         KV_SCALE_MODE=kv_scale_mode,
         DIRECT_OUTPUT=direct_output,
-        USE_PDL=False,
         num_warps=1,
         num_stages=1,
     )
@@ -1352,7 +1341,6 @@ def minimax_m3_sparse_attn_decode(
         output.stride(1),
         output.stride(2),
         NUM_TOPK_CHUNKS=num_topk_chunks,
-        USE_PDL=False,
         num_warps=1,
         num_stages=1,
     )

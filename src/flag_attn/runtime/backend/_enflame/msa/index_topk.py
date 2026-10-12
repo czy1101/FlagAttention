@@ -10,8 +10,33 @@ import torch
 import triton
 import triton.language as tl
 
-
+# The standalone prefill scorer uses the portable Triton implementation;
+# Enflame specializes fused score/TopK and decode scoring below.
 from ..utils import SPARSE_BLOCK_SIZE, round_up
+
+
+# S60 cannot lower the TLE radix kernel or the generic uint64 packed keys.
+_HAS_TLE_RADIX = False
+_MAX_STREAMING_TOPK = 64
+
+
+def _select_prefill_topk_path(
+    score: torch.Tensor,
+    topk: int,
+    max_query_len: int,
+) -> str:
+    """Keep small selections on S60 reduction; stream larger power-of-two K."""
+    if (
+        score.device.type == "gcu"
+        and score.dtype == torch.float32
+        and score.ndim == 3
+        and 4 < topk <= _MAX_STREAMING_TOPK
+        and (topk & (topk - 1)) == 0
+        and 0 < score.shape[2] <= 0xFFFF
+        and 0 < max_query_len <= 65535
+    ):
+        return "streaming"
+    return "reduction"
 
 
 @triton.jit
@@ -746,6 +771,92 @@ def _prefill_topk_reduction_enflame(
         )
 
 
+@triton.jit
+def _prefill_topk_streaming_enflame(
+    score_ptr,
+    output_ptr,
+    cu_seqlens_q,
+    prefix_lens,
+    init_blocks,
+    local_blocks,
+    max_blocks,
+    stride_sh,
+    stride_sn,
+    stride_sk,
+    stride_oh,
+    stride_on,
+    stride_ok,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    SPARSE_BLOCK: tl.constexpr,
+):
+    """Scan bounded score tiles with separate FP32 scores and INT32 ids."""
+    query_id = tl.program_id(0)
+    request_id = tl.program_id(1)
+    head_id = tl.program_id(2)
+    q_start = tl.load(cu_seqlens_q + request_id)
+    q_end = tl.load(cu_seqlens_q + request_id + 1)
+    if query_id >= q_end - q_start:
+        return
+
+    prefix_len = tl.load(prefix_lens + request_id)
+    valid_blocks = (prefix_len + query_id + SPARSE_BLOCK) // SPARSE_BLOCK
+    valid_blocks = tl.minimum(tl.maximum(valid_blocks, 0), max_blocks)
+    real_selected = tl.minimum(valid_blocks, TOPK)
+    local_start = tl.maximum(valid_blocks - local_blocks, 0)
+    global_query = q_start + query_id
+    slots = tl.arange(0, TOPK)
+    selected_ids = tl.full((TOPK,), -1, tl.int32)
+    offsets = tl.arange(0, BLOCK_SIZE_N)
+
+    for slot in tl.range(0, real_selected):
+        best_score = float("-inf")
+        best_id = max_blocks
+        for tile_start in tl.range(0, valid_blocks, BLOCK_SIZE_N):
+            block_ids = tile_start + offsets
+            visible = block_ids < valid_blocks
+            values = tl.load(
+                score_ptr
+                + head_id * stride_sh
+                + global_query * stride_sn
+                + block_ids * stride_sk,
+                mask=visible,
+                other=float("-inf"),
+            )
+            values = tl.where(values == values, values, float("-inf"))
+            is_local = visible & (block_ids >= local_start)
+            values = tl.where(is_local, 1.0e29, values)
+            is_init = visible & (block_ids < init_blocks) & (values < 1.0e29)
+            values = tl.where(is_init, 1.0e30, values)
+
+            # Track validity separately so masked lanes never tie with -inf.
+            already_selected = tl.sum(
+                (block_ids[:, None] == selected_ids[None, :]).to(tl.int32),
+                axis=1,
+            ) > 0
+            available = visible & ~already_selected
+            tile_score = tl.max(tl.where(available, values, float("-inf")), axis=0)
+            tile_id = tl.min(
+                tl.where(available & (values == tile_score), block_ids, max_blocks),
+                axis=0,
+            )
+            better = (tile_id < max_blocks) & (
+                (tile_score > best_score)
+                | ((tile_score == best_score) & (tile_id < best_id))
+            )
+            best_score = tl.where(better, tile_score, best_score)
+            best_id = tl.where(better, tile_id, best_id)
+        selected_ids = tl.where(slots == slot, best_id, selected_ids)
+
+    tl.store(
+        output_ptr
+        + head_id * stride_oh
+        + global_query * stride_on
+        + slots * stride_ok,
+        selected_ids,
+    )
+
+
 @torch.no_grad()
 def minimax_m3_index_topk(
     score: torch.Tensor,
@@ -757,7 +868,7 @@ def minimax_m3_index_topk(
     local_blocks: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """S60 device-resident reduction TopK for MSA prefill."""
+    """S60 prefill TopK using reduction or streaming selection."""
     if score.ndim != 3:
         raise ValueError(
             "score must have shape "
@@ -816,6 +927,33 @@ def minimax_m3_index_topk(
         ]
 
     if total_q == 0:
+        return topk_idx
+
+    if (
+        _select_prefill_topk_path(score, topk, max_query_len) == "streaming"
+        and batch <= 255
+        and num_heads <= 255
+    ):
+        _prefill_topk_streaming_enflame[(max_query_len, batch, num_heads)](
+            score,
+            topk_idx,
+            cu_seqlens_q,
+            prefix_lens,
+            init_blocks,
+            local_blocks,
+            max_blocks,
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            TOPK=topk,
+            BLOCK_SIZE_N=64,
+            SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+            num_warps=1,
+            num_stages=1,
+        )
         return topk_idx
 
     block_size_n = triton.next_power_of_2(
@@ -1007,7 +1145,6 @@ def _decode_index_score_kernel_enflame(
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     BLOCK_SIZE_Q: tl.constexpr,
     num_kv_chunks: tl.constexpr,
-    USE_PDL: tl.constexpr,
 ):
     BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
@@ -1022,9 +1159,6 @@ def _decode_index_score_kernel_enflame(
     q_mask = q_offsets < decode_query_len
     q_ids = pid_r * decode_query_len + q_offsets
 
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
     seq_len = tl.load(seq_lens + pid_r)
     query_pos = seq_len - decode_query_len + q_offsets
@@ -1183,7 +1317,6 @@ def minimax_m3_index_decode_score(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         BLOCK_SIZE_Q=block_size_q,
         num_kv_chunks=num_kv_chunks,
-        USE_PDL=False,
         num_warps=1,
         num_stages=1,
     )

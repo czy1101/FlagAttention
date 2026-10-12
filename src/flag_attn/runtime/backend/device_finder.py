@@ -62,6 +62,7 @@ def _cuda_vendor() -> str:
     except (AssertionError, OSError, RuntimeError):
         name = ""
     for vendor, names in (
+        ("enflame", ("enflame", "gcu")),
         ("metax", ("metax", "曦云")),
         ("hygon", ("hygon", "dcu")),
         ("iluvatar", ("iluvatar", "天数")),
@@ -93,6 +94,12 @@ def detect_vendor() -> str:
         if value:
             return _normalize_vendor(value)
 
+    if (
+        _is_available("gcu")
+        and getattr(torch.version, "cuda", None) is None
+        and getattr(torch.version, "hip", None) is None
+    ):
+        return "enflame"
     if _is_available("cuda"):
         return _cuda_vendor()
     for vendor in ("enflame", "ascend", "cambricon", "mthreads", "intel"):

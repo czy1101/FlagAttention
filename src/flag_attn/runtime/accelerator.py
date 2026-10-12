@@ -176,12 +176,38 @@ def detect_accelerator(
             return None
         return _make_accelerator(device_type, index)
 
-    for device_type in _AUTO_PRIORITY:
+    automatic_priority = _AUTO_PRIORITY
+    if "gcu" in supported and _is_available("gcu"):
+        # torch_gcu exposes a CUDA-compatible facade. Prefer the real GCU
+        # device when CUDA is that facade instead of an NVIDIA runtime.
+        cuda_backend = _load_backend("cuda")
+        cuda_name = (
+            _device_name(cuda_backend, 0, "cuda").lower()
+            if cuda_backend is not None and _is_available("cuda")
+            else ""
+        )
+        cuda_is_gcu_facade = (
+            (
+                getattr(torch.version, "cuda", None) is None
+                and getattr(torch.version, "hip", None) is None
+            )
+            or "gcu" in cuda_name
+            or "enflame" in cuda_name
+        )
+        if cuda_is_gcu_facade:
+            automatic_priority = (
+                "gcu",
+                *(name for name in _AUTO_PRIORITY if name != "gcu"),
+            )
+
+    for device_type in automatic_priority:
         if device_type not in supported or not _is_available(device_type):
             continue
         index = int(os.environ.get("S60_TEST_DEVICE", "0")) if device_type == "gcu" else 0
         return _make_accelerator(device_type, index)
     return None
+
+
 def set_device(accelerator: Accelerator) -> None:
     backend = _load_backend(accelerator.device_type)
     setter = getattr(backend, "set_device", None)

@@ -1,5 +1,5 @@
 # Curated Enflame S60 Triton configurations.
-# FLAG_ATTN_FAST_AUTOTUNE=1 selects the first entry for each kernel.
+# FLAG_ATTN_FAST_AUTOTUNE=1 selects the first entry for each dispatch key.
 
 chunk_local_cumsum_vector_kernel:
   - META: {BS: 32}
@@ -100,3 +100,91 @@ chunk_gla_fwd_kernel_o_tle:
   - META: {BK: 256, BV: 128, B_VCHUNK: 1}
     num_warps: 1
     num_stages: 2
+
+# Parallax benchmark startup is dominated by compiling and timing candidates
+# for every (T, K, G, window, varlen) key. On the dense BF16 benchmark suite,
+# all 29 FWD/DQR/DKV tuning decisions selected BS=64, one warp, and one stage
+# for BK=64/128. Keep that measured winner first, plus BS=32 as a fallback for
+# FP16, sliding-window, and unseen shapes with different register pressure.
+# Less common BK values retain one safe launch. BS=64 also preserves the
+# packed-variable-length indexing contract.
+parallel_parallax_fwd_kernel:
+  - META: {BK: 16, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 32, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 64, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 64, BS: 32}
+    num_warps: 1
+    num_stages: 2
+  - META: {BK: 128, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 128, BS: 32}
+    num_warps: 1
+    num_stages: 2
+  - META: {BK: 256, BS: 64}
+    num_warps: 2
+    num_stages: 1
+
+parallel_parallax_bwd_kernel_dqr: &parallax_dqr_configs
+  - META: {BK: 16, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 32, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 64, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 64, BS: 32}
+    num_warps: 1
+    num_stages: 2
+  - META: {BK: 128, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 128, BS: 32}
+    num_warps: 1
+    num_stages: 2
+  - META: {BK: 256, BS: 64}
+    num_warps: 2
+    num_stages: 1
+
+parallel_parallax_bwd_kernel_dqr_split: *parallax_dqr_configs
+
+parallel_parallax_bwd_kernel_dkv:
+  - META: {BK: 16, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 32, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 64, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 64, BS: 32}
+    num_warps: 2
+    num_stages: 1
+  - META: {BK: 128, BS: 64}
+    num_warps: 1
+    num_stages: 1
+  - META: {BK: 128, BS: 32}
+    num_warps: 2
+    num_stages: 1
+  - META: {BK: 256, BS: 64}
+    num_warps: 2
+    num_stages: 1
+
+parallel_parallax_bwd_kernel_preprocess:
+  # BP=128 won all three measured dense BF16 cases (T=1024/2048/8192).
+  - META: {BP: 128}
+    num_warps: 1
+    num_stages: 1
+  # Keep BP=64 for packed variable lengths, where BP must equal BT.
+  - META: {BP: 64}
+    num_warps: 1
+    num_stages: 1

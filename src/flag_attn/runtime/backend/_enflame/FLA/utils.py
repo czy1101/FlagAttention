@@ -15,6 +15,23 @@ import torch
 ENFLAME_MAX_GRID_X = 65_535
 ENFLAME_MAX_GRID_YZ = 255
 
+
+@functools.lru_cache(maxsize=None)
+def get_num_sms(device_index: int | None = None) -> int:
+    """Return the selected GCU device's multiprocessor count when available."""
+    if not hasattr(torch, "gcu"):
+        return 0
+    try:
+        properties = torch.gcu.get_device_properties(device_index)
+    except (AttributeError, RuntimeError, TypeError):
+        return 0
+    for name in ("multi_processor_count", "num_sms", "cluster_count"):
+        value = getattr(properties, name, None)
+        if value is not None:
+            return int(value)
+    return 0
+
+
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     cache_entries: list[tuple[tuple, dict, Any]] = []
     cache_size = 8
@@ -157,6 +174,7 @@ def make_grid_2d(
 
 __all__ = [
     "check_shared_mem",
+    "get_num_sms",
     "input_guard",
     "make_grid_2d",
     "make_grid_3d",

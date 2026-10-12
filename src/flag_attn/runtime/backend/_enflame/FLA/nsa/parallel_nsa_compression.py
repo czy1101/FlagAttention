@@ -16,9 +16,7 @@ from flag_attn.parallel_nsa.triton_ops_helper import (
     exp,
     log,
 )
-from flag_attn.parallel_nsa.utils import (
-    check_shared_mem,
-)
+from ..utils import check_shared_mem
 
 
 # Compression attention forward

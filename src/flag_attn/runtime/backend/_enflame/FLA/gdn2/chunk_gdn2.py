@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 
 # 此仓库的pre index的入口参数没有BT，不支持varlen
-from ..compat import exp, exp2, has_triton_tle
+from ..compat import exp, exp2
 from ..index import prepare_chunk_indices, prepare_chunk_offsets
 
 
@@ -56,9 +56,9 @@ _S60_STATE_NUM_WARPS = 1
 _S60_STATE_NUM_STAGES = 2
 _S60_FUSED_BT = 64
 
-# Retained as capability metadata for existing benchmark/test imports. Runtime
-# dispatch does not depend on it: the fused Triton kernels are always defined.
-HAS_TLE_GDN2 = has_triton_tle(3, 6, 0)
+# Compatibility metadata describes this backend implementation, which always
+# uses the fused plain-Triton kernels regardless of installed TLE modules.
+HAS_TLE_GDN2 = False
 
 __all__ = ["chunk_gdn2"]
 

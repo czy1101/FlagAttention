@@ -55,13 +55,22 @@ _tuned_config_loader = TunedConfigLoader("enflame")
 
 
 def get_tuned_config(
-    op_name: str, fallback: Sequence[triton.Config]
+    op_name: str,
+    fallback: Sequence[triton.Config],
+    *,
+    fast_autotune_key: str | None = None,
 ) -> list[triton.Config]:
     if os.environ.get("FLAG_ATTN_USE_TUNED_CONFIGS", "1") == "0":
         return list(fallback)
     configs = _tuned_config_loader.get_tuned_config(op_name)
     if configs and os.environ.get("FLAG_ATTN_FAST_AUTOTUNE", "0") == "1":
-        return [configs[0]]
+        if fast_autotune_key is None:
+            return [configs[0]]
+        selected = {}
+        for config in configs:
+            value = config.kwargs.get(fast_autotune_key)
+            selected.setdefault(value, config)
+        return list(selected.values())
     return list(configs) if configs else list(fallback)
 
 
