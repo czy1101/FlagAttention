@@ -18,15 +18,17 @@ from __future__ import annotations
 
 import importlib
 
-_OPERATOR_EXPORTS = {
-    'SPARSE_BLOCK_SIZE': ('.minimax_sparse_attention.index_topk', 'SPARSE_BLOCK_SIZE'),
-    'minimax_m3_index_decode': ('.minimax_sparse_attention', 'minimax_m3_index_decode'),
-    'minimax_m3_index_decode_score': ('.minimax_sparse_attention', 'minimax_m3_index_decode_score'),
-    'minimax_m3_index_score': ('.minimax_sparse_attention', 'minimax_m3_index_score'),
-    'minimax_m3_index_topk': ('.minimax_sparse_attention', 'minimax_m3_index_topk'),
-    'minimax_m3_sparse_attn': ('.minimax_sparse_attention', 'minimax_m3_sparse_attn'),
-    'minimax_m3_sparse_attn_decode': ('.minimax_sparse_attention', 'minimax_m3_sparse_attn_decode'),
-}
+_OPERATOR_EXPORTS = {'SPARSE_BLOCK_SIZE': ('.minimax_sparse_attention.index_topk', 'SPARSE_BLOCK_SIZE'),
+ 'chunk_gdn2': ('.FLA.gdn2.chunk_gdn2', 'chunk_gdn2'),
+ 'diffkv_attention': ('.diffkv_attention.api', 'diffkv_attention'),
+ 'minimax_m3_index_decode': ('.minimax_sparse_attention', 'minimax_m3_index_decode'),
+ 'minimax_m3_index_decode_score': ('.minimax_sparse_attention', 'minimax_m3_index_decode_score'),
+ 'minimax_m3_index_score': ('.minimax_sparse_attention', 'minimax_m3_index_score'),
+ 'minimax_m3_index_topk': ('.minimax_sparse_attention', 'minimax_m3_index_topk'),
+ 'minimax_m3_sparse_attn': ('.minimax_sparse_attention', 'minimax_m3_sparse_attn'),
+ 'minimax_m3_sparse_attn_decode': ('.minimax_sparse_attention', 'minimax_m3_sparse_attn_decode'),
+ 'sage_attention': ('.sage_attention.attn_qk_int8_per_block', 'forward'),
+ 'sage_attention_per_block_int8': ('.sage_attention.quant_per_block', 'per_block_int8')}
 
 
 def __getattr__(name: str):
