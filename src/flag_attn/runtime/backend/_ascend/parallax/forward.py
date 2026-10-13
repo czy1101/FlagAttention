@@ -329,7 +329,10 @@ def parallax_forward(
 
     group_size = hq // h
     block_d = triton.next_power_of_2(dim)
-    block_t = 64 if window_size_left < 0 and dim <= 64 else 16
+    # A 64x64 causal tile produced nonfinite saved correction state for a
+    # short D16 GQA input. Keep sequences shorter than the query tile smaller;
+    # the underlying compiler issue is not yet identified.
+    block_t = 64 if window_size_left < 0 and dim <= 64 and time >= 64 else 16
     # Full causal attention amortizes the two score contractions and two PV
     # products better with a wider key tile. Windowed attention keeps BS=32:
     # BS=64 loads too many keys around each short-window boundary.

@@ -20,6 +20,7 @@ import triton.language as tl
 _LOG2E = tl.constexpr(1.4426950408889634)
 _BLOCK_N = 128
 _MAX_SPLITS = 64
+_MAX_FULLSCORE_SPLITS = 8
 _SPLIT_THRESHOLD = 512
 _AICORE_TARGET = 32
 
@@ -105,45 +106,30 @@ def _decode_single_kernel(
 
 
 @triton.jit
-def _decode_combined_pv_short_kernel(q, r, k, v, out, scale):
-    """Single-block short decode; combine the two PV states algebraically."""
-    offs_d = tl.arange(0, 64)
+def _decode_combined_pv_short_kernel(q, r, k, v, out, scale, Skv: tl.constexpr,
+                                     HQ: tl.constexpr, H: tl.constexpr, K: tl.constexpr):
+    """Masked short MHA decode, staging features in 64-wide pieces."""
+    bh = tl.program_id(0).to(tl.int64)
+    batch, head = bh // HQ, bh % HQ
     offs_n = tl.arange(0, 128)
-    b_q = tl.load(q + offs_d).to(tl.float32)
-    b_r = tl.load(r + offs_d).to(tl.float32)
-    offsets = offs_n[:, None] * 64 + offs_d[None, :]
-    b_k = tl.load(k + offsets).to(tl.float32)
-    scores = tl.sum(b_k * b_q[None, :], axis=1) * (scale * _LOG2E)
-    r_scores = tl.sum(b_k * b_r[None, :], axis=1)
-    m = tl.max(scores, axis=0)
-    p = _exp2(scores - m)
-    d1 = tl.sum(p, axis=0)
-    d2 = tl.sum(p * r_scores, axis=0)
-    inv_d1 = 1.0 / d1
-    weights = p * (1.0 + d2 * inv_d1 - r_scores) * inv_d1
-    b_v = tl.load(v + offsets).to(tl.float32)
-    result = tl.sum(weights[:, None] * b_v, axis=0)
-    tl.store(out + offs_d, result)
+    mask_n = offs_n < Skv
+    offs_d64 = tl.arange(0, 64)
+    s1 = tl.zeros((128,), tl.float32)
+    s2 = tl.zeros((128,), tl.float32)
 
+    for d_block in range(tl.cdiv(K, 64)):
+        offs_d = d_block * 64 + offs_d64
+        mask_d = offs_d < K
+        q_offset = bh * K + offs_d
+        b_q = tl.load(q + q_offset, mask=mask_d, other=0.0).to(tl.float32)
+        b_r = tl.load(r + q_offset, mask=mask_d, other=0.0).to(tl.float32)
+        offsets = ((batch * Skv + offs_n[:, None]) * H + head) * K + offs_d[None, :]
+        mask = mask_n[:, None] & mask_d[None, :]
+        b_k = tl.load(k + offsets, mask=mask, other=0.0).to(tl.float32)
+        s1 += tl.sum(b_k * b_q[None, :], axis=1)
+        s2 += tl.sum(b_k * b_r[None, :], axis=1)
 
-@triton.jit
-def _decode_combined_pv_d128_short_kernel(q, r, k, v, out, scale):
-    """D=128 short decode with D64-streamed scores and a single PV state."""
-    offs_n = tl.arange(0, 128)
-    offs_d = tl.arange(0, 64)
-    q0 = tl.load(q + offs_d).to(tl.float32)
-    q1 = tl.load(q + 64 + offs_d).to(tl.float32)
-    r0 = tl.load(r + offs_d).to(tl.float32)
-    r1 = tl.load(r + 64 + offs_d).to(tl.float32)
-    offsets0 = offs_n[:, None] * 128 + offs_d[None, :]
-    offsets1 = offsets0 + 64
-    k0 = tl.load(k + offsets0).to(tl.float32)
-    s1 = tl.sum(k0 * q0[None, :], axis=1)
-    s2 = tl.sum(k0 * r0[None, :], axis=1)
-    k1 = tl.load(k + offsets1).to(tl.float32)
-    s1 += tl.sum(k1 * q1[None, :], axis=1)
-    s2 += tl.sum(k1 * r1[None, :], axis=1)
-    s1 *= scale * _LOG2E
+    s1 = tl.where(mask_n, s1 * (scale * _LOG2E), -float("inf"))
     m = tl.max(s1, axis=0)
     p = _exp2(s1 - m)
     d1 = tl.sum(p, axis=0)
@@ -151,12 +137,13 @@ def _decode_combined_pv_d128_short_kernel(q, r, k, v, out, scale):
     inv_d1 = 1.0 / d1
     weights = p * (1.0 + d2 * inv_d1 - s2) * inv_d1
 
-    v0 = tl.load(v + offsets0).to(tl.float32)
-    o0 = tl.sum(weights[:, None] * v0, axis=0)
-    v1 = tl.load(v + offsets1).to(tl.float32)
-    o1 = tl.sum(weights[:, None] * v1, axis=0)
-    tl.store(out + offs_d, o0)
-    tl.store(out + 64 + offs_d, o1)
+    for d_block in range(tl.cdiv(K, 64)):
+        offs_d = d_block * 64 + offs_d64
+        mask_d = offs_d < K
+        offsets = ((batch * Skv + offs_n[:, None]) * H + head) * K + offs_d[None, :]
+        b_v = tl.load(v + offsets, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+        result = tl.sum(weights[:, None] * b_v, axis=0)
+        tl.store(out + bh * K + offs_d, result, mask=mask_d)
 
 
 @triton.jit(do_not_specialize=["Skv"])
@@ -363,11 +350,25 @@ def _choose_num_splits(batch_heads: int, kv_len: int, block_n: int, dim: int) ->
     return max(1, min(triton.cdiv(2 * _AICORE_TARGET, batch_heads), blocks, _MAX_SPLITS))
 
 
-def _decode_large_mha_fullscore(q, r, k, v, *, scale, out, merge_kernel):
-    """Lazy-load the TLE path only for its narrowly validated BF16 shapes."""
+def _decode_large_mha_fullscore(q, r, k, v, *, scale, out, merge_kernel, num_splits):
+    """Lazy-load the shared score/PV path for supported BF16 MHA ranges."""
     from .large_decode import decode_large_mha_fullscore
 
-    return decode_large_mha_fullscore(q, r, k, v, scale=scale, out=out, merge_kernel=merge_kernel)
+    return decode_large_mha_fullscore(
+        q, r, k, v, scale=scale, out=out, merge_kernel=merge_kernel,
+        num_splits=num_splits,
+    )
+
+
+def _choose_fullscore_splits(length: int) -> int:
+    """Choose a tile-dividing split count with bounded statistics vectors."""
+    tiles = length // 1024
+    if length <= 8192 or length % 1024:
+        return 1 if 1024 <= length <= 8192 and length % 1024 == 0 else 0
+    for splits in range(min(_MAX_FULLSCORE_SPLITS, tiles), 0, -1):
+        if tiles % splits == 0 and length // splits <= 8192:
+            return splits
+    return 0
 
 
 def parallax_attn_with_kvcache(
@@ -399,66 +400,45 @@ def parallax_attn_with_kvcache(
     )
     result = torch.empty_like(q) if out is None else out
     block_k = triton.next_power_of_2(dim)
-    # Full-score plus split-wide Full-D PV is measured only for these three
-    # BF16 MHA decode tuples. Runtime lengths, windows, GQA, and all other
-    # shapes deliberately retain the existing path below.
+    # Dense BF16 MHA D128 uses corrected full-cache PV through 8192 tokens;
+    # longer supported lengths use the split/two-moment path.
     if (
         q.dtype == torch.bfloat16
         and dim == 128
         and query_heads == kv_heads
         and seqused_k is None
         and window_left < 0
-        and (
-            (batch == 1 and query_heads == 8 and length in (8192, 16384))
-            or (batch == 4 and query_heads == 16 and length == 16384)
-        )
     ):
+        fullscore_splits = _choose_fullscore_splits(length)
+    else:
+        fullscore_splits = 0
+    if fullscore_splits:
         return _decode_large_mha_fullscore(
             q, r, k_cache, v_cache,
             scale=float(scale), out=result, merge_kernel=_decode_merge_kernel,
+            num_splits=fullscore_splits,
         )
 
-    # This exact short BF16 shape is faster with one combined weighted-V
-    # reduction than maintaining both online PV vectors. Keep dispatch narrow:
-    # the algebraic form has only been measured for this official decode case.
     if (
-        batch == 1
-        and length == 128
-        and query_heads == 1
-        and kv_heads == 1
-        and dim == 64
+        1 <= length <= 128
+        and query_heads == kv_heads
+        and dim in (64, 128)
         and q.dtype == torch.bfloat16
         and seqused_k is None
         and window_left < 0
     ):
-        _decode_combined_pv_short_kernel[(1,)](
+        batch_heads = batch * query_heads
+        _decode_combined_pv_short_kernel[(batch_heads,)](
             q,
             r,
             k_cache,
             v_cache,
             result,
             float(scale),
-            num_warps=4,
-            num_stages=2,
-        )
-        return result
-    if (
-        batch == 1
-        and length == 128
-        and query_heads == 1
-        and kv_heads == 1
-        and dim == 128
-        and q.dtype == torch.bfloat16
-        and seqused_k is None
-        and window_left < 0
-    ):
-        _decode_combined_pv_d128_short_kernel[(1,)](
-            q,
-            r,
-            k_cache,
-            v_cache,
-            result,
-            float(scale),
+            Skv=length,
+            HQ=query_heads,
+            H=kv_heads,
+            K=dim,
             num_warps=4,
             num_stages=2,
         )
