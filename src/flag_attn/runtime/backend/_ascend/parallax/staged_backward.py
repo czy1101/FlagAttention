@@ -275,14 +275,10 @@ def staged_parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
         current_stream.wait_stream(dqr_stream)
         current_stream.wait_stream(dkv_stream)
     if group > 1:
-        from .backward import _reduce_gqa_kernel
+        from .backward import _launch_reduce_gqa
         grad_k = torch.empty_like(k)
         grad_v = torch.empty_like(v)
         n = bsz * time * h * dim
-        reduce_block = 128
-        _reduce_gqa_kernel[(triton.cdiv(n, reduce_block),)](
-            grad_k_buf, grad_v_buf, grad_k, grad_v, n, h * parts, h, parts, dim, reduce_block,
-            num_warps=4,
-        )
+        _launch_reduce_gqa(grad_k_buf, grad_v_buf, grad_k, grad_v, n, h * parts, h, parts, dim)
         return grad_q, grad_r, grad_k, grad_v
     return grad_q, grad_r, grad_k_buf, grad_v_buf

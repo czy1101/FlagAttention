@@ -61,7 +61,8 @@ def parallel_parallax(
     """Causal Parallax attention with Ascend Triton autograd support.
 
     Tensors use ``[B, T, H, D]`` layout. ``window_size`` is the number of
-    causal keys retained (including the diagonal), and ``cu_seqlens`` selects
+    causal keys retained (including the diagonal); ``None`` or ``-1`` disables
+    the window. ``cu_seqlens`` selects
     packed variable-length sequences with batch size one.
     """
     if "head_first" in kwargs:
@@ -70,9 +71,9 @@ def parallel_parallax(
         unexpected = ", ".join(sorted(kwargs))
         raise TypeError(f"parallel_parallax got unexpected keyword argument(s): {unexpected}")
     if window_size is not None and (
-        not isinstance(window_size, int) or window_size <= 0
+        not isinstance(window_size, int) or (window_size != -1 and window_size <= 0)
     ):
-        raise ValueError("window_size must be a positive integer or None")
+        raise ValueError("window_size must be a positive integer, -1, or None")
     if scale is None:
         scale = k.shape[-1] ** -0.5
     window_size_left = -1 if window_size is None else int(window_size)

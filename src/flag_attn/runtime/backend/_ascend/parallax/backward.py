@@ -240,20 +240,42 @@ def _dkv_kernel(q, r, k, v, o, barv, d1, bart, m, delta_t, delta_b, grad_o, grad
 
 @triton.jit
 def _reduce_gqa_kernel(gk_buf, gv_buf, gk, gv, N: tl.constexpr, HQ: tl.constexpr,
-                       H: tl.constexpr, G: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr):
-    x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    hdim = x % D
-    rowhead = x // D
-    h = rowhead % H
-    bhrow = rowhead // H
-    src = (bhrow * HQ + h * G) * D + hdim
-    ak = tl.zeros((BLOCK,), tl.float32)
-    av = tl.zeros((BLOCK,), tl.float32)
-    for g in range(G):
-        ak += tl.load(gk_buf + src + g * D, x < N, 0).to(tl.float32)
-        av += tl.load(gv_buf + src + g * D, x < N, 0).to(tl.float32)
-    tl.store(gk + x, ak, x < N)
-    tl.store(gv + x, av, x < N)
+                       H: tl.constexpr, G: tl.constexpr, D: tl.constexpr,
+                       BLOCK: tl.constexpr, NUM_PROGRAMS: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    first = tl.program_id(0) * BLOCK
+    # Keep the grid bounded and let each CTA process multiple contiguous tiles.
+    for base in tl.range(first, N, NUM_PROGRAMS * BLOCK, loop_unroll_factor=1):
+        x = base + offsets
+        hdim = x % D
+        rowhead = x // D
+        h = rowhead % H
+        bhrow = rowhead // H
+        src = (bhrow * HQ + h * G) * D + hdim
+        valid = x < N
+        ak = tl.zeros((BLOCK,), tl.float32)
+        av = tl.zeros((BLOCK,), tl.float32)
+        for g in range(G):
+            ak += tl.load(gk_buf + src + g * D, valid, 0).to(tl.float32)
+            av += tl.load(gv_buf + src + g * D, valid, 0).to(tl.float32)
+        tl.store(gk + x, ak, valid)
+        tl.store(gv + x, av, valid)
+
+
+_REDUCE_GQA_BLOCK = 128
+_REDUCE_GQA_MAX_PROGRAMS = 1024
+
+
+def _launch_reduce_gqa(gk_buf, gv_buf, gk, gv, n, hq, h, group, dim):
+    """Reduce per-query-head scratch with a small grid and persistent CTAs."""
+    if n <= 0:
+        return
+    block = _REDUCE_GQA_BLOCK
+    programs = min(triton.cdiv(n, block), _REDUCE_GQA_MAX_PROGRAMS)
+    _reduce_gqa_kernel[(programs,)](
+        gk_buf, gv_buf, gk, gv, n, hq, h, group, dim, block, programs,
+        num_warps=4,
+    )
 
 
 def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
@@ -393,8 +415,5 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
         grad_k = torch.empty_like(k)
         grad_v = torch.empty_like(v)
         n = bsz * total_t * hkv * dim
-        _reduce_gqa_kernel[(triton.cdiv(n, 128),)](
-            grad_k_buf, grad_v_buf, grad_k, grad_v, n, hq, hkv, G, dim, 128,
-            num_warps=4,
-        )
+        _launch_reduce_gqa(grad_k_buf, grad_v_buf, grad_k, grad_v, n, hq, hkv, G, dim)
     return grad_q, grad_r, grad_k, grad_v
