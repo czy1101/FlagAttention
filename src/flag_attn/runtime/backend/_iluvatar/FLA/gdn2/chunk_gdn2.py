@@ -46,7 +46,7 @@ from .compat import (
     prepare_chunk_offsets,
 )
 
-# 此仓库的pre index的入口参数没有BT，不支持varlen
+# This repo's pre-index entry has no BT argument and does not support varlen.
 from .gdn2_native.chunk_fwd import chunk_gdn2_fwd
 
 LN2 = 0.6931471805599453
@@ -71,8 +71,8 @@ _CONFIG_PATH = Path(__file__).resolve().parents[2] / "tune_configs.yaml"
 
 
 @lru_cache(maxsize=1)
-def _load_autotune_config() -> dict[str, list[dict[str, Any]]]:
-    """Read the backend's single JSON-compatible YAML file."""
+def _load_tuned_config() -> dict[str, list[dict[str, Any]]]:
+    """Read the backend's JSON-compatible tune_configs.yaml."""
     if not _CONFIG_PATH.is_file():
         return {}
     data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -81,21 +81,20 @@ def _load_autotune_config() -> dict[str, list[dict[str, Any]]]:
     return data
 
 
-def _get_autotune_configs(
+def _autotune_configs(
     kernel_name: str,
     defaults: list[triton.Config],
 ) -> list[triton.Config]:
-    """Return curated yaml configs, or the caller's untouched defaults.
+    """Return the curated yaml pool only when the caller asks for it.
 
-    ``FLAG_ATTN_GDN2_FAST_AUTOTUNE=1`` must be set before importing this module.
-    The first yaml entry is used unless ``FLAG_ATTN_GDN2_FAST_MULTI=1``, which
-    searches every entry for that kernel. Without the fast-autotune flag this
-    returns ``defaults``.
+    ``FLAG_ATTN_GDN2_FAST_AUTOTUNE=1`` must be set before this module is
+    imported. The flag selects every yaml entry for ``kernel_name``. Without
+    it, autotune keeps ``defaults``.
     """
     if os.environ.get("FLAG_ATTN_GDN2_FAST_AUTOTUNE", "0") != "1":
         return defaults
 
-    entries = _load_autotune_config().get(kernel_name)
+    entries = _load_tuned_config().get(kernel_name)
     if not entries:
         return defaults
 
@@ -112,10 +111,7 @@ def _get_autotune_configs(
             if name in entry
         }
         configs.append(triton.Config(meta, **kwargs))
-
-    if os.environ.get("FLAG_ATTN_GDN2_FAST_MULTI", "0") == "1":
-        return configs
-    return configs[:1]
+    return configs
 
 
 def _generate_constraints(num_pack):
@@ -171,7 +167,7 @@ def softplus_nv(x):
 
 softplus = softplus_nv
 
-# triton实现
+# Triton implementation
 
 # 3. TLE kernels for GDN-2 prefill, BT=16, inference path.
 if HAS_TLE_GDN2:
@@ -192,7 +188,7 @@ if HAS_TLE_GDN2:
         }
     )
     @triton.autotune(
-        configs=_get_autotune_configs(
+        configs=_autotune_configs(
             "_chunk_gdn2_fwd_intra_infer_kernel",
             [
                 triton.Config(
@@ -263,6 +259,7 @@ if HAS_TLE_GDN2:
             bos = i_b * T
             eos = i_b * T + T
 
+        # Varlen packs every sequence into one chunk axis; chunk_offsets locates it in K2.
         decay_chunk = i_t_global if IS_VARLEN else i_b * tl.cdiv(T, BT) + i_t
 
         if i_t * BT >= T:
@@ -571,18 +568,12 @@ if HAS_TLE_GDN2:
         }
     )
     @triton.autotune(
-        configs=_get_autotune_configs(
+        configs=_autotune_configs(
             "_chunk_gdn2_fwd_h_o_infer_kernel",
             [
-                triton.Config(
-                    {"BV": BV, "FULL_K_TILE": full_k_tile},
-                    num_warps=num_warps,
-                    num_stages=num_stages,
-                )
-                for full_k_tile in [False, True]
+                triton.Config({"BV": BV}, num_warps=num_warps)
                 for BV in [32, 64]
                 for num_warps in [2, 4]
-                for num_stages in [1, 2, 3]
             ],
         ),
         key=["H", "K", "V", "BT"],
@@ -608,13 +599,11 @@ if HAS_TLE_GDN2:
         V: tl.constexpr,
         BT: tl.constexpr,
         BV: tl.constexpr,
-        BK: tl.constexpr,
         STATE_V_FIRST: tl.constexpr,
         USE_INITIAL_STATE: tl.constexpr,
         STORE_FINAL_STATE: tl.constexpr,
         STORE_H: tl.constexpr,
         IS_VARLEN: tl.constexpr,
-        FULL_K_TILE: tl.constexpr = False,
     ):
         i_v = tl.program_id(0)
         i_nh = tl.program_id(1)
@@ -643,144 +632,128 @@ if HAS_TLE_GDN2:
         Aqk += (bos * H + i_h).to(tl.int64) * BT
         o += (bos * H + i_h).to(tl.int64) * V
 
-        if FULL_K_TILE:
-            # Keep the state in one K tile so projection and update layouts are reused.
-            if STATE_V_FIRST:
-                b_h = tl.zeros([BV, BK], dtype=tl.float32)
-            else:
-                b_h = tl.zeros([BK, BV], dtype=tl.float32)
-
-            if USE_INITIAL_STATE:
-                if STATE_V_FIRST:
-                    p_h0 = tl.make_block_ptr(
-                        h0 + i_nh * K * V, (V, K), (K, 1),
-                        (i_v * BV, 0), (BV, BK), (1, 0)
-                    )
-                else:
-                    p_h0 = tl.make_block_ptr(
-                        h0 + i_nh * K * V, (K, V), (V, 1),
-                        (0, i_v * BV), (BK, BV), (1, 0)
-                    )
-                b_h += tl.load(p_h0, boundary_check=(0, 1)).to(tl.float32)
-
-            if STORE_H:
-                h += (boh * H + i_h).to(tl.int64) * K * V
-
-            for i_t in range(NT):
-                if STORE_H:
-                    i_t64 = i_t.to(tl.int64)
-                    if STATE_V_FIRST:
-                        p_h = tl.make_block_ptr(
-                            h + i_t64 * H * K * V, (V, K), (K, 1),
-                            (i_v * BV, 0), (BV, BK), (1, 0)
-                        )
-                    else:
-                        p_h = tl.make_block_ptr(
-                            h + i_t64 * H * K * V, (K, V), (V, 1),
-                            (0, i_v * BV), (BK, BV), (1, 0)
-                        )
-                    tl.store(p_h, b_h.to(p_h.dtype.element_ty), boundary_check=(0, 1))
-
-                p_w = tl.make_block_ptr(
-                    w_wy, (T, K), (H * K, 1), (i_t * BT, 0), (BT, BK), (1, 0)
-                )
-                b_w_blk = tl.load(p_w, boundary_check=(0, 1))
-                if STATE_V_FIRST:
-                    b_v_new = tl.dot(b_w_blk, tl.trans(b_h).to(b_w_blk.dtype))
-                else:
-                    b_v_new = tl.dot(b_w_blk, b_h.to(b_w_blk.dtype))
-                p_u = tl.make_block_ptr(
-                    u_wy, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-                )
-                b_v_new = tl.load(p_u, boundary_check=(0, 1)) - b_v_new
-
-                p_qg = tl.make_block_ptr(
-                    qg, (T, K), (H * K, 1), (i_t * BT, 0), (BT, BK), (1, 0)
-                )
-                b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
-                if STATE_V_FIRST:
-                    b_o = tl.dot(b_qg_blk, tl.trans(b_h).to(b_qg_blk.dtype))
-                else:
-                    b_o = tl.dot(b_qg_blk, b_h.to(b_qg_blk.dtype))
-                b_o *= scale
-                p_Aqk = tl.make_block_ptr(
-                    Aqk, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-                )
-                b_Aqk = tl.load(p_Aqk, boundary_check=(0, 1))
-                # BF16 keeps the FP32 exponent range; retain FP32 operands otherwise.
-                if Aqk.dtype.element_ty == tl.bfloat16:
-                    b_o += tl.dot(b_Aqk, b_v_new.to(tl.bfloat16))
-                else:
-                    b_o += tl.dot(b_Aqk.to(b_v_new.dtype), b_v_new)
-                p_o = tl.make_block_ptr(
-                    o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-                )
-                tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-
-                o_k = tl.arange(0, BK)
-                b_g_decay = tl.load(
-                    gk + i_t * H * K + o_k, mask=o_k < K, other=1.0
-                ).to(tl.float32)
-                if STATE_V_FIRST:
-                    b_h *= b_g_decay[None, :]
-                else:
-                    b_h *= b_g_decay[:, None]
-                b_v_cast = b_v_new.to(kg.dtype.element_ty)
-                p_kg = tl.make_block_ptr(
-                    kg, (K, T), (1, H * K), (0, i_t * BT), (BK, BT), (0, 1)
-                )
-                b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
-                if STATE_V_FIRST:
-                    b_h += tl.trans(tl.dot(b_kg_blk, b_v_cast))
-                else:
-                    b_h += tl.dot(b_kg_blk, b_v_cast)
-
-            if STORE_FINAL_STATE:
-                if STATE_V_FIRST:
-                    p_ht = tl.make_block_ptr(
-                        ht + i_nh * K * V, (V, K), (K, 1),
-                        (i_v * BV, 0), (BV, BK), (1, 0)
-                    )
-                else:
-                    p_ht = tl.make_block_ptr(
-                        ht + i_nh * K * V, (K, V), (V, 1),
-                        (0, i_v * BV), (BK, BV), (1, 0)
-                    )
-                tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-
+        if STATE_V_FIRST:
+            b_h1 = tl.zeros([BV, 64], dtype=tl.float32)
+            if K > 64:
+                b_h2 = tl.zeros([BV, 64], dtype=tl.float32)
+            if K > 128:
+                b_h3 = tl.zeros([BV, 64], dtype=tl.float32)
+            if K > 192:
+                b_h4 = tl.zeros([BV, 64], dtype=tl.float32)
         else:
-            if STATE_V_FIRST:
-                b_h1 = tl.zeros([BV, 64], dtype=tl.float32)
-                if K > 64:
-                    b_h2 = tl.zeros([BV, 64], dtype=tl.float32)
-                if K > 128:
-                    b_h3 = tl.zeros([BV, 64], dtype=tl.float32)
-                if K > 192:
-                    b_h4 = tl.zeros([BV, 64], dtype=tl.float32)
-            else:
-                b_h1 = tl.zeros([64, BV], dtype=tl.float32)
-                if K > 64:
-                    b_h2 = tl.zeros([64, BV], dtype=tl.float32)
-                if K > 128:
-                    b_h3 = tl.zeros([64, BV], dtype=tl.float32)
-                if K > 192:
-                    b_h4 = tl.zeros([64, BV], dtype=tl.float32)
+            b_h1 = tl.zeros([64, BV], dtype=tl.float32)
+            if K > 64:
+                b_h2 = tl.zeros([64, BV], dtype=tl.float32)
+            if K > 128:
+                b_h3 = tl.zeros([64, BV], dtype=tl.float32)
+            if K > 192:
+                b_h4 = tl.zeros([64, BV], dtype=tl.float32)
 
-            if USE_INITIAL_STATE:
+        if USE_INITIAL_STATE:
+            if STATE_V_FIRST:
+                p_h0_1 = tl.make_block_ptr(
+                    h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+                )
+            else:
+                p_h0_1 = tl.make_block_ptr(
+                    h0 + i_nh * K * V, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+                )
+            b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
+
+            if K > 64:
                 if STATE_V_FIRST:
-                    p_h0_1 = tl.make_block_ptr(
-                        h0 + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+                    p_h0_2 = tl.make_block_ptr(
+                        h0 + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 64),
+                        (BV, 64),
+                        (1, 0),
                     )
                 else:
-                    p_h0_1 = tl.make_block_ptr(
-                        h0 + i_nh * K * V, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+                    p_h0_2 = tl.make_block_ptr(
+                        h0 + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (64, i_v * BV),
+                        (64, BV),
+                        (1, 0),
                     )
-                b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
+                b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
+
+            if K > 128:
+                if STATE_V_FIRST:
+                    p_h0_3 = tl.make_block_ptr(
+                        h0 + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 128),
+                        (BV, 64),
+                        (1, 0),
+                    )
+                else:
+                    p_h0_3 = tl.make_block_ptr(
+                        h0 + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (128, i_v * BV),
+                        (64, BV),
+                        (1, 0),
+                    )
+                b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
+
+            if K > 192:
+                if STATE_V_FIRST:
+                    p_h0_4 = tl.make_block_ptr(
+                        h0 + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 192),
+                        (BV, 64),
+                        (1, 0),
+                    )
+                else:
+                    p_h0_4 = tl.make_block_ptr(
+                        h0 + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (192, i_v * BV),
+                        (64, BV),
+                        (1, 0),
+                    )
+                b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
+
+        if STORE_H:
+            h += (boh * H + i_h).to(tl.int64) * K * V
+
+        for i_t in range(NT):
+            # Optional: store the pre-chunk state.
+            if STORE_H:
+                i_t64 = i_t.to(tl.int64)
+                if STATE_V_FIRST:
+                    p_h1 = tl.make_block_ptr(
+                        h + i_t64 * H * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 0),
+                        (BV, 64),
+                        (1, 0),
+                    )
+                else:
+                    p_h1 = tl.make_block_ptr(
+                        h + i_t64 * H * K * V,
+                        (K, V),
+                        (V, 1),
+                        (0, i_v * BV),
+                        (64, BV),
+                        (1, 0),
+                    )
+                tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
 
                 if K > 64:
                     if STATE_V_FIRST:
-                        p_h0_2 = tl.make_block_ptr(
-                            h0 + i_nh * K * V,
+                        p_h2 = tl.make_block_ptr(
+                            h + i_t64 * H * K * V,
                             (V, K),
                             (K, 1),
                             (i_v * BV, 64),
@@ -788,20 +761,22 @@ if HAS_TLE_GDN2:
                             (1, 0),
                         )
                     else:
-                        p_h0_2 = tl.make_block_ptr(
-                            h0 + i_nh * K * V,
+                        p_h2 = tl.make_block_ptr(
+                            h + i_t64 * H * K * V,
                             (K, V),
                             (V, 1),
                             (64, i_v * BV),
                             (64, BV),
                             (1, 0),
                         )
-                    b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
+                    tl.store(
+                        p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1)
+                    )
 
                 if K > 128:
                     if STATE_V_FIRST:
-                        p_h0_3 = tl.make_block_ptr(
-                            h0 + i_nh * K * V,
+                        p_h3 = tl.make_block_ptr(
+                            h + i_t64 * H * K * V,
                             (V, K),
                             (K, 1),
                             (i_v * BV, 128),
@@ -809,20 +784,22 @@ if HAS_TLE_GDN2:
                             (1, 0),
                         )
                     else:
-                        p_h0_3 = tl.make_block_ptr(
-                            h0 + i_nh * K * V,
+                        p_h3 = tl.make_block_ptr(
+                            h + i_t64 * H * K * V,
                             (K, V),
                             (V, 1),
                             (128, i_v * BV),
                             (64, BV),
                             (1, 0),
                         )
-                    b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
+                    tl.store(
+                        p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1)
+                    )
 
                 if K > 192:
                     if STATE_V_FIRST:
-                        p_h0_4 = tl.make_block_ptr(
-                            h0 + i_nh * K * V,
+                        p_h4 = tl.make_block_ptr(
+                            h + i_t64 * H * K * V,
                             (V, K),
                             (K, 1),
                             (i_v * BV, 192),
@@ -830,369 +807,274 @@ if HAS_TLE_GDN2:
                             (1, 0),
                         )
                     else:
-                        p_h0_4 = tl.make_block_ptr(
-                            h0 + i_nh * K * V,
+                        p_h4 = tl.make_block_ptr(
+                            h + i_t64 * H * K * V,
                             (K, V),
                             (V, 1),
                             (192, i_v * BV),
                             (64, BV),
                             (1, 0),
                         )
-                    b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
+                    tl.store(
+                        p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1)
+                    )
 
-            if STORE_H:
-                h += (boh * H + i_h).to(tl.int64) * K * V
+            # v_new = u_wy - w_wy @ h
+            p_w = tl.make_block_ptr(
+                w_wy, (T, K), (H * K, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+            )
+            b_w_blk = tl.load(p_w, boundary_check=(0, 1))
+            if STATE_V_FIRST:
+                b_v_new = tl.dot(b_w_blk, tl.trans(b_h1).to(b_w_blk.dtype))
+            else:
+                b_v_new = tl.dot(b_w_blk, b_h1.to(b_w_blk.dtype))
 
-            for i_t in range(NT):
-                # Optional: store the pre-chunk state.
-                if STORE_H:
-                    i_t64 = i_t.to(tl.int64)
-                    if STATE_V_FIRST:
-                        p_h1 = tl.make_block_ptr(
-                            h + i_t64 * H * K * V,
-                            (V, K),
-                            (K, 1),
-                            (i_v * BV, 0),
-                            (BV, 64),
-                            (1, 0),
-                        )
-                    else:
-                        p_h1 = tl.make_block_ptr(
-                            h + i_t64 * H * K * V,
-                            (K, V),
-                            (V, 1),
-                            (0, i_v * BV),
-                            (64, BV),
-                            (1, 0),
-                        )
-                    tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
-
-                    if K > 64:
-                        if STATE_V_FIRST:
-                            p_h2 = tl.make_block_ptr(
-                                h + i_t64 * H * K * V,
-                                (V, K),
-                                (K, 1),
-                                (i_v * BV, 64),
-                                (BV, 64),
-                                (1, 0),
-                            )
-                        else:
-                            p_h2 = tl.make_block_ptr(
-                                h + i_t64 * H * K * V,
-                                (K, V),
-                                (V, 1),
-                                (64, i_v * BV),
-                                (64, BV),
-                                (1, 0),
-                            )
-                        tl.store(
-                            p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1)
-                        )
-
-                    if K > 128:
-                        if STATE_V_FIRST:
-                            p_h3 = tl.make_block_ptr(
-                                h + i_t64 * H * K * V,
-                                (V, K),
-                                (K, 1),
-                                (i_v * BV, 128),
-                                (BV, 64),
-                                (1, 0),
-                            )
-                        else:
-                            p_h3 = tl.make_block_ptr(
-                                h + i_t64 * H * K * V,
-                                (K, V),
-                                (V, 1),
-                                (128, i_v * BV),
-                                (64, BV),
-                                (1, 0),
-                            )
-                        tl.store(
-                            p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1)
-                        )
-
-                    if K > 192:
-                        if STATE_V_FIRST:
-                            p_h4 = tl.make_block_ptr(
-                                h + i_t64 * H * K * V,
-                                (V, K),
-                                (K, 1),
-                                (i_v * BV, 192),
-                                (BV, 64),
-                                (1, 0),
-                            )
-                        else:
-                            p_h4 = tl.make_block_ptr(
-                                h + i_t64 * H * K * V,
-                                (K, V),
-                                (V, 1),
-                                (192, i_v * BV),
-                                (64, BV),
-                                (1, 0),
-                            )
-                        tl.store(
-                            p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1)
-                        )
-
-                # v_new = u_wy - w_wy @ h
+            if K > 64:
                 p_w = tl.make_block_ptr(
-                    w_wy, (T, K), (H * K, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+                    w_wy, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0)
                 )
                 b_w_blk = tl.load(p_w, boundary_check=(0, 1))
                 if STATE_V_FIRST:
-                    b_v_new = tl.dot(b_w_blk, tl.trans(b_h1).to(b_w_blk.dtype))
+                    b_v_new += tl.dot(b_w_blk, tl.trans(b_h2).to(b_w_blk.dtype))
                 else:
-                    b_v_new = tl.dot(b_w_blk, b_h1.to(b_w_blk.dtype))
+                    b_v_new += tl.dot(b_w_blk, b_h2.to(b_w_blk.dtype))
 
-                if K > 64:
-                    p_w = tl.make_block_ptr(
-                        w_wy, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0)
-                    )
-                    b_w_blk = tl.load(p_w, boundary_check=(0, 1))
-                    if STATE_V_FIRST:
-                        b_v_new += tl.dot(b_w_blk, tl.trans(b_h2).to(b_w_blk.dtype))
-                    else:
-                        b_v_new += tl.dot(b_w_blk, b_h2.to(b_w_blk.dtype))
-
-                if K > 128:
-                    p_w = tl.make_block_ptr(
-                        w_wy, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0)
-                    )
-                    b_w_blk = tl.load(p_w, boundary_check=(0, 1))
-                    if STATE_V_FIRST:
-                        b_v_new += tl.dot(b_w_blk, tl.trans(b_h3).to(b_w_blk.dtype))
-                    else:
-                        b_v_new += tl.dot(b_w_blk, b_h3.to(b_w_blk.dtype))
-
-                if K > 192:
-                    p_w = tl.make_block_ptr(
-                        w_wy, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0)
-                    )
-                    b_w_blk = tl.load(p_w, boundary_check=(0, 1))
-                    if STATE_V_FIRST:
-                        b_v_new += tl.dot(b_w_blk, tl.trans(b_h4).to(b_w_blk.dtype))
-                    else:
-                        b_v_new += tl.dot(b_w_blk, b_h4.to(b_w_blk.dtype))
-
-                p_u = tl.make_block_ptr(
-                    u_wy, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+            if K > 128:
+                p_w = tl.make_block_ptr(
+                    w_wy, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0)
                 )
-                b_v_new = tl.load(p_u, boundary_check=(0, 1)) - b_v_new
+                b_w_blk = tl.load(p_w, boundary_check=(0, 1))
+                if STATE_V_FIRST:
+                    b_v_new += tl.dot(b_w_blk, tl.trans(b_h3).to(b_w_blk.dtype))
+                else:
+                    b_v_new += tl.dot(b_w_blk, b_h3.to(b_w_blk.dtype))
 
-                # o = scale * qg @ h + Aqk @ v_new
+            if K > 192:
+                p_w = tl.make_block_ptr(
+                    w_wy, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0)
+                )
+                b_w_blk = tl.load(p_w, boundary_check=(0, 1))
+                if STATE_V_FIRST:
+                    b_v_new += tl.dot(b_w_blk, tl.trans(b_h4).to(b_w_blk.dtype))
+                else:
+                    b_v_new += tl.dot(b_w_blk, b_h4.to(b_w_blk.dtype))
+
+            p_u = tl.make_block_ptr(
+                u_wy, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+            )
+            b_v_new = tl.load(p_u, boundary_check=(0, 1)) - b_v_new
+
+            # o = scale * qg @ h + Aqk @ v_new
+            p_qg = tl.make_block_ptr(
+                qg, (T, K), (H * K, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+            )
+            b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
+            if STATE_V_FIRST:
+                b_o = tl.dot(b_qg_blk, tl.trans(b_h1).to(b_qg_blk.dtype))
+            else:
+                b_o = tl.dot(b_qg_blk, b_h1.to(b_qg_blk.dtype))
+
+            if K > 64:
                 p_qg = tl.make_block_ptr(
-                    qg, (T, K), (H * K, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+                    qg, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0)
                 )
                 b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
                 if STATE_V_FIRST:
-                    b_o = tl.dot(b_qg_blk, tl.trans(b_h1).to(b_qg_blk.dtype))
+                    b_o += tl.dot(b_qg_blk, tl.trans(b_h2).to(b_qg_blk.dtype))
                 else:
-                    b_o = tl.dot(b_qg_blk, b_h1.to(b_qg_blk.dtype))
+                    b_o += tl.dot(b_qg_blk, b_h2.to(b_qg_blk.dtype))
 
-                if K > 64:
-                    p_qg = tl.make_block_ptr(
-                        qg, (T, K), (H * K, 1), (i_t * BT, 64), (BT, 64), (1, 0)
-                    )
-                    b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
-                    if STATE_V_FIRST:
-                        b_o += tl.dot(b_qg_blk, tl.trans(b_h2).to(b_qg_blk.dtype))
-                    else:
-                        b_o += tl.dot(b_qg_blk, b_h2.to(b_qg_blk.dtype))
-
-                if K > 128:
-                    p_qg = tl.make_block_ptr(
-                        qg, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0)
-                    )
-                    b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
-                    if STATE_V_FIRST:
-                        b_o += tl.dot(b_qg_blk, tl.trans(b_h3).to(b_qg_blk.dtype))
-                    else:
-                        b_o += tl.dot(b_qg_blk, b_h3.to(b_qg_blk.dtype))
-
-                if K > 192:
-                    p_qg = tl.make_block_ptr(
-                        qg, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0)
-                    )
-                    b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
-                    if STATE_V_FIRST:
-                        b_o += tl.dot(b_qg_blk, tl.trans(b_h4).to(b_qg_blk.dtype))
-                    else:
-                        b_o += tl.dot(b_qg_blk, b_h4.to(b_qg_blk.dtype))
-
-                # o = scale * qg @ h + Aqk @ v_new
-                b_o *= scale
-                p_Aqk = tl.make_block_ptr(
-                    Aqk, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+            if K > 128:
+                p_qg = tl.make_block_ptr(
+                    qg, (T, K), (H * K, 1), (i_t * BT, 128), (BT, 64), (1, 0)
                 )
-                b_Aqk = tl.load(p_Aqk, boundary_check=(0, 1))
-                # BF16 keeps the FP32 exponent range; retain FP32 operands otherwise.
-                if Aqk.dtype.element_ty == tl.bfloat16:
-                    b_o += tl.dot(b_Aqk, b_v_new.to(tl.bfloat16))
-                else:
-                    b_o += tl.dot(b_Aqk.to(b_v_new.dtype), b_v_new)
-
-                p_o = tl.make_block_ptr(
-                    o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-                )
-                tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-
-                # State decay is shared by all V tiles and precomputed once in K1.
-                o_k = tl.arange(0, 64)
-                b_g_decay1 = tl.load(
-                    gk + i_t * H * K + o_k, mask=o_k < K, other=1.0
-                ).to(tl.float32)
+                b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
                 if STATE_V_FIRST:
-                    b_h1 *= b_g_decay1[None, :]
+                    b_o += tl.dot(b_qg_blk, tl.trans(b_h3).to(b_qg_blk.dtype))
                 else:
-                    b_h1 *= b_g_decay1[:, None]
+                    b_o += tl.dot(b_qg_blk, b_h3.to(b_qg_blk.dtype))
 
-                if K > 64:
-                    o_k2 = 64 + o_k
-                    b_g_decay2 = tl.load(
-                        gk + i_t * H * K + o_k2, mask=o_k2 < K, other=1.0
-                    ).to(tl.float32)
-                    if STATE_V_FIRST:
-                        b_h2 *= b_g_decay2[None, :]
-                    else:
-                        b_h2 *= b_g_decay2[:, None]
+            if K > 192:
+                p_qg = tl.make_block_ptr(
+                    qg, (T, K), (H * K, 1), (i_t * BT, 192), (BT, 64), (1, 0)
+                )
+                b_qg_blk = tl.load(p_qg, boundary_check=(0, 1))
+                if STATE_V_FIRST:
+                    b_o += tl.dot(b_qg_blk, tl.trans(b_h4).to(b_qg_blk.dtype))
+                else:
+                    b_o += tl.dot(b_qg_blk, b_h4.to(b_qg_blk.dtype))
 
-                if K > 128:
-                    o_k3 = 128 + o_k
-                    b_g_decay3 = tl.load(
-                        gk + i_t * H * K + o_k3, mask=o_k3 < K, other=1.0
-                    ).to(tl.float32)
-                    if STATE_V_FIRST:
-                        b_h3 *= b_g_decay3[None, :]
-                    else:
-                        b_h3 *= b_g_decay3[:, None]
+            # Issue decay loads before the output dot so qg/Aqk work can hide latency.
+            o_k = tl.arange(0, 64)
+            b_g_decay1 = tl.load(
+                gk + i_t * H * K + o_k, mask=o_k < K, other=1.0
+            ).to(tl.float32)
+            if K > 64:
+                o_k2 = 64 + o_k
+                b_g_decay2 = tl.load(
+                    gk + i_t * H * K + o_k2, mask=o_k2 < K, other=1.0
+                ).to(tl.float32)
+            if K > 128:
+                o_k3 = 128 + o_k
+                b_g_decay3 = tl.load(
+                    gk + i_t * H * K + o_k3, mask=o_k3 < K, other=1.0
+                ).to(tl.float32)
+            if K > 192:
+                o_k4 = 192 + o_k
+                b_g_decay4 = tl.load(
+                    gk + i_t * H * K + o_k4, mask=o_k4 < K, other=1.0
+                ).to(tl.float32)
 
-                if K > 192:
-                    o_k4 = 192 + o_k
-                    b_g_decay4 = tl.load(
-                        gk + i_t * H * K + o_k4, mask=o_k4 < K, other=1.0
-                    ).to(tl.float32)
-                    if STATE_V_FIRST:
-                        b_h4 *= b_g_decay4[None, :]
-                    else:
-                        b_h4 *= b_g_decay4[:, None]
+            b_o *= scale
+            p_Aqk = tl.make_block_ptr(
+                Aqk, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+            )
+            b_Aqk = tl.load(p_Aqk, boundary_check=(0, 1))
+            b_o += tl.dot(b_Aqk.to(b_v_new.dtype), b_v_new)
 
-                # State update: h += kg^T @ v_new.  The GDN-2 write gate has already
-                # been folded into u_wy and therefore into v_new.
-                b_v_cast = b_v_new.to(kg.dtype.element_ty)
+            p_o = tl.make_block_ptr(
+                o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+            )
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+            if STATE_V_FIRST:
+                b_h1 *= b_g_decay1[None, :]
+            else:
+                b_h1 *= b_g_decay1[:, None]
+
+            if K > 64:
+                if STATE_V_FIRST:
+                    b_h2 *= b_g_decay2[None, :]
+                else:
+                    b_h2 *= b_g_decay2[:, None]
+
+            if K > 128:
+                if STATE_V_FIRST:
+                    b_h3 *= b_g_decay3[None, :]
+                else:
+                    b_h3 *= b_g_decay3[:, None]
+
+            if K > 192:
+                if STATE_V_FIRST:
+                    b_h4 *= b_g_decay4[None, :]
+                else:
+                    b_h4 *= b_g_decay4[:, None]
+
+            # State update: h += kg^T @ v_new.  The GDN-2 write gate has already
+            # been folded into u_wy and therefore into v_new.
+            b_v_cast = b_v_new.to(kg.dtype.element_ty)
+            p_kg = tl.make_block_ptr(
+                kg, (K, T), (1, H * K), (0, i_t * BT), (64, BT), (0, 1)
+            )
+            b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
+            if STATE_V_FIRST:
+                b_h1 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
+            else:
+                b_h1 += tl.dot(b_kg_blk, b_v_cast)
+
+            if K > 64:
                 p_kg = tl.make_block_ptr(
-                    kg, (K, T), (1, H * K), (0, i_t * BT), (64, BT), (0, 1)
+                    kg, (K, T), (1, H * K), (64, i_t * BT), (64, BT), (0, 1)
                 )
                 b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
                 if STATE_V_FIRST:
-                    b_h1 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
+                    b_h2 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
                 else:
-                    b_h1 += tl.dot(b_kg_blk, b_v_cast)
+                    b_h2 += tl.dot(b_kg_blk, b_v_cast)
 
-                if K > 64:
-                    p_kg = tl.make_block_ptr(
-                        kg, (K, T), (1, H * K), (64, i_t * BT), (64, BT), (0, 1)
-                    )
-                    b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
-                    if STATE_V_FIRST:
-                        b_h2 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
-                    else:
-                        b_h2 += tl.dot(b_kg_blk, b_v_cast)
+            if K > 128:
+                p_kg = tl.make_block_ptr(
+                    kg, (K, T), (1, H * K), (128, i_t * BT), (64, BT), (0, 1)
+                )
+                b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
+                if STATE_V_FIRST:
+                    b_h3 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
+                else:
+                    b_h3 += tl.dot(b_kg_blk, b_v_cast)
 
-                if K > 128:
-                    p_kg = tl.make_block_ptr(
-                        kg, (K, T), (1, H * K), (128, i_t * BT), (64, BT), (0, 1)
-                    )
-                    b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
-                    if STATE_V_FIRST:
-                        b_h3 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
-                    else:
-                        b_h3 += tl.dot(b_kg_blk, b_v_cast)
+            if K > 192:
+                p_kg = tl.make_block_ptr(
+                    kg, (K, T), (1, H * K), (192, i_t * BT), (64, BT), (0, 1)
+                )
+                b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
+                if STATE_V_FIRST:
+                    b_h4 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
+                else:
+                    b_h4 += tl.dot(b_kg_blk, b_v_cast)
 
-                if K > 192:
-                    p_kg = tl.make_block_ptr(
-                        kg, (K, T), (1, H * K), (192, i_t * BT), (64, BT), (0, 1)
-                    )
-                    b_kg_blk = tl.load(p_kg, boundary_check=(0, 1))
-                    if STATE_V_FIRST:
-                        b_h4 += tl.trans(tl.dot(b_kg_blk, b_v_cast))
-                    else:
-                        b_h4 += tl.dot(b_kg_blk, b_v_cast)
+        if STORE_FINAL_STATE:
+            if STATE_V_FIRST:
+                p_ht = tl.make_block_ptr(
+                    ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+                )
+            else:
+                p_ht = tl.make_block_ptr(
+                    ht + i_nh * K * V, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+                )
+            tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
-            if STORE_FINAL_STATE:
+            if K > 64:
                 if STATE_V_FIRST:
                     p_ht = tl.make_block_ptr(
-                        ht + i_nh * K * V, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+                        ht + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 64),
+                        (BV, 64),
+                        (1, 0),
                     )
                 else:
                     p_ht = tl.make_block_ptr(
-                        ht + i_nh * K * V, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+                        ht + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (64, i_v * BV),
+                        (64, BV),
+                        (1, 0),
                     )
-                tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+                tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
-                if K > 64:
-                    if STATE_V_FIRST:
-                        p_ht = tl.make_block_ptr(
-                            ht + i_nh * K * V,
-                            (V, K),
-                            (K, 1),
-                            (i_v * BV, 64),
-                            (BV, 64),
-                            (1, 0),
-                        )
-                    else:
-                        p_ht = tl.make_block_ptr(
-                            ht + i_nh * K * V,
-                            (K, V),
-                            (V, 1),
-                            (64, i_v * BV),
-                            (64, BV),
-                            (1, 0),
-                        )
-                    tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            if K > 128:
+                if STATE_V_FIRST:
+                    p_ht = tl.make_block_ptr(
+                        ht + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 128),
+                        (BV, 64),
+                        (1, 0),
+                    )
+                else:
+                    p_ht = tl.make_block_ptr(
+                        ht + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (128, i_v * BV),
+                        (64, BV),
+                        (1, 0),
+                    )
+                tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
-                if K > 128:
-                    if STATE_V_FIRST:
-                        p_ht = tl.make_block_ptr(
-                            ht + i_nh * K * V,
-                            (V, K),
-                            (K, 1),
-                            (i_v * BV, 128),
-                            (BV, 64),
-                            (1, 0),
-                        )
-                    else:
-                        p_ht = tl.make_block_ptr(
-                            ht + i_nh * K * V,
-                            (K, V),
-                            (V, 1),
-                            (128, i_v * BV),
-                            (64, BV),
-                            (1, 0),
-                        )
-                    tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-
-                if K > 192:
-                    if STATE_V_FIRST:
-                        p_ht = tl.make_block_ptr(
-                            ht + i_nh * K * V,
-                            (V, K),
-                            (K, 1),
-                            (i_v * BV, 192),
-                            (BV, 64),
-                            (1, 0),
-                        )
-                    else:
-                        p_ht = tl.make_block_ptr(
-                            ht + i_nh * K * V,
-                            (K, V),
-                            (V, 1),
-                            (192, i_v * BV),
-                            (64, BV),
-                            (1, 0),
-                        )
-                    tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            if K > 192:
+                if STATE_V_FIRST:
+                    p_ht = tl.make_block_ptr(
+                        ht + i_nh * K * V,
+                        (V, K),
+                        (K, 1),
+                        (i_v * BV, 192),
+                        (BV, 64),
+                        (1, 0),
+                    )
+                else:
+                    p_ht = tl.make_block_ptr(
+                        ht + i_nh * K * V,
+                        (K, V),
+                        (V, 1),
+                        (192, i_v * BV),
+                        (64, BV),
+                        (1, 0),
+                    )
+                tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
     def chunk_gdn2_fwd_h_o_infer(
         kg: torch.Tensor,
@@ -1239,11 +1121,10 @@ if HAS_TLE_GDN2:
 
         final_state = None
         if output_final_state:
-            # K2 writes every valid state element, including empty sequences.
             if state_v_first:
-                final_state = kg.new_empty(N, H, V, K, dtype=torch.float32)
+                final_state = kg.new_zeros(N, H, V, K, dtype=torch.float32)
             else:
-                final_state = kg.new_empty(N, H, K, V, dtype=torch.float32)
+                final_state = kg.new_zeros(N, H, K, V, dtype=torch.float32)
 
         h = None
         if return_intermediate_states:
@@ -1276,7 +1157,6 @@ if HAS_TLE_GDN2:
             K=K,
             V=V,
             BT=BT,
-            BK=max(64, triton.next_power_of_2(K)),
             STATE_V_FIRST=state_v_first,
         )
 
@@ -1407,7 +1287,6 @@ if HAS_TLE_GDN2:
         )
 
 
-# 4. 唯一公开入口
 def chunk_gdn2(
     q,
     k,
