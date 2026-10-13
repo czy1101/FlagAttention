@@ -267,7 +267,7 @@ def parallax_forward(
     if h <= 0 or hq % h:
         raise ValueError("query head count must be divisible by a positive KV head count")
     if q.dtype not in (torch.float16, torch.bfloat16) or any(x.dtype != q.dtype for x in (r, k, v)):
-        raise TypeError("q, r, k, and v must use the same float16 or bfloat16 dtype")
+        raise TypeError("parallel_parallax requires bf16 or fp16 inputs with matching q, r, k, and v dtypes")
     if not all(x.device == q.device for x in (r, k, v)):
         raise ValueError("q, r, k, and v must be on the same device")
     if q.device.type != "npu":
@@ -280,7 +280,7 @@ def parallax_forward(
         raise ValueError("window_size_left must be -1 or greater than zero")
     if cu_seqlens is not None:
         if batch != 1:
-            raise ValueError("packed variable-length inputs require batch size 1")
+            raise ValueError(f"The batch size is expected to be 1 rather than {batch} when using cu_seqlens")
         if cu_seqlens.ndim != 1 or cu_seqlens.device != q.device or cu_seqlens.numel() < 2:
             raise ValueError("cu_seqlens must be a one-dimensional NPU tensor with at least two entries")
         if cu_seqlens.dtype not in (torch.int32, torch.int64):
