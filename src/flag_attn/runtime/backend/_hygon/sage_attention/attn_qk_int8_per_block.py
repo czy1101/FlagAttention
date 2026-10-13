@@ -15,6 +15,28 @@
 import torch
 import triton
 import triton.language as tl
+import triton.experimental.tle.language as tle
+
+# Static unrolling is useful for short KV sequences, but its compile cost and
+# generated code size grow with the number of KV tiles.  Keep the dispatch by
+# sequence-length family rather than by an individual benchmark shape.
+_STATIC_KV_MAX_LEN = 512
+
+
+def _resolve_static_kv(kv_len, static_kv):
+    """Select the KV-loop form without changing the public default behavior.
+
+    ``None`` enables the length-family dispatch used by the Hygon path:
+    short sequences retain the fully specialized loop, while long sequences
+    use the runtime loop to avoid compiling one unrolled body per KV tile.
+    An explicit bool is accepted for A/B testing and debugging.
+    """
+    if static_kv is None:
+        return kv_len <= _STATIC_KV_MAX_LEN
+    if not isinstance(static_kv, bool):
+        raise TypeError("static_kv must be None or bool")
+    return static_kv
+
 
 _TILE_CONFIGS = [
     triton.Config({"BLOCK_M": block_m, "BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
@@ -35,11 +57,19 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
                     start_m, mask_ptrs, stride_maskn,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
-                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
+                    STAGE: tl.constexpr, FULL_KV: tl.constexpr,
+                    PREFIX_KV: tl.constexpr,
+                    PV_FP32: tl.constexpr,
+                    offs_m: tl.constexpr, offs_n: tl.constexpr,
                     ):
     lo, hi = 0, kv_len
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
+        # Keep the exact-length path compile-time mask-free.  For a long
+        # non-multiple sequence, PREFIX_KV makes only the complete prefix
+        # tiles mask-free and leaves the final tile on the boundary path.
+        full_tile = FULL_KV or (PREFIX_KV and (start_n + BLOCK_N <= kv_len))
+        k_mask = offs_n[None, :] < (kv_len - start_n)
         mask_block = None
         skip = False
         if mask_ptrs is not None:
@@ -48,9 +78,14 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             else:
                 mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
         if not skip:
-            k_mask = offs_n[None, :] < (kv_len - start_n)
-            k = tl.load(K_ptrs, mask=k_mask)
-            k_scale = tl.load(K_scale_ptr)
+            if full_tile:
+                k = tl.load(K_ptrs)
+            else:
+                k = tl.load(K_ptrs, mask=k_mask)
+            # K scales are defined per 64-token block, independently of the
+            # selected BLOCK_N.  Index from the tile origin so BLOCK_N=32 and
+            # BLOCK_N=64 both reuse the correct scale entry.
+            k_scale = tl.load(K_scale_ptr + start_n // 64)
 
             qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
 
@@ -59,7 +94,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     qk = qk + tl.where(mask_block, 0, -1.0e6)
                 else:
                     qk = qk + mask_block
-            else:
+            elif not full_tile:
                 qk += tl.where(k_mask, 0, -1.0e6)
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -72,13 +107,23 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
 
             acc = acc * alpha[:, None]
 
-            v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
+            if full_tile:
+                v = tl.load(V_ptrs)
+            else:
+                v = tl.load(V_ptrs, mask=offs_n[:, None] < (kv_len - start_n))
             p = p.to(tl.float16)
 
-            acc += tl.dot(p, v, out_dtype=tl.float16)
+            if PV_FP32:
+                # For sufficiently large workgroups, accumulate PV directly
+                # in the FP32 accumulator so the backend avoids a separate
+                # FP16-dot result conversion before the online accumulator.
+                acc += tl.dot(p, v, out_dtype=tl.float32)
+            else:
+                # Keep the launch-bound short-sequence family on the original
+                # FP16-dot path, which is faster for tiny tiles on Hygon.
+                acc += tl.dot(p, v, out_dtype=tl.float16)
             m_i = m_ij
         K_ptrs += BLOCK_N * stride_kn
-        K_scale_ptr += 1
         V_ptrs += BLOCK_N * stride_vn
     return acc, l_i, m_i
 
@@ -154,6 +199,24 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
 @triton.heuristics({
     "KV_BLOCKS": lambda args: triton.cdiv(args["kv_len"], args["BLOCK_N"]),
     "FULL_KV": lambda args: args["kv_len"] % args["BLOCK_N"] == 0,
+    # The mask-free dynamic path pays off when there is enough work to hide
+    # launch/loop overhead.  Keep the exact-length fast path unchanged.
+    "FAST_FULL_KV": lambda args: (
+        args["kv_len"] % args["BLOCK_N"] == 0
+        and (args["kv_len"] >= 2048 or args["H"] >= 32)
+    ),
+    # For non-multiple long sequences, use unmasked loads for the complete
+    # prefix and keep only the final tile on the boundary path.
+    "FAST_PREFIX_KV": lambda args: (
+        args["kv_len"] % args["BLOCK_N"] != 0
+        and (args["kv_len"] >= 2048 or args["H"] >= 32)
+    ),
+    # Direct FP32 PV accumulation pays off only once there is enough work to
+    # amortize its conversion cost.  The condition is a workload family, not
+    # a single benchmark length.
+    "PV_FP32": lambda args: (
+        args["kv_len"] >= 2048 or args["H"] >= 32
+    ),
 })
 @triton.jit
 def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
@@ -169,6 +232,9 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
               STAGE: tl.constexpr,
               RETURN_LSE: tl.constexpr,
               STATIC_KV: tl.constexpr,
+              FAST_FULL_KV: tl.constexpr,
+              FAST_PREFIX_KV: tl.constexpr,
+              PV_FP32: tl.constexpr,
               KV_BLOCKS: tl.constexpr,
               FULL_KV: tl.constexpr,
               Q_SCALE_BLOCK: tl.constexpr,
@@ -213,7 +279,9 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
                                         start_m, mask_ptrs, stride_maskn,
                                         BLOCK_M, HEAD_DIM, BLOCK_N,
-                                        4 - STAGE, offs_m, offs_n
+                                        4 - STAGE, FAST_FULL_KV, FAST_PREFIX_KV,
+                                        PV_FP32,
+                                        offs_m, offs_n
                                         )
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
@@ -224,7 +292,8 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
         tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
 
 def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
-            output_dtype=torch.float16, return_lse=False, maxnreg=None):
+            output_dtype=torch.float16, return_lse=False, maxnreg=None,
+            static_kv=None):
     stage = 1
 
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
@@ -261,10 +330,8 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
     else:
         lse = torch.empty([0], dtype=torch.float32, device='cpu')
 
-    def grid(meta):
-        return (triton.cdiv(qo_len, meta["BLOCK_M"]), h_qo, b)
-    # Full-static experiment: specialize every shape by its KV block count.
-    static_kv = True
+    grid = lambda meta: (triton.cdiv(qo_len, meta["BLOCK_M"]), h_qo, b)
+    static_kv = _resolve_static_kv(kv_len, static_kv)
     launch_options = {}
     if maxnreg is not None and maxnreg <= 0:
         raise ValueError("maxnreg must be positive")

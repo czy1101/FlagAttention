@@ -19,7 +19,7 @@ except ImportError:
     tle = None
     HAS_TLE = False
 
-from ..chunk_h import chunk_bwd_dh, chunk_fwd_h
+from ..chunk_h import chunk_bwd_dh, chunk_fwd_h, chunk_fwd_h_fused_cumsum
 from ..cumsum_gla import chunk_local_cumsum
 from ..index import prepare_chunk_indices
 from ..utils import check_shared_mem, input_guard
@@ -28,6 +28,16 @@ RCP_LN2 = 1.4426950216
 
 BK_LIST = [32, 64] if check_shared_mem() else [16, 32]
 BV_LIST = [64, 128] if check_shared_mem("ampere") else [16, 32]
+
+
+def _select_chunk_size(sequence_length: int) -> int:
+    configured = os.environ.get("FLAG_ATTN_GLA_CHUNK_SIZE")
+    if configured is not None:
+        chunk_size = int(configured)
+        if chunk_size not in (16, 32, 64, 128):
+            raise ValueError("FLAG_ATTN_GLA_CHUNK_SIZE must be one of 16, 32, 64, 128")
+        return chunk_size
+    return min(64, max(16, triton.next_power_of_2(sequence_length)))
 
 
 @triton.jit
@@ -69,11 +79,22 @@ def chunk_gla_fwd_A_kernel_intra_sub_inter(
     BC: tl.constexpr,
     BK: tl.constexpr,
     NC: tl.constexpr,
+    TRIANGULAR: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_t, i_c, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
-    i_i, i_j = i_c // NC, i_c % NC
+    if TRIANGULAR:
+        i_i = 0
+        i_j = 0
+        for i_row in range(NC - 1):
+            row_start = i_row * (i_row + 1) // 2
+            row_end = (i_row + 1) * (i_row + 2) // 2
+            in_row = (i_c >= row_start) & (i_c < row_end)
+            i_i = tl.where(in_row, i_row + 1, i_i)
+            i_j = tl.where(in_row, i_c - row_start, i_j)
+    else:
+        i_i, i_j = i_c // NC, i_c % NC
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
             chunk_indices + i_t * 2 + 1
@@ -509,6 +530,168 @@ def chunk_gla_fwd_kernel_o(
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
     b_o += tl.dot(b_A, b_v)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["T"])
+def chunk_gla_fwd_kernel_o_fused_intra(
+    q,
+    k,
+    v,
+    g,
+    h,
+    o,
+    cu_seqlens,
+    chunk_indices,
+    scale,
+    T,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    NC: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Compute q @ h and the intra-chunk A @ v without materializing A.
+
+    This path is used only when no backward graph is needed.  It trades the
+    global A read/write for a local reconstruction of each A tile while the
+    corresponding v tile is already resident, removing a large intermediate
+    tensor and one full round trip through device memory.
+    """
+    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_hv = i_bh // HV, i_bh % HV
+    i_h = i_hv // (HV // H)
+    if IS_VARLEN:
+        i_tg = i_t.to(tl.int64)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
+            chunk_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int64)
+        T = eos - bos
+    else:
+        NT = tl.cdiv(T, BT)
+        i_tg = (i_b * NT + i_t).to(tl.int64)
+        bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
+
+    q += (bos * H + i_h) * K
+    k += (bos * H + i_h) * K
+    g += (bos * HV + i_hv) * K
+    v += (bos * HV + i_hv) * V
+    o += (bos * HV + i_hv) * V
+    h += (i_tg * HV + i_hv).to(tl.int64) * K * V
+
+    # Keep the same BC-row numerical decomposition as the reference A
+    # kernels.  This avoids changing exponent range/rounding while still
+    # eliminating the global A materialization.
+    q_rows = tl.arange(0, BC)
+    k_cols = tl.arange(0, BC)
+    for i_i in range(NC):
+        b_o = tl.zeros([BC, BV], dtype=tl.float32)
+        for i_k in range(tl.cdiv(K, BK)):
+            p_q = tl.make_block_ptr(
+                q, (T, K), (H * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0)
+            )
+            p_g = tl.make_block_ptr(
+                g, (T, K), (HV * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0)
+            )
+            if STATE_V_FIRST:
+                p_h = tl.make_block_ptr(
+                    h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
+                )
+            else:
+                p_h = tl.make_block_ptr(
+                    h, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0)
+                )
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+            b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
+            b_h = tl.load(p_h, boundary_check=(0, 1))
+            if STATE_V_FIRST:
+                b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
+            else:
+                b_o += tl.dot(b_qg, b_h.to(b_qg.dtype))
+
+        for i_c in range(NC):
+            b_A = tl.zeros([BC, BC], dtype=tl.float32)
+            for i_k in range(tl.cdiv(K, BK)):
+                p_q = tl.make_block_ptr(
+                    q, (T, K), (H * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0)
+                )
+                p_g = tl.make_block_ptr(
+                    g, (T, K), (HV * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0)
+                )
+                p_k = tl.make_block_ptr(
+                    k, (T, K), (H * K, 1), (i_t * BT + i_c * BC, i_k * BK), (BC, BK), (1, 0)
+                )
+                p_gk = tl.make_block_ptr(
+                    g, (T, K), (HV * K, 1), (i_t * BT + i_c * BC, i_k * BK), (BC, BK), (1, 0)
+                )
+                b_q = tl.load(p_q, boundary_check=(0, 1))
+                b_g = tl.load(p_g, boundary_check=(0, 1))
+                b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
+                b_gk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
+                if i_c < i_i:
+                    o_k = i_k * BK + tl.arange(0, BK)
+                    b_gn = tl.load(
+                        g + (i_t * BT + i_i * BC) * HV * K + o_k,
+                        mask=o_k < K,
+                        other=0.0,
+                    )
+                    p_ki = tl.make_block_ptr(
+                        k,
+                        (K, T),
+                        (1, H * K),
+                        (i_k * BK, i_t * BT + i_c * BC),
+                        (BK, BC),
+                        (0, 1),
+                    )
+                    p_gki = tl.make_block_ptr(
+                        g,
+                        (K, T),
+                        (1, HV * K),
+                        (i_k * BK, i_t * BT + i_c * BC),
+                        (BK, BC),
+                        (0, 1),
+                    )
+                    b_ki = tl.load(p_ki, boundary_check=(0, 1)).to(tl.float32)
+                    b_gki = tl.load(p_gki, boundary_check=(0, 1)).to(tl.float32)
+                    b_qg = b_q * exp2(b_g - b_gn[None, :]) * scale
+                    b_A += tl.dot(
+                        b_qg,
+                        b_ki * exp2(b_gn[:, None] - b_gki),
+                    )
+                else:
+                    g_max = tl.max(b_g, axis=0)
+                    g_min = tl.min(b_g, axis=0)
+                    g_mid = 0.5 * (g_max + g_min)
+                    b_qg = b_q * exp2(b_g - g_mid[None, :])
+                    b_A += tl.dot(
+                        b_qg,
+                        tl.trans(b_k * exp2(-b_gk + g_mid[None, :]))
+                    ) * scale
+            m_s = q_rows[:, None] >= (i_c * BC + k_cols)[None, :]
+            b_A = tl.where(m_s, b_A, 0.0)
+            p_v = tl.make_block_ptr(
+                v, (T, V), (HV * V, 1), (i_t * BT + i_c * BC, i_v * BV), (BC, BV), (1, 0)
+            )
+            b_v = tl.load(p_v, boundary_check=(0, 1))
+            b_o += tl.dot(b_A.to(b_v.dtype), b_v)
+        p_o = tl.make_block_ptr(
+            o, (T, V), (HV * V, 1), (i_t * BT + i_i * BC, i_v * BV), (BC, BV), (1, 0)
+        )
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 if HAS_TLE:
@@ -1327,26 +1510,32 @@ def chunk_gla_fwd_intra_gk(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BC = min(16, BT)
+    # Use a wider intra tile for smaller head groups, where launch overhead
+    # dominates.  Keep BC=16 for large H, where the wider tile raises
+    # register pressure (notably the H=64 case).
+    BC = min(32 if H <= 32 else 16, BT)
     NC = triton.cdiv(BT, BC)
 
     A = q.new_empty(B, T, H, BT, dtype=torch.float)
-    grid = (NT, NC * NC, B * H)
-    chunk_gla_fwd_A_kernel_intra_sub_inter[grid](
-        q=q,
-        k=k,
-        g=g,
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        T=T,
-        H=H,
-        K=K,
-        BT=BT,
-        BC=BC,
-        NC=NC,
-    )
+    triangular_pairs = NC * (NC - 1) // 2
+    if triangular_pairs:
+        grid = (NT, triangular_pairs, B * H)
+        chunk_gla_fwd_A_kernel_intra_sub_inter[grid](
+            q=q,
+            k=k,
+            g=g,
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            scale=scale,
+            T=T,
+            H=H,
+            K=K,
+            BT=BT,
+            BC=BC,
+            NC=NC,
+            TRIANGULAR=True,
+        )
 
     grid = (NT, NC, B * H)
     # load the entire [BC, K] blocks into SRAM at once
@@ -1427,8 +1616,7 @@ def chunk_gla_fwd_o_gk(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    # Please ensure zeros, since vllm will use padding v
-    o = torch.zeros_like(v)
+    o = torch.empty_like(v)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * HV)
@@ -1436,7 +1624,7 @@ def chunk_gla_fwd_o_gk(
     def grid_tle(meta):
         return (triton.cdiv(V, meta["BV"] * meta.get("B_VCHUNK", 1)), NT, B * HV)
 
-    _use_tle = HAS_TLE and os.environ.get("FLA_GLA_TLE", "1") != "0"
+    _use_tle = HAS_TLE and os.environ.get("FLAG_ATTN_GLA_TLE", os.environ.get("FLA_GLA_TLE", "1")) != "0"
     if _use_tle:
         kernel = chunk_gla_fwd_kernel_o_tle
         grid_fn = grid_tle
@@ -1459,6 +1647,58 @@ def chunk_gla_fwd_o_gk(
         K=K,
         V=V,
         BT=BT,
+        STATE_V_FIRST=state_v_first,
+    )
+    return o
+
+
+def chunk_gla_fwd_o_fused_intra(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    h: torch.Tensor,
+    scale: float,
+    state_v_first: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
+):
+    B, T, H, K, HV, V = *q.shape, v.shape[2], v.shape[-1]
+    BT = chunk_size
+    BC = min(16, BT)
+    NC = triton.cdiv(BT, BC)
+
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+    # Keep the fused kernel deliberately conservative.  A 64-wide V tile
+    # bounds register pressure while still removing the large A intermediate.
+    BK = min(64, triton.next_power_of_2(K))
+    BV = min(64, triton.next_power_of_2(V))
+    o = torch.empty_like(v)
+    grid = (triton.cdiv(V, BV), NT, B * HV)
+    chunk_gla_fwd_kernel_o_fused_intra[grid](
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        h=h,
+        o=o,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        scale=scale,
+        T=T,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BT=BT,
+        BC=BC,
+        BK=BK,
+        BV=BV,
+        NC=NC,
         STATE_V_FIRST=state_v_first,
     )
     return o
@@ -1652,52 +1892,88 @@ def chunk_gla_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
+    fuse_intra: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if g_cumsum is None:
-        g_cumsum = chunk_local_cumsum(
-            g,
-            chunk_size,
-            scale=RCP_LN2,
+    use_fused_h_cumsum = (
+        g_cumsum is None
+        and os.environ.get("FLAG_ATTN_GLA_FUSED_CUMSUM_H", "1") != "0"
+        and initial_state is None
+        and not output_final_state
+        and not state_v_first
+        and cu_seqlens is None
+        # The synchronized fused H path is beneficial for V=128 as well;
+        # keep V=64 on the general kernel because its tiny state is launch
+        # bound and the fused variant regresses there.
+        and v.shape[-1] >= 128
+    )
+    if use_fused_h_cumsum:
+        g_cumsum, h = chunk_fwd_h_fused_cumsum(
+            k=k,
+            v=v,
+            g=g,
+            chunk_size=chunk_size,
+        )
+        ht = None
+    else:
+        if g_cumsum is None:
+            g_cumsum = chunk_local_cumsum(
+                g,
+                chunk_size,
+                scale=RCP_LN2,
+                cu_seqlens=cu_seqlens,
+            )
+
+        h, ht = chunk_fwd_h(
+            k=k,
+            v=v,
+            g=None,
+            gk=g_cumsum,
+            gv=None,
+            h0=initial_state,
+            output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            states_in_fp32=False,
+            state_v_first=state_v_first,
         )
 
-    h, ht = chunk_fwd_h(
-        k=k,
-        v=v,
-        g=None,
-        gk=g_cumsum,
-        gv=None,
-        h0=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        states_in_fp32=False,
-        state_v_first=state_v_first,
-    )
-
-    # the intra A is kept in fp32
-    # the computation has very marginal effect on the entire throughput
-    A = chunk_gla_fwd_intra_gk(
-        q=q,
-        k=k,
-        g=g_cumsum,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-    )
-    o = chunk_gla_fwd_o_gk(
-        q=q,
-        v=v,
-        g=g_cumsum,
-        A=A,
-        h=h,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-        state_v_first=state_v_first,
-    )
+    if fuse_intra and v.shape[-1] <= 128:
+        A = None
+        o = chunk_gla_fwd_o_fused_intra(
+            q=q,
+            k=k,
+            v=v,
+            g=g_cumsum,
+            h=h,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            state_v_first=state_v_first,
+        )
+    else:
+        # The intra A is kept in fp32 for the backward path and for wide V.
+        A = chunk_gla_fwd_intra_gk(
+            q=q,
+            k=k,
+            g=g_cumsum,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+        )
+        o = chunk_gla_fwd_o_gk(
+            q=q,
+            v=v,
+            g=g_cumsum,
+            A=A,
+            h=h,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            state_v_first=state_v_first,
+        )
     return g_cumsum, A, h, ht, o
 
 
@@ -1823,7 +2099,7 @@ class ChunkGLAFunction(torch.autograd.Function):
         cu_seqlens,
         cu_seqlens_cpu,
     ):
-        chunk_size = min(64, max(16, triton.next_power_of_2(q.shape[1])))
+        chunk_size = _select_chunk_size(q.shape[1])
         if cu_seqlens is not None:
             chunk_indices = prepare_chunk_indices(
                 cu_seqlens,
@@ -1833,6 +2109,11 @@ class ChunkGLAFunction(torch.autograd.Function):
         else:
             chunk_indices = None
 
+        # The fused path remains opt-in until its Hygon numerical parity is
+        # fully validated; the default path keeps the established results.
+        use_fused_intra = os.environ.get("FLAG_ATTN_GLA_FUSED_INTRA", "0") != "0" and not any(
+            x is not None and x.requires_grad for x in (q, k, v, g, initial_state)
+        )
         g_cumsum, A, _, ht, o = chunk_gla_fwd(
             q=q,
             k=k,
@@ -1846,12 +2127,19 @@ class ChunkGLAFunction(torch.autograd.Function):
             chunk_size=chunk_size,
             chunk_indices=chunk_indices,
             state_v_first=state_v_first,
+            fuse_intra=use_fused_intra,
         )
         # recompute g_cumsum in bwd pass
         if g.dtype != torch.float:
             g_cumsum = None
         else:
             g = None
+        if use_fused_intra:
+            # No input can require a backward graph on this path, so the
+            # materialized A is intentionally absent.
+            ctx.fused_intra = True
+            return o, ht
+        ctx.fused_intra = False
         ctx.save_for_backward(q, k, v, g, g_cumsum, initial_state, A, chunk_indices)
         ctx.chunk_size = chunk_size
         ctx.scale = scale
@@ -1935,7 +2223,7 @@ def chunk_gla(
         >>> import torch
         >>> import torch.nn.functional as F
         >>> from einops import rearrange
-        >>> from fla.ops.gla import chunk_gla
+        >>> from flag_attn import chunk_gla
         # inputs with equal lengths
         >>> B, T, H, K, V = 4, 2048, 4, 512, 512
         >>> q = torch.randn(B, T, H, K, device='cuda')

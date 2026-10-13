@@ -39,7 +39,7 @@ import triton.language as tl
 from flag_attn.runtime.backend import _hygon as runtime
 
 from ..index import prepare_chunk_indices, prepare_chunk_offsets
-from flag_attn.gated_delta_rule.compat import has_triton_tle
+from flag_attn.utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
     try:
@@ -446,7 +446,10 @@ if HAS_TLE_KDA:
         g_out = torch.empty(B, T_padded, HV, K, device=q.device, dtype=torch.float32)
         ws = torch.empty(B, T_padded, HV, 3 * K, device=q.device, dtype=q.dtype)
         Aqk = torch.empty(B, T_padded, HV, BT, device=q.device, dtype=q.dtype)
-        Akk = torch.zeros(B, T_padded, HV, BT, device=q.device, dtype=q.dtype)
+        # Every valid Akk element is written by the intra kernel.  The state
+        # kernel reads only valid rows with boundary checks, so no full
+        # device-side pre-clear is needed for fixed or varlen input.
+        Akk = torch.empty(B, T_padded, HV, BT, device=q.device, dtype=q.dtype)
 
         _kda_fwd_intra_kernel[grid](
             q=q,
@@ -1395,7 +1398,10 @@ if HAS_TLE_KDA:
             else:
                 final_state = kg.new_zeros(N, HV, K, V, dtype=torch.float32)
 
-        o = torch.zeros(B, T_actual, HV, V, device=kg.device, dtype=v.dtype)
+        # The recurrence stores every valid output element; avoid pre-clearing
+        # the large output tensor while keeping final-state initialization
+        # unchanged for this A/B variant.
+        o = torch.empty(B, T_actual, HV, V, device=kg.device, dtype=v.dtype)
 
         h0_arg = (
             initial_state
@@ -1408,8 +1414,7 @@ if HAS_TLE_KDA:
             else kg.new_empty(1, dtype=torch.float32)
         )
 
-        def grid(meta):
-            return (triton.cdiv(V, meta["BV"]), N * HV)
+        grid = lambda meta: (triton.cdiv(V, meta["BV"]), N * HV)
         _kda_fwd_state_output_direct_kernel[grid](
             v=v,
             beta=beta,
@@ -1526,14 +1531,21 @@ def strict_tle_input_error(
         return "strict TLE KDA requires Triton TLE >= 3.6.0"
 
     inputs = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+    # The strict TLE kernels consume the input tensors through the same
+    # ``tle.load``/``tl.dot`` path for both 16-bit floating formats.  Keeping
+    # this check BF16-only unnecessarily rejected FP16 before compilation, even
+    # though all strict intermediates use explicit FP32 accumulation and the
+    # workspace preserves the input element type.  Accept both formats here so
+    # FP16 reaches the real Hygon/TLE compiler path.
+    supported_dtypes = (torch.bfloat16, torch.float16)
     invalid_dtypes = {
         name: tensor.dtype
         for name, tensor in inputs.items()
-        if tensor.dtype != torch.bfloat16
+        if tensor.dtype not in supported_dtypes
     }
     if invalid_dtypes:
         details = ", ".join(f"{name}={dtype}" for name, dtype in invalid_dtypes.items())
-        return f"strict TLE KDA requires bfloat16 inputs, got {details}"
+        return f"strict TLE KDA requires bfloat16 or float16 inputs, got {details}"
     if any(not tensor.is_cuda for tensor in inputs.values()):
         return "strict TLE KDA requires CUDA inputs"
     if any(tensor.device != q.device for tensor in inputs.values()):
@@ -1746,9 +1758,38 @@ if HAS_STRICT_TLE_KDA:
         b_gq = tl.where(m_c[:, None], exp2(tl.load(gc_sp)), 0.0)
         b_gk = tl.where(m_c[:, None], exp2(-tl.load(gc_sp)), 0.0)
 
-        b_kgt = tl.trans(b_kf * b_gk).to(b_k.dtype)
-        b_Aqk = tl.dot((b_qf * b_gq).to(b_q.dtype), b_kgt, out_dtype=tl.float32)
-        b_Akk = tl.dot((b_kf * b_gq).to(b_k.dtype), b_kgt, out_dtype=tl.float32)
+        # Match the validated generic-TLE FP16 path: keep the exponential
+        # gate factors in FP32 and pass the backend's explicit input precision
+        # to dot.  Casting these products back to FP16 is numerically unsafe on
+        # BW1000 and made the strict kernel return NaNs.
+        if q.dtype.element_ty == tl.float16:
+            b_kgt = tl.trans(b_kf * b_gk)
+            b_Aqk = tl.dot(
+                b_qf * b_gq,
+                b_kgt,
+                input_precision=_FP16_DOT_PRECISION,
+                out_dtype=tl.float32,
+            )
+            b_Akk = tl.dot(
+                b_kf * b_gq,
+                b_kgt,
+                input_precision=_FP16_DOT_PRECISION,
+                out_dtype=tl.float32,
+            )
+        else:
+            b_kgt = tl.trans(b_kf * b_gk).to(b_k.dtype)
+            b_Aqk = tl.dot(
+                (b_qf * b_gq).to(b_q.dtype),
+                b_kgt,
+                input_precision=_FP16_DOT_PRECISION,
+                out_dtype=tl.float32,
+            )
+            b_Akk = tl.dot(
+                (b_kf * b_gq).to(b_k.dtype),
+                b_kgt,
+                input_precision=_FP16_DOT_PRECISION,
+                out_dtype=tl.float32,
+            )
 
         b_Aqk = b_Aqk * b_q_rstd[:, None] * b_k_rstd[None, :]
         b_Akk = b_Akk * b_k_rstd[:, None] * b_k_rstd[None, :]
@@ -1932,9 +1973,34 @@ if HAS_STRICT_TLE_KDA:
 
         b_gq = tl.where(m_c[:, None], exp2(tl.load(gc_sp)), 0.0)
         b_gk = tl.where(m_c[:, None], exp2(-tl.load(gc_sp)), 0.0)
-        b_kgt = tl.trans(b_kf * b_gk).to(b_k.dtype)
-        b_Aqk = tl.dot((b_qf * b_gq).to(b_q.dtype), b_kgt, out_dtype=tl.float32)
-        b_Akk = tl.dot((b_kf * b_gq).to(b_k.dtype), b_kgt, out_dtype=tl.float32)
+        if q.dtype.element_ty == tl.float16:
+            b_kgt = tl.trans(b_kf * b_gk)
+            b_Aqk = tl.dot(
+                b_qf * b_gq,
+                b_kgt,
+                input_precision=_FP16_DOT_PRECISION,
+                out_dtype=tl.float32,
+            )
+            b_Akk = tl.dot(
+                b_kf * b_gq,
+                b_kgt,
+                input_precision=_FP16_DOT_PRECISION,
+                out_dtype=tl.float32,
+            )
+        else:
+            b_kgt = tl.trans(b_kf * b_gk).to(b_k.dtype)
+            b_Aqk = tl.dot(
+                (b_qf * b_gq).to(b_q.dtype),
+                b_kgt,
+                input_precision=_FP16_DOT_PRECISION,
+                out_dtype=tl.float32,
+            )
+            b_Akk = tl.dot(
+                (b_kf * b_gq).to(b_k.dtype),
+                b_kgt,
+                input_precision=_FP16_DOT_PRECISION,
+                out_dtype=tl.float32,
+            )
         b_Aqk = b_Aqk * b_q_rstd[:, None] * b_k_rstd[None, :]
         b_Akk = b_Akk * b_k_rstd[:, None] * b_k_rstd[None, :]
 
@@ -2128,8 +2194,7 @@ if HAS_STRICT_TLE_KDA:
                 num_stages=1,
             )
         else:
-            def grid(meta):
-                return (triton.cdiv(V, meta["BV"]), N * HV)
+            grid = lambda meta: (triton.cdiv(V, meta["BV"]), N * HV)
             _kda_fwd_state_output_direct_kernel[grid](
                 v=v,
                 beta=beta,
@@ -2195,6 +2260,35 @@ def chunk_kda_fwd_infer_strict_tle(
     )
     if reason is not None:
         raise ValueError(reason)
+
+    # Native FP16 strict-TLE dots are enabled by default.  If an older Hygon
+    # compiler lacks the FP16 dot lowering, callers can set this opt-out to
+    # ``0`` and use the BF16 compatibility bridge below.  The bridge is kept
+    # explicit and still runs the strict-TLE kernels; it never silently routes
+    # to generic Triton.
+    if (
+        q.dtype == torch.float16
+        and os.environ.get("FLAGGEMS_KDA_STRICT_FP16_NATIVE", "1") != "1"
+    ):
+        o, final_state = chunk_kda_fwd_infer_strict_tle(
+            q=q.to(torch.bfloat16),
+            k=k.to(torch.bfloat16),
+            v=v.to(torch.bfloat16),
+            g=g.to(torch.bfloat16),
+            beta=beta.to(torch.bfloat16),
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            state_v_first=state_v_first,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            A_log=A_log,
+            dt_bias=dt_bias,
+        )
+        return o.to(torch.float16), final_state
 
     triton.set_allocator(_allocate_triton_workspace)
 
@@ -2534,7 +2628,9 @@ def _kda_fwd_intra_triton(
     qg = torch.empty(B, T_len, HV, K, device=q.device, dtype=q.dtype)
     kg = torch.empty(B, T_len, HV, K, device=q.device, dtype=q.dtype)
     Aqk = torch.empty(B, T_len, HV, BT, device=q.device, dtype=q.dtype)
-    Akk = torch.zeros(B, T_len, HV, BT, device=q.device, dtype=q.dtype)
+    # Intra Triton writes every valid Akk element before consumption; padded
+    # rows remain protected by the consumer's boundary checks.
+    Akk = torch.empty(B, T_len, HV, BT, device=q.device, dtype=q.dtype)
 
     _kda_fwd_intra_triton_kernel[grid](
         q=q,
@@ -2934,7 +3030,7 @@ def _kda_fwd_h_o_triton(
         else:
             final_state = kg.new_zeros(N, HV, K, V, dtype=torch.float32)
 
-    o = torch.zeros(B, T, HV, V, device=kg.device, dtype=u.dtype)
+    o = torch.empty(B, T, HV, V, device=kg.device, dtype=u.dtype)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * HV)
