@@ -27,12 +27,11 @@
     {"META": {"BK": 32, "BV": 128, "B_VCHUNK": 1}, "num_warps": 2, "num_stages": 2}
   ],
   "_chunk_gdn2_fwd_intra_infer_kernel": [
-    {"META": {"BK": 64, "BV": 32}, "num_warps": 2, "num_stages": 2},
+    {"META": {"BK": 64, "BV": 32}, "num_warps": 2, "num_stages": 4},
     {"META": {"BK": 64, "BV": 64}, "num_warps": 4, "num_stages": 2},
     {"META": {"BK": 64, "BV": 64}, "num_warps": 2, "num_stages": 1},
-    {"META": {"BK": 64, "BV": 64}, "num_warps": 4, "num_stages": 1},
     {"META": {"BK": 64, "BV": 32}, "num_warps": 2, "num_stages": 1},
-    {"META": {"BK": 32, "BV": 64}, "num_warps": 2, "num_stages": 1}
+    {"META": {"BK": 64, "BV": 64}, "num_warps": 4, "num_stages": 1}
   ],
   "_chunk_gdn2_fwd_h_o_infer_kernel": [
     {"META": {"BV": 32}, "num_warps": 4, "num_stages": 3},
