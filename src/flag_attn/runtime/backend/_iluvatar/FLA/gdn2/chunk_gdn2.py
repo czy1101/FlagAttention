@@ -1286,7 +1286,6 @@ if HAS_TLE_GDN2:
             chunk_size=chunk_size,
         )
 
-
 def chunk_gdn2(
     q,
     k,
