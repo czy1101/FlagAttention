@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "fused_attnres": (".FLA.attnres", "fused_attnres"),
     "parallel_parallax": (".FLA.parallax", "parallel_parallax"),
     "parallax_decode": (".FLA.parallax", "parallax_decode"),
     "parallax_attn_with_kvcache": (".FLA.parallax", "parallax_attn_with_kvcache"),
