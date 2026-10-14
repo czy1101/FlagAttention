@@ -25,9 +25,11 @@ from .. import (
     attention_decode_ascend_bf16_mtp1,
     attention_decode_ascend_bf16_mtp2,
     attention_decode_ascend_bf16_mtp3,
+    attention_decode_ascend_bf16_mtp4,
     prepare_ascend_bf16_mtp1_workspace,
     prepare_ascend_bf16_mtp2_workspace,
     prepare_ascend_bf16_mtp3_workspace,
+    prepare_ascend_bf16_mtp4_workspace,
 )
 from ..dynamic.bf16_dynamic import _validate
 
@@ -68,7 +70,9 @@ def prepare_static_bf16_workspace(
         return prepare_ascend_bf16_mtp1_workspace(inputs, static_sched=True)
     if inputs.mtp == 2:
         return prepare_ascend_bf16_mtp2_workspace(inputs, static_sched=True)
-    return prepare_ascend_bf16_mtp3_workspace(inputs, static_sched=True)
+    if inputs.mtp == 3:
+        return prepare_ascend_bf16_mtp3_workspace(inputs, static_sched=True)
+    return prepare_ascend_bf16_mtp4_workspace(inputs, static_sched=True)
 
 
 def attention_decode_bf16_tle(
@@ -81,7 +85,9 @@ def attention_decode_bf16_tle(
         return attention_decode_ascend_bf16_mtp1(inputs, workspace)
     if inputs.mtp == 2:
         return attention_decode_ascend_bf16_mtp2(inputs, workspace)
-    return attention_decode_ascend_bf16_mtp3(inputs, workspace)
+    if inputs.mtp == 3:
+        return attention_decode_ascend_bf16_mtp3(inputs, workspace)
+    return attention_decode_ascend_bf16_mtp4(inputs, workspace)
 
 
 def bf16_static_workspace_is_reset(

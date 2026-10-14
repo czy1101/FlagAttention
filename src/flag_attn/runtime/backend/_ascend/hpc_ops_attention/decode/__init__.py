@@ -30,9 +30,11 @@ _OPERATOR_EXPORTS = {
     "attention_decode_ascend_bf16_mtp1": (".bf16", "attention_decode_ascend_bf16_mtp1"),
     "attention_decode_ascend_bf16_mtp2": (".bf16", "attention_decode_ascend_bf16_mtp2"),
     "attention_decode_ascend_bf16_mtp3": (".bf16", "attention_decode_ascend_bf16_mtp3"),
+    "attention_decode_ascend_bf16_mtp4": (".bf16", "attention_decode_ascend_bf16_mtp4"),
     "prepare_ascend_bf16_mtp1_workspace": (".bf16", "prepare_ascend_bf16_mtp1_workspace"),
     "prepare_ascend_bf16_mtp2_workspace": (".bf16", "prepare_ascend_bf16_mtp2_workspace"),
     "prepare_ascend_bf16_mtp3_workspace": (".bf16", "prepare_ascend_bf16_mtp3_workspace"),
+    "prepare_ascend_bf16_mtp4_workspace": (".bf16", "prepare_ascend_bf16_mtp4_workspace"),
     "refresh_ascend_bf16_mtp1_task_map": (".bf16", "refresh_ascend_bf16_mtp1_task_map"),
 }
 

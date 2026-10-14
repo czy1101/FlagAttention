@@ -88,7 +88,7 @@ def _choose_pages_per_split(lengths, mtp: int) -> int:
     growing KV length cannot re-shard an existing workspace.
     """
     if mtp != 1:
-        # The model was fitted against the MTP1 producer; MTP2/MTP3 keep the
+        # The model was fitted against the MTP1 producer; MTP2/3/4 keep the
         # stable eight-page split size.
         return PAGES_PER_SPLIT
     if not lengths:
@@ -121,7 +121,7 @@ class AscendBF16MTP1Workspace:
     # Contiguous per-split copies of V.  K remains paged and is consumed one
     # page at a time; contiguous V lets the producer issue one PV dot per split.
     gather_v: torch.Tensor
-    # MTP2/3 materialise probabilities between the combined QK/V-gather stage
+    # MTP3/4 materialise probabilities between the combined QK/V-gather stage
     # and the contiguous PV stage.  MTP1 keeps its lower-overhead fused path.
     score_p: torch.Tensor
     score_sum: torch.Tensor
@@ -140,6 +140,14 @@ class AscendBF16MTP1Workspace:
     # default, so that a schedule refresh (KV lengths grow during decoding)
     # cannot change the sharding of an existing workspace.
     pages_per_split: int
+
+    @property
+    def route(self) -> str:
+        """Describe the actual producer and reduction choices for callers."""
+        producer = "staged-qk-pv" if self.mtp >= 3 else "fused-pv"
+        schedule = "compact" if self.compact_producer else "rectangular"
+        reduction = "hierarchical" if self.hierarchical_reduction else "direct"
+        return f"ascend/mtp{self.mtp}/{producer}/{schedule}/pps{self.pages_per_split}/{reduction}"
 
 
 @triton.jit
@@ -804,7 +812,7 @@ def _bf16_mtp_pv_kernel(
     SL_SP: tl.constexpr,
     USE_TASK_MAP: tl.constexpr,
 ):
-    """Finish MTP2/3 with one contiguous PV dot per split."""
+    """Finish MTP3/4 with one contiguous PV dot per split."""
     if USE_TASK_MAP:
         task = tl.program_id(0) * 3
         batch = tl.load(TASK_MAP + task)
@@ -1174,7 +1182,7 @@ def _prepare_ascend_bf16_workspace(
     # land inside the buffer; finalisation only ever reads rows below ``mtp * hq``.
     hkv = int(inputs.k_cache.shape[2])
     heads_per_group = hq // hkv
-    q_rows = {1: 8, 2: 16, 3: 32}.get(mtp, mtp * hq)
+    q_rows = triton.next_power_of_2(mtp * heads_per_group)
     padded_rows = (q_rows // heads_per_group) * hq
     rows = max(mtp * hq, padded_rows)
     partial_dtype = torch.bfloat16 if mtp == 1 else torch.float32
@@ -1210,13 +1218,13 @@ def _prepare_ascend_bf16_workspace(
         score_p=torch.empty(
             (
                 (batch, hkv, max_splits, q_rows, pages_per_split * 64)
-                if mtp == 3 else (1,)
+                if mtp >= 3 else (1,)
             ),
             dtype=inputs.q.dtype,
             device=inputs.q.device,
         ),
         score_sum=torch.empty(
-            ((batch, hkv, max_splits, q_rows) if mtp == 3 else (1,)),
+            ((batch, hkv, max_splits, q_rows) if mtp >= 3 else (1,)),
             dtype=torch.float32,
             device=inputs.q.device,
         ),
@@ -1254,6 +1262,12 @@ def prepare_ascend_bf16_mtp3_workspace(
     inputs, *, static_sched: bool = False,
 ) -> AscendBF16MTP1Workspace:
     return _prepare_ascend_bf16_workspace(inputs, 3, static_sched=static_sched)
+
+
+def prepare_ascend_bf16_mtp4_workspace(
+    inputs, *, static_sched: bool = False,
+) -> AscendBF16MTP1Workspace:
+    return _prepare_ascend_bf16_workspace(inputs, 4, static_sched=static_sched)
 
 
 def refresh_ascend_bf16_mtp1_task_map(
@@ -1675,6 +1689,13 @@ def attention_decode_ascend_bf16_mtp3(
     return _attention_decode_ascend_bf16_mtp(inputs, workspace, 3, 32)
 
 
+def attention_decode_ascend_bf16_mtp4(
+    inputs,
+    workspace: AscendBF16MTP1Workspace,
+) -> torch.Tensor:
+    return _attention_decode_ascend_bf16_mtp(inputs, workspace, 4, 32)
+
+
 __all__ = [
     "HAS_TLE",
     "USE_TLE",
@@ -1682,8 +1703,10 @@ __all__ = [
     "attention_decode_ascend_bf16_mtp1",
     "attention_decode_ascend_bf16_mtp2",
     "attention_decode_ascend_bf16_mtp3",
+    "attention_decode_ascend_bf16_mtp4",
     "prepare_ascend_bf16_mtp1_workspace",
     "prepare_ascend_bf16_mtp2_workspace",
     "prepare_ascend_bf16_mtp3_workspace",
+    "prepare_ascend_bf16_mtp4_workspace",
     "refresh_ascend_bf16_mtp1_task_map",
 ]

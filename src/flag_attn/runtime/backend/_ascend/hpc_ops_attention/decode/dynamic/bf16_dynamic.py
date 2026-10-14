@@ -25,9 +25,11 @@ from .. import (
     attention_decode_ascend_bf16_mtp1,
     attention_decode_ascend_bf16_mtp2,
     attention_decode_ascend_bf16_mtp3,
+    attention_decode_ascend_bf16_mtp4,
     prepare_ascend_bf16_mtp1_workspace,
     prepare_ascend_bf16_mtp2_workspace,
     prepare_ascend_bf16_mtp3_workspace,
+    prepare_ascend_bf16_mtp4_workspace,
     refresh_ascend_bf16_mtp1_task_map,
 )
 
@@ -66,8 +68,8 @@ def _validate(inputs: DynamicBF16Inputs) -> tuple[int, int, int]:
         raise ValueError("q must be BF16 [batch * MTP, Hq, 128]")
     if inputs.q.stride(2) != 1:
         raise ValueError("q head dimension must be contiguous")
-    if inputs.mtp not in (1, 2, 3):
-        raise NotImplementedError("Ascend BF16 dynamic decode supports MTP=1, MTP=2, or MTP=3")
+    if inputs.mtp not in (1, 2, 3, 4):
+        raise NotImplementedError("Ascend BF16 dynamic decode supports MTP=1, MTP=2, MTP=3, or MTP=4")
 
     tensors = (
         inputs.q,
@@ -115,7 +117,9 @@ def prepare_dynamic_bf16_workspace(
         return prepare_ascend_bf16_mtp1_workspace(inputs)
     if inputs.mtp == 2:
         return prepare_ascend_bf16_mtp2_workspace(inputs)
-    return prepare_ascend_bf16_mtp3_workspace(inputs)
+    if inputs.mtp == 3:
+        return prepare_ascend_bf16_mtp3_workspace(inputs)
+    return prepare_ascend_bf16_mtp4_workspace(inputs)
 
 
 def attention_decode_bf16_dynamic(
@@ -127,7 +131,9 @@ def attention_decode_bf16_dynamic(
         return attention_decode_ascend_bf16_mtp1(inputs, workspace)
     if inputs.mtp == 2:
         return attention_decode_ascend_bf16_mtp2(inputs, workspace)
-    return attention_decode_ascend_bf16_mtp3(inputs, workspace)
+    if inputs.mtp == 3:
+        return attention_decode_ascend_bf16_mtp3(inputs, workspace)
+    return attention_decode_ascend_bf16_mtp4(inputs, workspace)
 
 
 def refresh_dynamic_bf16_task_map(
