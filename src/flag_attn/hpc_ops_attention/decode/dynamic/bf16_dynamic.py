@@ -22,6 +22,7 @@ import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
+from flag_attn.runtime.backend import resolve_operator
 
 from ..assign_task import (
     _bf16_compact__assign_prefix_kernel as _dynamic__assign_prefix_kernel,
@@ -35,6 +36,8 @@ from .. import (
     prepare_pure_triton_mtp1_workspace,
     tle,
 )
+
+USE_TLE = USE_TLE and hasattr(tle, "device_mesh")
 
 _FINAL_KERNEL_LOCK = RLock()
 
@@ -10789,7 +10792,7 @@ def _base_workspace(workspace) -> DynamicBF16Workspace:
     raise TypeError(f"unsupported BF16 dynamic workspace: {type(workspace)!r}")
 
 
-def prepare_dynamic_bf16_workspace(inputs: DynamicBF16Inputs):
+def _generic_prepare_dynamic_bf16_workspace(inputs: DynamicBF16Inputs):
     """Prepare the fixed MTP1/MTP2/MTP3 winner, with a generic fallback."""
     if not USE_TLE:
         return prepare_pure_triton_mtp1_workspace(inputs, "bf16")
@@ -10871,7 +10874,7 @@ def prepare_dynamic_bf16_workspace(inputs: DynamicBF16Inputs):
     return _prepare_dynamic_bf16_workspace_base(inputs)
 
 
-def attention_decode_bf16_dynamic(inputs: DynamicBF16Inputs, workspace):
+def _generic_attention_decode_bf16_dynamic(inputs: DynamicBF16Inputs, workspace):
     if isinstance(workspace, PureTritonMTP1Workspace):
         return attention_decode_pure_triton_mtp1(inputs, workspace)
     """Run the fixed production route selected during workspace preparation."""
@@ -10910,7 +10913,7 @@ def attention_decode_bf16_dynamic(inputs: DynamicBF16Inputs, workspace):
     return _attention_decode_bf16_dynamic_base(inputs, workspace)
 
 
-def refresh_dynamic_bf16_task_map(inputs: DynamicBF16Inputs, workspace) -> None:
+def _generic_refresh_dynamic_bf16_task_map(inputs: DynamicBF16Inputs, workspace) -> None:
     """Refresh a base/final workspace without changing its selected route."""
     if isinstance(workspace, PureTritonMTP1Workspace):
         if inputs.mtp != 1:
@@ -10923,12 +10926,44 @@ def refresh_dynamic_bf16_task_map(inputs: DynamicBF16Inputs, workspace) -> None:
     _refresh_dynamic_bf16_task_map_base(inputs, _base_workspace(workspace))
 
 
-def bf16_dynamic_workspace_is_reset(workspace) -> bool:
+def _generic_bf16_dynamic_workspace_is_reset(workspace) -> bool:
     """Return whether cooperative-finalization counters are replay-ready."""
     if isinstance(workspace, PureTritonMTP1Workspace):
         return True
     base = _base_workspace(workspace)
     return not bool(torch.count_nonzero(base.completion).item())
+
+
+def prepare_dynamic_bf16_workspace(inputs: DynamicBF16Inputs):
+    return resolve_operator(
+        "hy3_attention_decode_bf16_dynamic_prepare",
+        __name__,
+        "_generic_prepare_dynamic_bf16_workspace",
+    )(inputs)
+
+
+def attention_decode_bf16_dynamic(inputs: DynamicBF16Inputs, workspace):
+    return resolve_operator(
+        "hy3_attention_decode_bf16_dynamic",
+        __name__,
+        "_generic_attention_decode_bf16_dynamic",
+    )(inputs, workspace)
+
+
+def refresh_dynamic_bf16_task_map(inputs: DynamicBF16Inputs, workspace) -> None:
+    return resolve_operator(
+        "hy3_attention_decode_bf16_dynamic_refresh_task_map",
+        __name__,
+        "_generic_refresh_dynamic_bf16_task_map",
+    )(inputs, workspace)
+
+
+def bf16_dynamic_workspace_is_reset(workspace) -> bool:
+    return resolve_operator(
+        "hy3_attention_decode_bf16_dynamic_workspace_is_reset",
+        __name__,
+        "_generic_bf16_dynamic_workspace_is_reset",
+    )(workspace)
 
 
 __all__ = [
