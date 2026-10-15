@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import torch
 
 import triton
+from flag_attn.runtime.backend import resolve_operator
 
 import triton.language as tl
 
@@ -27,6 +28,8 @@ from .. import (
     gpu_types,
     tle,
 )
+
+USE_TLE = USE_TLE and hasattr(tle, "device_mesh")
 
 _scheduler_mtp1__TASK_STRIDE = 12
 
@@ -12269,7 +12272,7 @@ def select_decode_policy(inputs):
     return _fp8_entry__select_fp8_decode_policy(inputs)
 
 
-def prepare_decode_workspace(inputs):
+def _generic_prepare_decode_workspace(inputs):
     if not USE_TLE:
         if inputs.mtp == 1:
             return prepare_pure_triton_mtp1_workspace(inputs, QUANT_TYPE)
@@ -12277,7 +12280,7 @@ def prepare_decode_workspace(inputs):
     return _fp8_entry__prepare_fp8_decode_workspace(inputs)
 
 
-def attention_decode_fp8(inputs, workspace):
+def _generic_attention_decode_fp8(inputs, workspace):
     if isinstance(workspace, PureTritonMTP1Workspace):
         return attention_decode_pure_triton_mtp1(inputs, workspace)
     if isinstance(workspace, PureTritonMTPWorkspace):
@@ -12285,10 +12288,34 @@ def attention_decode_fp8(inputs, workspace):
     return _fp8_entry__attention_decode_fp8_tle(inputs, workspace)
 
 
-def workspace_is_reset(workspace):
+def _generic_workspace_is_reset(workspace):
     if isinstance(workspace, PureTritonMTP1Workspace):
         return True
     return _fp8_entry__fp8_workspace_is_reset(workspace)
+
+
+def prepare_decode_workspace(inputs):
+    return resolve_operator(
+        "hy3_attention_decode_fp8_kv_dynamic_prepare",
+        __name__,
+        "_generic_prepare_decode_workspace",
+    )(inputs)
+
+
+def attention_decode_fp8(inputs, workspace):
+    return resolve_operator(
+        "hy3_attention_decode_fp8_kv_dynamic",
+        __name__,
+        "_generic_attention_decode_fp8",
+    )(inputs, workspace)
+
+
+def workspace_is_reset(workspace):
+    return resolve_operator(
+        "hy3_attention_decode_fp8_kv_dynamic_workspace_is_reset",
+        __name__,
+        "_generic_workspace_is_reset",
+    )(workspace)
 
 
 __all__ = [

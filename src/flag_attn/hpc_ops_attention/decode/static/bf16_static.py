@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import torch
+from flag_attn.runtime.backend import resolve_operator
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
@@ -45,6 +46,8 @@ from .. import (
     prepare_pure_triton_mtp1_workspace,
     tle,
 )
+
+USE_TLE = USE_TLE and hasattr(tle, "device_mesh")
 
 _base__TILE_N = tl.constexpr(64)
 
@@ -1688,7 +1691,7 @@ OFFICIAL_CASES = _bf16_entry__OFFICIAL_CASES
 StaticBF16Inputs = _bf16_entry__StaticBF16Inputs
 StaticBF16Policy = _bf16_entry__StaticBF16Policy
 StaticBF16Workspace = _bf16_entry__StaticBF16Workspace
-def prepare_static_bf16_workspace(inputs):
+def _generic_prepare_static_bf16_workspace(inputs):
     if not USE_TLE:
         if inputs.mtp == 1:
             return prepare_pure_triton_mtp1_workspace(inputs, "bf16")
@@ -1696,12 +1699,29 @@ def prepare_static_bf16_workspace(inputs):
     return _bf16_entry__prepare_static_bf16_workspace(inputs)
 
 
-def attention_decode_bf16_static(inputs, workspace):
+def _generic_attention_decode_bf16_static(inputs, workspace):
     if isinstance(workspace, PureTritonMTP1Workspace):
         return attention_decode_pure_triton_mtp1(inputs, workspace)
     if isinstance(workspace, PureTritonMTPWorkspace):
         return attention_decode_pure_triton_mtp(inputs, workspace)
     return _bf16_entry__attention_decode_bf16_tle(inputs, workspace)
+
+
+def prepare_static_bf16_workspace(inputs):
+    return resolve_operator(
+        "hy3_attention_decode_bf16_static_prepare",
+        __name__,
+        "_generic_prepare_static_bf16_workspace",
+    )(inputs)
+
+
+def attention_decode_bf16_static(inputs, workspace):
+    return resolve_operator(
+        "hy3_attention_decode_bf16_static",
+        __name__,
+        "_generic_attention_decode_bf16_static",
+    )(inputs, workspace)
+
 
 select_static_bf16_policy = _bf16_entry__select_static_bf16_policy
 __all__ = [
