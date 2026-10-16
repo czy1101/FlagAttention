@@ -18,15 +18,18 @@ import triton.language as tl
 import triton.experimental.tle.language as tle
 
 _TILE_CONFIGS = [
-    triton.Config({"BLOCK_M": block_m, "BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
-    for block_m, block_n in ((64, 64), (128, 64), (128, 32))
+    triton.Config(
+        {"BLOCK_M": block_m, "BLOCK_N": block_n},
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    for block_m, block_n in (
+        (64, 64), (128, 64), (128, 32),
+    )
     for num_warps in (4, 8)
+    for num_stages in (1, 2)
 ]
 
-
-def _prune_tile_configs(configs, named_args, **kwargs):
-    expected_warps = 4 if kwargs["HEAD_DIM"] == 64 else 8
-    return [config for config in configs if config.num_warps == expected_warps]
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
@@ -191,7 +194,6 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
 @triton.autotune(
     configs=_TILE_CONFIGS,
     key=["qo_len", "kv_len", "H", "HEAD_DIM", "num_kv_groups", "RETURN_LSE"],
-    prune_configs_by={"early_config_prune": _prune_tile_configs},
     cache_results=True,
 )
 @triton.heuristics({
