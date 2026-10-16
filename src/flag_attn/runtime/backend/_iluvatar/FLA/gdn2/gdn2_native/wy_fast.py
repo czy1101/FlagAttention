@@ -27,7 +27,11 @@ import torch
 import triton
 import triton.language as tl
 
-from ..compat import autotune_cache_kwargs, exp2, prepare_chunk_indices
+from flag_attn.runtime.backend._iluvatar.FLA.gdn2.compat import (
+    autotune_cache_kwargs,
+    exp2,
+    prepare_chunk_indices,
+)
 
 
 @triton.heuristics(

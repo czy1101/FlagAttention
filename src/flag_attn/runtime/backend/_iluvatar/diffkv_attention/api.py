@@ -162,7 +162,7 @@ RESOURCE = ResourcePolicy()
 @lru_cache(maxsize=1)
 def _implementation():
     """Load the kernel module lazily to keep API/config imports acyclic."""
-    from . import diffkv
+    from flag_attn.runtime.backend._iluvatar.diffkv_attention import diffkv
 
     return diffkv
 
@@ -346,9 +346,11 @@ def diffkv_attention(
     cu_seqlens_q = torch.arange(
         batch + 1, device=query.device, dtype=torch.int32
     )
-    max_seqlen_k = int(context_lens.max().item())
     path = _implementation()._normalize_path(path)
     use_3d = path == "3d"
+    # Kernels and the separate reducer read each sequence length on device.
+    # Page-table capacity is a safe launch-policy upper bound without a host sync.
+    max_seqlen_k = block_tables.shape[1] * key_cache.shape[1]
     if use_3d:
         if num_segments is None:
             num_segments = _implementation().get_num_par_softmax_segments(

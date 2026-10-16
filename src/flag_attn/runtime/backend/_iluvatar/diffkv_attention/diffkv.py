@@ -15,7 +15,8 @@
 
 """Triton/TLE kernels and backend launchers for DiffKV attention.
 
-The public API and input validation live in :mod:`.api`, following the
+The public API and input validation live in
+``flag_attn.runtime.backend._iluvatar.diffkv_attention.api``, following the
 GLA/MSA organization in FlagAttention.  This module owns the kernel
 definitions, launch policy, and backend-specific launchers; it deliberately
 does not define the public package entry point.
@@ -23,9 +24,10 @@ does not define the public package entry point.
 The module contains both the TLE-optimized and synchronous Triton kernels.
 The backend is selected at import time and can be overridden per call.
 
-The optimized path uses asynchronous TLE loads and shape-aware launch
-heuristics.  The synchronous Triton implementation remains available as a
-fallback when TLE is unavailable or explicitly disabled.
+The CoreX path uses resource-aware launch heuristics, synchronous K/V loads,
+and a separate split-KV reducer. Optional TLE reduction loads remain available.
+The standard Triton implementation is the fallback when TLE is unavailable
+or explicitly disabled.
 
 The caller selects either direct 2D execution or split-KV 3D execution.  The
 launcher then derives tile, reducer, and resource settings for that path.  The
@@ -53,9 +55,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_attn.utils import has_triton_tle
-
-from .api import (
+from flag_attn.runtime.backend._iluvatar.diffkv_attention.api import (
     DEFAULT_BLOCK_SIZE as _DEFAULT_BLOCK_SIZE,
     LAUNCH as _LAUNCH,
     OPTIMIZED_HEAD_SIZE_QK as _OPTIMIZED_HEAD_SIZE_QK,
@@ -65,6 +65,7 @@ from .api import (
     WORKLOAD as _WORKLOAD,
     SUPPORTED_BACKENDS as _SUPPORTED_BACKENDS,
 )
+from flag_attn.utils import has_triton_tle
 
 DiffKVPath = Literal["2d", "3d"]
 DiffKVBackend = Literal["auto", "tle", "triton"]
@@ -514,48 +515,8 @@ def should_use_tle_fused_reducer(
     block_size: int,
     use_3d: bool,
 ) -> bool:
-    """Return whether the fused reducer supports the requested workload."""
-    workload = _tle_workload_class(max_seqlen_k)
-    if not (
-        use_3d
-        and _has_optimized_head_layout(head_size_qk, head_size_v)
-        and max_seqlen_q == 1
-        and workload is not None
-        and block_size == _DEFAULT_BLOCK_SIZE
-    ):
-        return False
-
-    # The fused path uses a completion counter whose terminal CTA is
-    # responsible for publishing the final output.  A tail sequence can leave
-    # some of the nominal segment CTAs empty (for example, 513 tokens with a
-    # 32-way split and 16-token tiles).  Those CTAs return before incrementing
-    # the counter, so enabling fusion would leave the output unfinalized.  The
-    # regular reducer handles this case through its active-segment mask.
-    fused_segments = _LAUNCH.fused_segments
-    tile_size = get_tle_tile_size(use_3d, num_seqs, max_seqlen_k)
-    if (
-        tile_size > block_size
-        and max_seqlen_k is not None
-        and math.ceil(max_seqlen_k / (fused_segments * tile_size)) <= 2
-    ):
-        fused_segments = _LAUNCH.compact_fused_segments
-    tiles_per_segment = math.ceil(
-        max_seqlen_k / (fused_segments * tile_size)
-    )
-    active_segments = math.ceil(
-        max_seqlen_k / (tiles_per_segment * tile_size)
-    )
-    if active_segments != fused_segments:
-        return False
-
-    # The fused path uses one completion counter per sequence/head group.  A
-    # single sequence can use it across short and medium KV lengths.  For a
-    # small batch, keep fusion in the lower medium range where the regular
-    # launch would use the same compact split; longer medium contexts retain
-    # the parallel reducer to avoid doubling partial-buffer traffic.
-    if num_seqs == 1:
-        return workload in {"short", "medium"}
-    return num_seqs <= 4 and _medium_work_is_compact(max_seqlen_k, tile_size)
+    """Use the separate reducer to avoid CoreX terminal-CTA register spills."""
+    return False
 
 
 def should_split_tle_decode_heads(
@@ -710,21 +671,21 @@ def get_tle_main_num_warps(
     use_3d: bool,
     split_heads: bool,
     fused_reducer: bool,
+    num_programs: int | None = None,
+    num_sms: int | None = None,
+    tile_size: int | None = None,
 ) -> int:
-    """Select the main-kernel warp count from launch geometry.
-
-    Medium 3D grids with at least 32 sequences already expose enough CTAs to
-    trade warp-level parallelism for lower register pressure.  Keeping the
-    default four-warps launch for shorter batches avoids slowing the less
-    populated grids, while long workloads retain their overlap-oriented
-    configuration.
-    """
+    """Trade warp parallelism against grid parallelism on CoreX."""
     if fused_reducer:
         return _LAUNCH.fused_warps
-    if split_heads and num_seqs == 1:
-        return 8
-    if use_3d and _tle_workload_class(max_seqlen_k) == "medium" and num_seqs >= 32:
-        return 2
+    if num_programs is not None and num_sms is not None:
+        target_programs = (
+            _RESOURCE.target_cta_waves_per_sm * num_sms * _LAUNCH.warps
+        )
+        if tile_size is not None and tile_size <= _LAUNCH.default_tile:
+            if num_programs >= target_programs // 2:
+                return _LAUNCH.warps
+        return 2 * _LAUNCH.warps if num_programs <= target_programs else _LAUNCH.warps
     return _LAUNCH.warps
 
 
@@ -753,18 +714,19 @@ def _geometry_split_segments(
 ) -> int:
     """Derive split-KV parallelism from launch geometry.
 
-    Dynamic request lengths should not accumulate another batch/length lookup
-    table.  Aim for roughly two CTA waves when the query/head grid is
-    under-filled.  The available KV tiles provide the upper bound, so the
-    split remains a power-of-two compile-time descriptor independent of
-    canonical benchmark lengths.
+    Use the actual decode query/head grid and device size. Increase the
+    target program count once the base grid covers the device. Available KV
+    tiles bound the power-of-two split count; no benchmark-length table is
+    needed.
     """
     if max_seqlen_k <= 0 or total_num_q_blocks <= 0 or num_kv_heads <= 0:
         return 1
     base_programs = total_num_q_blocks * num_kv_heads
     target_programs = max(
         base_programs,
-        _RESOURCE.target_cta_waves_per_sm * max(num_sms, 1),
+        _RESOURCE.target_cta_waves_per_sm
+        * (2 if base_programs >= num_sms else 1)
+        * max(num_sms, 1),
     )
     desired = max(1, math.ceil(target_programs / base_programs))
     segments = 1
@@ -791,6 +753,9 @@ def get_num_par_softmax_segments(
     """Select the 3D split count from workload and resource descriptors."""
     if not use_3d:
         return 1
+    # Decode launches one query block per sequence, without padded grid entries.
+    if total_num_q_blocks is not None:
+        total_num_q_blocks = num_seqs
     tile_size = get_tle_tile_size(
         use_3d,
         num_seqs,
@@ -830,8 +795,8 @@ def get_tle_num_stages(
     num_kv_heads: int | None = None,
 ) -> int:
     """Keep the CoreX async-load pipeline within the 128 KiB CTA limit."""
-    # CoreX has 128 KiB of shared memory per CTA. Keep the async K/V
-    # pipeline single-buffered; the NVIDIA multi-stage policy exceeds it.
+    # CoreX has 128 KiB of shared memory per CTA. A single stage avoids
+    # the extra resource cost and slower launches measured with two stages.
     return 1
 
 
@@ -846,11 +811,10 @@ def get_tle_tile_size(
 ) -> int:
     """Select a KV tile width from launch parallelism and sequence length.
 
-    Wider decode grids use smaller tiles to preserve independent CTAs.  Short
-    2D batches below the wide-tile limit can use a 128-token tile to reduce
-    pipeline iterations; longer workloads use 64-token tiles when that saves
-    serial KV-loop work.  The thresholds are workload properties rather than
-    GPU-specific shape tables.
+    The 2D policy uses 32- or 64-token tiles to limit shared-memory pressure.
+    The 3D policy can use a wider tile when the grid provides enough work.
+    These decisions use workload and device geometry instead of benchmark
+    shape tables.
     """
     workload = _tle_workload_class(max_seqlen_k)
     has_geometry = (
@@ -883,7 +847,7 @@ def get_tle_tile_size(
                 or (not has_geometry and num_seqs < 32)
             )
         ):
-            return _LAUNCH.short_2d_wide_tile
+            return _LAUNCH.short_2d_batch_tile
         return (
             _LAUNCH.short_2d_batch_tile
             if workload == "short"
@@ -1136,8 +1100,12 @@ def kernel_unified_attention_diffkv(
     if USE_SPLIT_QK:
         # Keep these bounds as literals: Triton requires values referenced
         # directly inside a JIT function to be Triton constexpr globals.
-        offs_d_qk_lo = tl.arange(0, 128)
-        offs_d_qk_hi = 128 + tl.arange(0, 64)
+        if num_queries_per_kv >= 16:
+            offs_d_qk_lo = tl.arange(0, 64)
+            offs_d_qk_hi = 64 + tl.arange(0, 128)
+        else:
+            offs_d_qk_lo = tl.arange(0, 128)
+            offs_d_qk_hi = 128 + tl.arange(0, 64)
         Q_lo = tl.load(
             query_ptr + query_offset_base + offs_d_qk_lo[None, :],
             mask=query_mask,
@@ -1280,7 +1248,7 @@ def kernel_unified_attention_diffkv(
                 + offs_d_qk_lo[:, None] * stride_k_cache_3,
                 mask=tile_mask[None, :],
                 other=0.0,
-                is_async=True,
+                is_async=False,
             ).to(Q_lo.dtype)
             K_hi = tle.load(
                 key_cache_ptr
@@ -1288,7 +1256,7 @@ def kernel_unified_attention_diffkv(
                 + offs_d_qk_hi[:, None] * stride_k_cache_3,
                 mask=tile_mask[None, :],
                 other=0.0,
-                is_async=True,
+                is_async=False,
             ).to(Q_hi.dtype)
         else:
             K = tle.load(
@@ -1297,11 +1265,11 @@ def kernel_unified_attention_diffkv(
                 + offs_d_qk[:, None] * stride_k_cache_3,
                 mask=dim_mask_qk[:, None] & tile_mask[None, :],
                 other=0.0,
-                is_async=True,
+                is_async=False,
             ).to(Q.dtype)
-        # V : (TILE_SIZE, HEAD_SIZE_V_PADDED).  K uses the TLE asynchronous
-        # load path; V remains a direct load because its pointer tile is not
-        # TMA-compatible in the supported Triton backend.
+        # V : (TILE_SIZE, HEAD_SIZE_V_PADDED).  Synchronous TLE loads avoid
+        # the slower async-copy lowering observed on CoreX. Keep the direct
+        # V load to limit shared-memory allocation.
         V_load = tle.load(
             value_cache_ptr + v_offset,
             mask=dim_mask_v[None, :] & tile_mask[:, None],
@@ -2223,6 +2191,8 @@ def _select_tle_launch_config(
         if num_queries_per_kv <= _LAUNCH.query_block_m
         else triton.next_power_of_2(num_queries_per_kv)
     )
+    if is_decode:
+        block_m = triton.next_power_of_2(num_queries_per_kv)
     block_q = block_m // num_queries_per_kv
 
     use_3d = _resolve_3d_path(
@@ -2615,6 +2585,12 @@ def _unified_attention_diffkv_tle(
     BLOCK_M = launch.block_m
     BLOCK_Q = launch.block_q
     tile_size = launch.tile_size
+    if (
+        sliding_window_val > 0
+        and launch.launch_num_q_blocks * num_kv_heads
+        > _RESOURCE.target_cta_waves_per_sm * num_sms * _LAUNCH.warps
+    ):
+        tile_size = min(tile_size, _LAUNCH.default_tile)
     num_segments = launch.num_segments
     launch_num_q_blocks = launch.launch_num_q_blocks
     use_decode_fastpath = launch.use_decode_fastpath
@@ -2631,6 +2607,14 @@ def _unified_attention_diffkv_tle(
                 use_3d,
                 split_heads,
                 fuse_reducer,
+                num_programs=(
+                    launch_num_q_blocks
+                    * num_kv_heads
+                    * (num_queries_per_kv // BLOCK_M if split_heads else 1)
+                    * num_segments
+                ),
+                num_sms=num_sms,
+                tile_size=tile_size,
             ),
             "num_stages": launch.loop_num_stages,
         }

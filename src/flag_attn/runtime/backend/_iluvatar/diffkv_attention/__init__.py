@@ -22,7 +22,7 @@ from importlib import import_module
 def __getattr__(name: str):
     if name not in __all__:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(import_module(".api", __name__), name)
+    value = getattr(import_module("flag_attn.runtime.backend._iluvatar.diffkv_attention.api"), name)
     globals()[name] = value
     return value
 

@@ -15,10 +15,11 @@
 import torch
 import triton
 import triton.language as tl
+import triton.experimental.tle.language as tle
 
 _TILE_CONFIGS = [
     triton.Config({"BLOCK_M": block_m, "BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
-    for block_m, block_n in ((64, 64), (128, 64), (128, 32), (64, 128), (128, 128))
+    for block_m, block_n in ((64, 64), (128, 64), (128, 32))
     for num_warps in (4, 8)
 ]
 
@@ -34,12 +35,15 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
                     K_SCALE_BLOCK: tl.constexpr,
+                    K_base,
+                    V_base,
                     FULL_KV: tl.constexpr,
                     ):
     start_n = 0
-    offs_k = tl.arange(0, HEAD_DIM)
     while start_n < kv_len:
         start_n = tl.multiple_of(start_n, BLOCK_N)
+        K_block_ptrs = K_ptrs + start_n * stride_kn
+        V_block_ptrs = V_ptrs + start_n * stride_vn
         mask_block = None
         skip = False
         if mask_ptrs is not None:
@@ -50,33 +54,29 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             else:
                 mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
         if not skip:
+            k_mask = offs_n[None, :] < (kv_len - start_n)
+
             if FULL_KV:
-                k = tl.load(tl.make_block_ptr(
-                    base=K_ptrs,
+                k_block_ptr = tl.make_block_ptr(
+                    base=K_base,
                     shape=(HEAD_DIM, kv_len),
                     strides=(1, stride_kn),
                     offsets=(0, start_n),
                     block_shape=(HEAD_DIM, BLOCK_N),
                     order=(0, 1),
-                ))
+                )
+                k = tl.load(k_block_ptr)
             else:
-                k_mask = offs_n[None, :] < (kv_len - start_n)
-                k = tl.load(
-                    K_ptrs + offs_k[:, None] + (start_n + offs_n[None, :]) * stride_kn,
+                k = tle.load(
+                    K_block_ptrs,
                     mask=k_mask,
                     other=0,
+                    is_async=False,
                 )
-            if BLOCK_N > K_SCALE_BLOCK:
-                scale0 = tl.load(K_scale_ptr + start_n // K_SCALE_BLOCK)
-                scale1_off = (start_n + K_SCALE_BLOCK) // K_SCALE_BLOCK
-                scale1 = tl.load(
-                    K_scale_ptr + scale1_off,
-                    mask=scale1_off < tl.cdiv(kv_len, K_SCALE_BLOCK),
-                    other=1.0,
-                )
-                k_scale = tl.where(offs_n < K_SCALE_BLOCK, scale0, scale1)
-            else:
-                k_scale = tl.load(K_scale_ptr + start_n // K_SCALE_BLOCK)
+
+            k_scale = tl.load(
+                K_scale_ptr + start_n // K_SCALE_BLOCK
+            )
 
             qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
 
@@ -85,7 +85,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     qk = qk + tl.where(mask_block, 0, -1.0e6)
                 else:
                     qk = qk + mask_block
-            elif not FULL_KV:
+            else:
                 qk += tl.where(k_mask, 0, -1.0e6)
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -99,19 +99,21 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             acc = acc * alpha[:, None]
 
             if FULL_KV:
-                v = tl.load(tl.make_block_ptr(
-                    base=V_ptrs,
+                v_block_ptr = tl.make_block_ptr(
+                    base=V_base,
                     shape=(kv_len, HEAD_DIM),
                     strides=(stride_vn, 1),
                     offsets=(start_n, 0),
                     block_shape=(BLOCK_N, HEAD_DIM),
                     order=(1, 0),
-                ))
+                )
+                v = tl.load(v_block_ptr)
             else:
-                v = tl.load(
-                    V_ptrs + (start_n + offs_n[:, None]) * stride_vn + offs_k[None, :],
+                v = tle.load(
+                    V_block_ptrs,
                     mask=offs_n[:, None] < (kv_len - start_n),
                     other=0,
+                    is_async=False,
                 )
             p = p.to(tl.float16)
 
@@ -129,10 +131,11 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                            KV_BLOCKS: tl.constexpr, FULL_KV: tl.constexpr,
                            K_SCALE_BLOCK: tl.constexpr,
                            ):
-    offs_k = tl.arange(0, HEAD_DIM)
     for block_id in tl.static_range(0, KV_BLOCKS):
         start_n = block_id * BLOCK_N
+        K_block_ptrs = K_ptrs + start_n * stride_kn
         K_scale_block_ptr = K_scale_ptr + (block_id * BLOCK_N) // K_SCALE_BLOCK
+        V_block_ptrs = V_ptrs + start_n * stride_vn
         mask_block = None
         skip = False
         if mask_ptrs is not None:
@@ -144,32 +147,11 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                 mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
         if not skip:
             if FULL_KV:
-                k = tl.load(tl.make_block_ptr(
-                    base=K_ptrs,
-                    shape=(HEAD_DIM, kv_len),
-                    strides=(1, stride_kn),
-                    offsets=(0, start_n),
-                    block_shape=(HEAD_DIM, BLOCK_N),
-                    order=(0, 1),
-                ))
+                k = tle.load(K_block_ptrs, is_async=True)
             else:
                 k_mask = offs_n[None, :] < (kv_len - start_n)
-                k = tl.load(
-                    K_ptrs + offs_k[:, None] + (start_n + offs_n[None, :]) * stride_kn,
-                    mask=k_mask,
-                    other=0,
-                )
-            if BLOCK_N > K_SCALE_BLOCK:
-                scale0 = tl.load(K_scale_block_ptr)
-                scale1_off = (start_n + K_SCALE_BLOCK) // K_SCALE_BLOCK
-                scale1 = tl.load(
-                    K_scale_ptr + scale1_off,
-                    mask=scale1_off < tl.cdiv(kv_len, K_SCALE_BLOCK),
-                    other=1.0,
-                )
-                k_scale = tl.where(offs_n < K_SCALE_BLOCK, scale0, scale1)
-            else:
-                k_scale = tl.load(K_scale_block_ptr)
+                k = tle.load(K_block_ptrs, mask=k_mask, other=0, is_async=True)
+            k_scale = tl.load(K_scale_block_ptr)
 
             qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
 
@@ -192,23 +174,17 @@ def _attn_fwd_inner_static(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             acc = acc * alpha[:, None]
 
             if FULL_KV:
-                v = tl.load(tl.make_block_ptr(
-                    base=V_ptrs,
-                    shape=(kv_len, HEAD_DIM),
-                    strides=(stride_vn, 1),
-                    offsets=(start_n, 0),
-                    block_shape=(BLOCK_N, HEAD_DIM),
-                    order=(1, 0),
-                ))
+                v = tle.load(V_block_ptrs, is_async=True)
             else:
-                v = tl.load(
-                    V_ptrs + (start_n + offs_n[:, None]) * stride_vn + offs_k[None, :],
+                v = tle.load(
+                    V_block_ptrs,
                     mask=offs_n[:, None] < (kv_len - start_n),
                     other=0,
+                    is_async=True,
                 )
             p = p.to(tl.float16)
 
-            acc += tl.dot(p, v, out_dtype=tl.float32)
+            acc += tl.dot(p, v, out_dtype=tl.float16)
             m_i = m_ij
     return acc, l_i, m_i
 
@@ -254,9 +230,25 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
     offs_k = tl.arange(0, HEAD_DIM)
     Q_ptrs = Q + (off_z * stride_qz + off_h * stride_qh) + offs_m[:, None] * stride_qn + offs_k[None, :]
     Q_scale_ptr = Q_scale + q_scale_offset + (start_m * BLOCK_M) // Q_SCALE_BLOCK
-    K_ptrs = K + (off_z * stride_kz + (off_h // num_kv_groups) * stride_kh)
+
+    K_base = K + (
+        off_z * stride_kz
+        + (off_h // num_kv_groups) * stride_kh
+    )
+
+    K_ptrs = (
+        K_base
+        + offs_n[None, :] * stride_kn
+        + offs_k[:, None]
+    )
+
     K_scale_ptr = K_scale + k_scale_offset
-    V_ptrs = V + (off_z * stride_vz + (off_h // num_kv_groups) * stride_vh)
+    V_base = V + (
+        off_z * stride_vz
+        + (off_h // num_kv_groups) * stride_vh
+    )
+    V_ptrs = V + (off_z * stride_vz + (off_h // num_kv_groups) * stride_vh) + offs_n[:, None] * stride_vn + offs_k[None, :]
+    
     O_block_ptr = Out + (off_z * stride_oz + off_h * stride_oh) + offs_m[:, None] * stride_on + offs_k[None, :]
     if mask is None:
         mask_ptrs = None
@@ -281,7 +273,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
                                         start_m, mask_ptrs, stride_maskn,
                                         BLOCK_M, HEAD_DIM, BLOCK_N,
                                         4 - STAGE, offs_m, offs_n, K_SCALE_BLOCK,
-                                        FULL_KV
+                                        K_base, V_base, FULL_KV,
                                         )
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
@@ -329,9 +321,8 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None,
     else:
         lse = torch.empty([0], dtype=torch.float32, device='cpu')
 
-    def grid(meta):
-        return (triton.cdiv(qo_len, meta["BLOCK_M"]), h_qo, b)
-
+    grid = lambda meta: (triton.cdiv(qo_len, meta["BLOCK_M"]), h_qo, b)
+    # Full-static experiment: specialize every shape by its KV block count.
     static_kv = False
     launch_options = {}
     if maxnreg is not None:

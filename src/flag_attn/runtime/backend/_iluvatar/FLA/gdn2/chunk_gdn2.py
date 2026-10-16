@@ -38,7 +38,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from .compat import (
+from flag_attn.runtime.backend._iluvatar.FLA.gdn2.compat import (
     autotune_cache_kwargs,
     exp2,
     has_triton_tle,
@@ -47,7 +47,7 @@ from .compat import (
 )
 
 # This repo's pre-index entry has no BT argument and does not support varlen.
-from .gdn2_native.chunk_fwd import chunk_gdn2_fwd
+from flag_attn.runtime.backend._iluvatar.FLA.gdn2.gdn2_native.chunk_fwd import chunk_gdn2_fwd
 
 LN2 = 0.6931471805599453
 RCP_LN2 = 1.4426950408889634
@@ -63,7 +63,6 @@ if has_triton_tle(3, 6, 0):
 else:
     tle = None
     HAS_TLE_GDN2 = False
-
 
 __all__ = ["chunk_gdn2"]
 

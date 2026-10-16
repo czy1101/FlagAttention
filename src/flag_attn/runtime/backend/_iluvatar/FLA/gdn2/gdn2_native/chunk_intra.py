@@ -24,10 +24,15 @@ import torch
 import triton
 import triton.language as tl
 
-from ..compat import autotune_cache_kwargs, exp2, prepare_chunk_indices
-
-from .chunk_intra_token_parallel import chunk_gdn2_fwd_intra_token_parallel
-from .wy_fast import recompute_w_u_fwd_gdn2
+from flag_attn.runtime.backend._iluvatar.FLA.gdn2.compat import (
+    autotune_cache_kwargs,
+    exp2,
+    prepare_chunk_indices,
+)
+from flag_attn.runtime.backend._iluvatar.FLA.gdn2.gdn2_native.chunk_intra_token_parallel import (
+    chunk_gdn2_fwd_intra_token_parallel,
+)
+from flag_attn.runtime.backend._iluvatar.FLA.gdn2.gdn2_native.wy_fast import recompute_w_u_fwd_gdn2
 
 IS_TF32_SUPPORTED = (
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8

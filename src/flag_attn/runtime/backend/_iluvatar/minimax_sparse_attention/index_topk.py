@@ -32,10 +32,11 @@ import triton
 import triton.language as tl
 from triton.errors import TritonError
 
+from flag_attn.runtime.backend._iluvatar.minimax_sparse_attention.utils import (
+    current_platform as current_platform,  # benchmark import-time PDL cache
+)
+from flag_attn.runtime.backend._iluvatar.minimax_sparse_attention.utils import round_up
 from flag_attn.utils import has_triton_tle
-
-from .utils import current_platform as current_platform  # benchmark import-time PDL cache
-from .utils import round_up
 
 _FP8_DTYPES = (
     torch.float8_e4m3fn,
