@@ -43,7 +43,7 @@ from flag_attn.hpc_ops_attention.decode.static import (  # noqa: E402
     fp8_qkpertoken_perhead_vperhead_static as fp8_qk_static,
     fp8_qpertoken_perhead_kvpertensor_static as fp8_kv_static,
 )
-from flag_attn import hy3_attention
+from flag_attn import hy3_attention, hy3_attention_prepare
 
 
 BLOCK_SIZE = 64
@@ -463,7 +463,7 @@ def test_attention_decode_fp8_perf(
     )
     inputs = _inputs(panel)
     implementation = _implementation(schedule, quant_type)
-    workspace = implementation.prepare_decode_workspace(inputs)
+    workspace = hy3_attention_prepare(inputs, variant=variant)
     cuda_output = (
         torch.empty_like(panel.q, dtype=torch.bfloat16) if hpc is not None else None
     )
@@ -485,7 +485,8 @@ def test_attention_decode_fp8_perf(
     if BENCH_CHECK:
         actual = tle_call().detach().clone()
         test_backend.device_fn.synchronize()
-        reset = implementation.workspace_is_reset(workspace)
+        reset = (workspace.is_reset() if hasattr(workspace, "is_reset")
+                 else implementation.workspace_is_reset(workspace))
         assert torch.isfinite(actual).all()
         assert reset, "decode workspace was not reset"
         if cuda_call is not None:

@@ -141,6 +141,10 @@ class AscendBF16MTP1Workspace:
     # cannot change the sharding of an existing workspace.
     pages_per_split: int
 
+    def is_reset(self) -> bool:
+        """No completion counters persist between the separate kernel launches."""
+        return True
+
     @property
     def route(self) -> str:
         """Describe the actual producer and reduction choices for callers."""

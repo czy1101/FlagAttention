@@ -168,6 +168,10 @@ class FP8DecodeWorkspace:
     pages_per_split: int
     quant_type: int
 
+    def is_reset(self) -> bool:
+        """No completion counters persist between the separate kernel launches."""
+        return True
+
 
 def _validate_fp8_layout(inputs: FP8DecodeInputs, quant_type: int) -> tuple[int, int, int]:
     """Host-only structural checks for one FP8 decode call.
