@@ -4097,6 +4097,8 @@ def parallel_parallax(
         window_size (int, Optional):
             Sliding-window length. If provided, each query at position `i` only attends to
             keys in `[i - window_size + 1, i]`. If `None`, full causal attention is used.
+            The value `-1` is also accepted for compatibility with FLA's low-level API
+            and is treated the same as `None`.
             Default: `None`.
         cu_seqlens (torch.LongTensor, Optional):
             Cumulative sequence lengths of shape `[N+1]` for variable-length training
@@ -4113,6 +4115,10 @@ def parallel_parallax(
     if kwargs:
         unexpected = ", ".join(sorted(kwargs))
         raise TypeError(f"parallel_parallax got unexpected keyword argument(s): {unexpected}")
+    # FLA's low-level kernels use -1 as the unbounded-window sentinel, while
+    # this public API uses None.  Accept both conventions at the boundary.
+    if isinstance(window_size, int) and window_size == -1:
+        window_size = None
     _validate_parallel_parallax_inputs(q, r, k, v, window_size, cu_seqlens)
     if scale is None:
         scale = k.shape[-1] ** -0.5

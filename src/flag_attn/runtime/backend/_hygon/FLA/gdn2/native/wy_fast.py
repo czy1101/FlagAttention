@@ -255,7 +255,10 @@ def recompute_w_u_fwd_gdn2(
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
     BK = 64
-    BV = 64
+    # For the large-V class, halve the number of V tiles.  Keep BV=64 for
+    # smaller workloads because the wider tile increases register pressure
+    # without providing enough reuse to amortize it.
+    BV = 128 if V >= 512 else 64
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)

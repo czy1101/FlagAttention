@@ -12,4 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-{}
+# BW/gfx936 is Wave64; four warps maps to the validated 256-thread
+# workgroup.  Keep eight warps for short-tile workloads where the measured
+# autotune key can select it, but remove stages 3/4 because they matched stage
+# 2 while adding compile candidates on this kernel.
+attention_blocksparse_prefill_fp8:
+  - META: {}
+    num_warps: 4
+    num_stages: 2
+  - META: {}
+    num_warps: 8
+    num_stages: 2

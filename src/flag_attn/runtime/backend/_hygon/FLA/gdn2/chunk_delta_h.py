@@ -19,6 +19,11 @@ NUM_WARPS = [2, 4, 8, 16]
 IS_HIP_BACKEND = device.vendor_name in {"amd", "hygon"}
 
 H_KERNEL_NUM_STAGES = [1,2,3] if IS_HIP_BACKEND else [2, 3, 4]
+# gfx936 benefits from a wider CTA for large V tiles. Keep the existing
+# 2/4-warps candidates and let autotune select 8 only when the workload
+# amortizes the extra parallelism; this avoids forcing a larger register
+# footprint on the short, launch-bound cases.
+H_KERNEL_NUM_WARPS = [2, 4, 8] if IS_HIP_BACKEND else [2, 4]
 
 @libentry()
 @triton.heuristics(
@@ -34,7 +39,7 @@ H_KERNEL_NUM_STAGES = [1,2,3] if IS_HIP_BACKEND else [2, 3, 4]
 @libtuner(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
+        for num_warps in H_KERNEL_NUM_WARPS
         for num_stages in H_KERNEL_NUM_STAGES
         for BV in [32, 64]
     ],

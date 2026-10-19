@@ -13,3 +13,6 @@
 # limitations under the License.
 
 __all__ = []
+from .chunk_gdn2 import chunk_gdn2
+
+__all__ = ["chunk_gdn2"]

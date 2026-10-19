@@ -10,6 +10,11 @@ import torch
 import triton
 import triton.language as tl
 
+from triton.compiler.errors import CompilationError
+from triton.runtime.errors import OutOfResources
+
+from flag_attn.runtime.backend import _hygon as runtime
+
 try:
     HAS_TLE = False
     import triton.experimental.tle.language as tle  # noqa: F401
@@ -25,6 +30,21 @@ from ..index import prepare_chunk_indices
 from ..utils import check_shared_mem, input_guard
 
 RCP_LN2 = 1.4426950216
+OP_NAME = "chunk_gla"
+_SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _use_tle_path() -> bool:
+    # TLE remains the performance path when the package is available. Hygon
+    # lowering may serialize async loads, so compilation failures must fall
+    # back to the portable Triton kernel instead of escaping to callers.
+    override = os.environ.get("FLAG_ATTN_GLA_TLE")
+    if override is None:
+        override = os.environ.get("FLA_GLA_TLE")
+    if override is None:
+        return HAS_TLE
+    return HAS_TLE and override not in {"0", "false", "False", "off", "OFF"}
+
 
 BK_LIST = [32, 64] if check_shared_mem() else [16, 32]
 BV_LIST = [64, 128] if check_shared_mem("ampere") else [16, 32]
@@ -51,17 +71,12 @@ def exp2(x):
     }
 )
 @triton.autotune(
+    # Hygon gfx936: winners observed across all supported forward shape families.
     configs=[
-        triton.Config(
-            {"BK": BK},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
+        triton.Config({"BK": 64}, num_warps=1, num_stages=2),
+        triton.Config({"BK": 64}, num_warps=2, num_stages=2),
     ],
-    key=["BC"],
+    key=["BC", "K"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_A_kernel_intra_sub_inter(
@@ -180,16 +195,12 @@ def chunk_gla_fwd_A_kernel_intra_sub_inter(
     }
 )
 @triton.autotune(
+    # Keep both occupancy regimes selected by D/H families (1 and 2 warps).
     configs=[
-        triton.Config(
-            {},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3]
+        triton.Config({}, num_warps=1, num_stages=2),
+        triton.Config({}, num_warps=2, num_stages=2),
     ],
-    key=["BK", "BT"],
+    key=["BK", "BT", "K"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_A_kernel_intra_sub_intra(
@@ -270,7 +281,7 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra(
     }
 )
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
+    configs=[triton.Config({}, num_warps=1)],
     key=["BC", "BK"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -356,13 +367,8 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_split(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-    ],
-    key=["BC"],
+    configs=[triton.Config({}, num_warps=1)],
+    key=["BC", "NK"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_A_kernel_intra_sub_intra_merge(
@@ -435,7 +441,7 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_merge(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=["BT", "HV", "STATE_V_FIRST", "V"],
+    key=["BT", "H", "K", "HV", "STATE_V_FIRST", "V"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -702,19 +708,16 @@ if HAS_TLE:
         }
     )
     @triton.autotune(
+        # Hygon gfx936: retain only empirically winning families; this avoids
+        # recompiling the 108-way Cartesian product on every fresh process.
         configs=[
-            triton.Config(
-                {"BK": BK, "BV": BV, "B_VCHUNK": B_VCHUNK},
-                num_warps=num_warps,
-                num_stages=num_stages,
-            )
-            for BK in [32, 64]
-            for BV in [64, 128]
-            for B_VCHUNK in [1, 2, 4]
-            for num_warps in [2, 4, 8]
-            for num_stages in [2, 3, 4]
+            triton.Config({"BK": 32, "BV": 128, "B_VCHUNK": 4}, num_warps=4, num_stages=2),
+            triton.Config({"BK": 32, "BV": 128, "B_VCHUNK": 2}, num_warps=8, num_stages=2),
+            triton.Config({"BK": 64, "BV": 128, "B_VCHUNK": 1}, num_warps=8, num_stages=2),
+            triton.Config({"BK": 64, "BV": 128, "B_VCHUNK": 2}, num_warps=8, num_stages=2),
+            triton.Config({"BK": 64, "BV": 64, "B_VCHUNK": 1}, num_warps=4, num_stages=4),
         ],
-        key=["BT", "HV", "STATE_V_FIRST", "V"],
+        key=["BT", "H", "K", "HV", "STATE_V_FIRST", "V"],
     )
     @triton.jit(do_not_specialize=["T"])
     def chunk_gla_fwd_kernel_o_tle(
@@ -901,16 +904,12 @@ if HAS_TLE:
     }
 )
 @triton.autotune(
+    # Hygon gfx936: two measured occupancy regimes for small/large D families.
     configs=[
-        triton.Config(
-            {},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=2, num_stages=2),
     ],
-    key=["BK", "NC", "BT"],
+    key=["BK", "NC", "BT", "H", "K"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_bwd_kernel_intra(
@@ -1123,14 +1122,10 @@ def chunk_gla_bwd_kernel_intra(
     }
 )
 @triton.autotune(
+    # Small-BV and large-BV families select different occupancy settings.
     configs=[
-        triton.Config(
-            {},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for num_warps in [1, 2, 4]
-        for num_stages in [2, 3, 4]
+        triton.Config({}, num_warps=4, num_stages=4),
+        triton.Config({}, num_warps=1, num_stages=2),
     ],
     key=["BV", "BT"],
 )
@@ -1199,18 +1194,12 @@ def chunk_gla_bwd_kernel_dA(
     }
 )
 @triton.autotune(
+    # Hygon gfx936: retain measured small/large state-tile winners.
     configs=[
-        triton.Config(
-            {"BK": BK, "BV": BV},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for BK in BK_LIST
-        for BV in BV_LIST
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        triton.Config({"BK": 32, "BV": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 32, "BV": 32}, num_warps=8, num_stages=2),
     ],
-    key=["BT", "K", "V", "STATE_V_FIRST"],
+    key=["BT", "H", "K", "V", "STATE_V_FIRST"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_bwd_kernel_dv(
@@ -1335,18 +1324,12 @@ def chunk_gla_bwd_kernel_dv(
     }
 )
 @triton.autotune(
+    # Hygon gfx936: alternate K/V state tiles cover long and small D families.
     configs=[
-        triton.Config(
-            {"BK": BK, "BV": BV},
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        for BK in BK_LIST
-        for BV in BV_LIST
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        triton.Config({"BK": 16, "BV": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 32, "BV": 16}, num_warps=4, num_stages=3),
     ],
-    key=["BT", "K", "V", "STATE_V_FIRST"],
+    key=["BT", "H", "K", "V", "STATE_V_FIRST"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_bwd_kernel_inter(
@@ -1624,31 +1607,55 @@ def chunk_gla_fwd_o_gk(
     def grid_tle(meta):
         return (triton.cdiv(V, meta["BV"] * meta.get("B_VCHUNK", 1)), NT, B * HV)
 
-    _use_tle = HAS_TLE and os.environ.get("FLAG_ATTN_GLA_TLE", os.environ.get("FLA_GLA_TLE", "1")) != "0"
+    _use_tle = _use_tle_path()
     if _use_tle:
         kernel = chunk_gla_fwd_kernel_o_tle
         grid_fn = grid_tle
     else:
         kernel = chunk_gla_fwd_kernel_o
         grid_fn = grid
-    kernel[grid_fn](
-        q=q,
-        v=v,
-        g=g,
-        h=h,
-        o=o,
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        T=T,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BT=BT,
-        STATE_V_FIRST=state_v_first,
-    )
+    try:
+        kernel[grid_fn](
+            q=q,
+            v=v,
+            g=g,
+            h=h,
+            o=o,
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            scale=scale,
+            T=T,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BT=BT,
+            STATE_V_FIRST=state_v_first,
+        )
+    except (CompilationError, OutOfResources):
+        if not _use_tle:
+            raise
+        # A TLE/TMA lowering failure is a backend capability issue, not an
+        # API failure. Retry the same workload with the portable Triton path.
+        chunk_gla_fwd_kernel_o[grid](
+            q=q,
+            v=v,
+            g=g,
+            h=h,
+            o=o,
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            scale=scale,
+            T=T,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BT=BT,
+            STATE_V_FIRST=state_v_first,
+        )
     return o
 
 
@@ -2172,6 +2179,62 @@ class ChunkGLAFunction(torch.autograd.Function):
         return dq.to(q), dk.to(k), dv.to(v), dg, None, dh0, None, None, None, None
 
 
+def _validate_chunk_gla_inputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    state_v_first: bool,
+    cu_seqlens: torch.Tensor | None,
+) -> None:
+    tensors = {"q": q, "k": k, "v": v, "g": g}
+    if any(not isinstance(value, torch.Tensor) for value in tensors.values()):
+        bad = next(name for name, value in tensors.items() if not isinstance(value, torch.Tensor))
+        raise TypeError(f"{bad} must be a torch.Tensor")
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or g.ndim != 4:
+        raise ValueError("q, k, v and g must all have shape [B, T, H, D]")
+    if q.shape != k.shape or q.shape != g.shape:
+        raise ValueError("q, k and g must have identical shapes")
+    if v.shape[:3] != q.shape[:3]:
+        raise ValueError("v must match q in batch, sequence and head dimensions")
+    if q.dtype not in _SUPPORTED_INPUT_DTYPES:
+        raise TypeError(f"unsupported q dtype {q.dtype}; expected float16, bfloat16 or float32")
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise TypeError("q, k and v must use the same dtype")
+    if g.dtype not in (q.dtype, torch.float32):
+        raise TypeError("g must use q.dtype or torch.float32")
+    if len({q.device, k.device, v.device, g.device}) != 1:
+        raise ValueError("q, k, v and g must be on the same device")
+    if initial_state is not None:
+        if not isinstance(initial_state, torch.Tensor):
+            raise TypeError("initial_state must be a torch.Tensor or None")
+        if initial_state.ndim != 4:
+            raise ValueError("initial_state must have shape [N, H, K, V] or [N, H, V, K]")
+        if initial_state.device != q.device:
+            raise ValueError("initial_state must be on the same device as q")
+        if initial_state.dtype != torch.float32:
+            raise TypeError("initial_state must be torch.float32")
+        expected_n = q.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
+        expected_tail = (v.shape[-1], q.shape[-1]) if state_v_first else (q.shape[-1], v.shape[-1])
+        if initial_state.shape != (expected_n, q.shape[2], *expected_tail):
+            raise ValueError(
+                "initial_state shape must be "
+                f"({expected_n}, {q.shape[2]}, {expected_tail[0]}, {expected_tail[1]})"
+            )
+    if cu_seqlens is not None:
+        if not isinstance(cu_seqlens, torch.Tensor):
+            raise TypeError("cu_seqlens must be a torch.Tensor or None")
+        if q.shape[0] != 1:
+            raise ValueError("q batch size must be 1 when cu_seqlens is provided")
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+            raise ValueError("cu_seqlens must be a one-dimensional tensor with N+1 entries")
+        if cu_seqlens.dtype not in (torch.int32, torch.int64):
+            raise TypeError("cu_seqlens must use int32 or int64")
+        if cu_seqlens.device != q.device:
+            raise ValueError("cu_seqlens must be on the same device as q")
+
+
 @torch.compiler.disable
 def chunk_gla(
     q: torch.Tensor,
@@ -2247,6 +2310,7 @@ def chunk_gla(
             cu_seqlens=cu_seqlens
         )
     """
+    _validate_chunk_gla_inputs(q, k, v, g, initial_state, state_v_first, cu_seqlens)
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(

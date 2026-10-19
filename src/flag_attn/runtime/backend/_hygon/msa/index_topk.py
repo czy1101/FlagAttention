@@ -46,6 +46,8 @@ else:
     tle = None
     _HAS_TLE = False
 
+_HAS_TLE_RADIX = False
+
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128

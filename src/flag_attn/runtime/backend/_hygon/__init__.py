@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 from types import SimpleNamespace
 
 import torch
-import importlib
+
 # Hygon PyTorch exposes its device through the CUDA-compatible API.
 device = SimpleNamespace(vendor_name="hygon", name="cuda")
 torch_device_fn = torch.cuda
@@ -30,16 +31,57 @@ class _Error:
 error = _Error()
 
 
-
-
+# Every Hygon override is registered at this single backend entry point.
+# Values are (relative module, symbol) pairs and are imported lazily below.
 _OPERATOR_EXPORTS = {
     "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),
     "sage_attention_forward": (".sage_attention.attn_qk_int8_per_block", "forward"),
     "SPARSE_BLOCK_SIZE": (".msa.index_topk", "SPARSE_BLOCK_SIZE"),
     "chunk_kda_fwd_infer": (".FLA.kda.chunk_kda", "chunk_kda_fwd_infer"),
+    "chunk_gdn2": (".FLA.gdn2", "chunk_gdn2"),
+    "chunk_gdn2_native": (".FLA.gdn2.native.chunk_fwd", "chunk_gdn2_fwd"),
     "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
-    "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
+    "parallel_nsa_compression": (
+        ".FLA.nsa.parallel_nsa_compression",
+        "parallel_nsa_compression",
+    ),
+    "parallel_moba": (".FLA.moba.parallel", "parallel_moba"),
+    "parallel_parallax": (".FLA.parallax.parallel", "parallel_parallax"),
+    "parallax_decode": (".FLA.parallax.decode", "parallax_decode"),
+    "parallax_attn_with_kvcache": (
+        ".FLA.parallax.decode",
+        "parallax_attn_with_kvcache",
+    ),
     "chunk_gla": (".FLA.gla", "chunk_gla"),
+    "fused_attnres": (".FLA.attnres", "fused_attnres"),
+    "hy3_attention": (
+        ".hy3.prefill",
+        "attention_with_kvcache_blocksparse_prefill_fp8",
+    ),
+    "hy3_attention_decode_bf16_static": (
+        ".hy3.decode",
+        "attention_decode_bf16_static",
+    ),
+    "hy3_attention_decode_bf16_dynamic": (
+        ".hy3.decode",
+        "attention_decode_bf16_dynamic",
+    ),
+    "hy3_attention_decode_fp8_qk_static": (
+        ".hy3.decode",
+        "attention_decode_fp8_qk_static",
+    ),
+    "hy3_attention_decode_fp8_qk_dynamic": (
+        ".hy3.decode",
+        "attention_decode_fp8_qk_dynamic",
+    ),
+    "hy3_attention_decode_fp8_kv_static": (
+        ".hy3.decode",
+        "attention_decode_fp8_kv_static",
+    ),
+    "hy3_attention_decode_fp8_kv_dynamic": (
+        ".hy3.decode",
+        "attention_decode_fp8_kv_dynamic",
+    ),
     "minimax_m3_index_decode": (".msa", "minimax_m3_index_decode"),
     "minimax_m3_index_decode_score": (".msa", "minimax_m3_index_decode_score"),
     "minimax_m3_index_score": (".msa", "minimax_m3_index_score"),
