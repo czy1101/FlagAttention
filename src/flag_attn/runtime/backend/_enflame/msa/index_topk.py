@@ -10,8 +10,97 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_attn.minimax_sparse_attention.index_topk import _index_block_score_kernel
 
+# The standalone prefill scorer uses the portable Triton implementation;
+# Enflame specializes fused score/TopK and decode scoring below.
 from ..utils import SPARSE_BLOCK_SIZE, round_up
+
+
+# Preserve the portable score algorithm; specialize its launch on S60.
+@torch.no_grad()
+def minimax_m3_index_score(
+    idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
+    index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
+    block_table: torch.Tensor,  # [batch, max_blocks]
+    cu_seqlens_q: torch.Tensor,  # [batch+1] int32
+    seq_lens: torch.Tensor,  # [batch] int32
+    prefix_lens: torch.Tensor,  # [batch] int32
+    max_query_len: int,
+    max_seq_len: int,
+    num_kv_heads: int,
+) -> torch.Tensor:
+    """Use one S60 warp for per-token visible-block index scoring.
+
+    Returns score [num_kv_heads, total_q, max_block], where each score is the
+    max over a 128-token index-K block. M3 has num_idx_heads == num_kv_heads.
+    """
+    total_q, num_idx_heads, head_dim = idx_q.shape
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
+    batch = cu_seqlens_q.shape[0] - 1
+    max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+
+    # Keep score strides 16-divisible to avoid Triton recompiles.
+    score_block_stride = round_up(max_block, 16)
+    score = torch.empty(
+        (num_idx_heads, total_q, score_block_stride),
+        dtype=torch.float32,
+        device=idx_q.device,
+    )
+    BLOCK_SIZE_Q = 64
+    grid_score = (triton.cdiv(max_query_len, BLOCK_SIZE_Q), batch * num_idx_heads)
+    _index_block_score_kernel[grid_score](
+        idx_q,
+        index_kv_cache,
+        score,
+        block_table,
+        cu_seqlens_q,
+        seq_lens,
+        prefix_lens,
+        num_idx_heads,
+        head_dim,
+        idx_q.stride(0),
+        idx_q.stride(1),
+        idx_q.stride(2),
+        index_kv_cache.stride(0),
+        index_kv_cache.stride(1),
+        index_kv_cache.stride(2),
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        block_table.stride(0),
+        BLOCK_SIZE_Q=BLOCK_SIZE_Q,
+        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        num_warps=1,
+    )
+    return score
+
+
+
+# S60 cannot lower the TLE radix kernel or the generic uint64 packed keys.
+_HAS_TLE_RADIX = False
+_MAX_STREAMING_TOPK = 64
+
+
+def _select_prefill_topk_path(
+    score: torch.Tensor,
+    topk: int,
+    max_query_len: int,
+) -> str:
+    """Keep small selections on S60 reduction; stream larger power-of-two K."""
+    if (
+        score.device.type == "gcu"
+        and score.dtype == torch.float32
+        and score.ndim == 3
+        and 4 < topk <= _MAX_STREAMING_TOPK
+        and (topk & (topk - 1)) == 0
+        and 0 < score.shape[2] <= 0xFFFF
+        and 0 < max_query_len <= 65535
+    ):
+        return "streaming"
+    return "reduction"
 
 
 @triton.jit
@@ -746,6 +835,143 @@ def _prefill_topk_reduction_enflame(
         )
 
 
+@triton.jit
+def _prefill_topk_streaming_enflame(
+    score_ptr,
+    output_ptr,
+    cu_seqlens_q,
+    prefix_lens,
+    init_blocks,
+    local_blocks,
+    max_blocks,
+    stride_sh,
+    stride_sn,
+    stride_sk,
+    stride_oh,
+    stride_on,
+    stride_ok,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    SPARSE_BLOCK: tl.constexpr,
+):
+    """Scan bounded score tiles with separate FP32 scores and INT32 ids."""
+    query_id = tl.program_id(0)
+    request_id = tl.program_id(1)
+    head_id = tl.program_id(2)
+    q_start = tl.load(cu_seqlens_q + request_id)
+    q_end = tl.load(cu_seqlens_q + request_id + 1)
+    if query_id >= q_end - q_start:
+        return
+
+    prefix_len = tl.load(prefix_lens + request_id)
+    valid_blocks = (prefix_len + query_id + SPARSE_BLOCK) // SPARSE_BLOCK
+    valid_blocks = tl.minimum(tl.maximum(valid_blocks, 0), max_blocks)
+    real_selected = tl.minimum(valid_blocks, TOPK)
+    local_start = tl.maximum(valid_blocks - local_blocks, 0)
+    global_query = q_start + query_id
+    slots = tl.arange(0, TOPK)
+    selected_ids = tl.full((TOPK,), -1, tl.int32)
+    offsets = tl.arange(0, BLOCK_SIZE_N)
+
+    for slot in tl.range(0, real_selected):
+        best_score = float("-inf")
+        best_id = max_blocks
+        for tile_start in tl.range(0, valid_blocks, BLOCK_SIZE_N):
+            block_ids = tile_start + offsets
+            visible = block_ids < valid_blocks
+            values = tl.load(
+                score_ptr
+                + head_id * stride_sh
+                + global_query * stride_sn
+                + block_ids * stride_sk,
+                mask=visible,
+                other=float("-inf"),
+            )
+            values = tl.where(values == values, values, float("-inf"))
+            is_local = visible & (block_ids >= local_start)
+            values = tl.where(is_local, 1.0e29, values)
+            is_init = visible & (block_ids < init_blocks) & (values < 1.0e29)
+            values = tl.where(is_init, 1.0e30, values)
+
+            # Track validity separately so masked lanes never tie with -inf.
+            already_selected = tl.sum(
+                (block_ids[:, None] == selected_ids[None, :]).to(tl.int32),
+                axis=1,
+            ) > 0
+            available = visible & ~already_selected
+            tile_score = tl.max(tl.where(available, values, float("-inf")), axis=0)
+            tile_id = tl.min(
+                tl.where(available & (values == tile_score), block_ids, max_blocks),
+                axis=0,
+            )
+            better = (tile_id < max_blocks) & (
+                (tile_score > best_score)
+                | ((tile_score == best_score) & (tile_id < best_id))
+            )
+            best_score = tl.where(better, tile_score, best_score)
+            best_id = tl.where(better, tile_id, best_id)
+        selected_ids = tl.where(slots == slot, best_id, selected_ids)
+
+    tl.store(
+        output_ptr
+        + head_id * stride_oh
+        + global_query * stride_on
+        + slots * stride_ok,
+        selected_ids,
+    )
+
+
+@triton.jit
+def _prefill_topk_rows_enflame(
+    score_ptr, output_ptr, cu_seqlens_q, prefix_lens,
+    init_blocks, local_blocks, max_blocks,
+    stride_sh, stride_sn, stride_sk,
+    stride_oh, stride_on, stride_ok,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    SPARSE_BLOCK: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+):
+    """Keep a bounded multi-row score tile live across TopK reductions."""
+    request_id = tl.program_id(1)
+    head_id = tl.program_id(2)
+    query_ids = tl.program_id(0) * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    q_start = tl.load(cu_seqlens_q + request_id)
+    q_end = tl.load(cu_seqlens_q + request_id + 1)
+    q_valid = query_ids < q_end - q_start
+    prefix_len = tl.load(prefix_lens + request_id)
+    valid_blocks = (prefix_len + query_ids + SPARSE_BLOCK) // SPARSE_BLOCK
+    valid_blocks = tl.minimum(tl.maximum(valid_blocks, 0), max_blocks)
+    real_selected = tl.minimum(valid_blocks, TOPK)
+    block_ids = tl.arange(0, BLOCK_SIZE_N)
+    available = q_valid[:, None] & (block_ids[None, :] < valid_blocks[:, None])
+    values = tl.load(
+        score_ptr + head_id * stride_sh
+        + (q_start + query_ids[:, None]) * stride_sn
+        + block_ids[None, :] * stride_sk,
+        mask=available,
+        other=float("-inf"),
+    )
+    values = tl.where(values == values, values, float("-inf"))
+    local_start = tl.maximum(valid_blocks - local_blocks, 0)
+    is_local = available & (block_ids[None, :] >= local_start[:, None])
+    values = tl.where(is_local, 1.0e29, values)
+    is_init = available & (block_ids[None, :] < init_blocks) & (values < 1.0e29)
+    values = tl.where(is_init, 1.0e30, values)
+    for slot in tl.static_range(0, TOPK):
+        maximum = tl.max(values, axis=1)
+        matching = available & (values == maximum[:, None])
+        selected = -tl.max(tl.where(matching, -block_ids[None, :], -BLOCK_SIZE_N), axis=1)
+        tl.store(
+            output_ptr + head_id * stride_oh
+            + (q_start + query_ids) * stride_on + slot * stride_ok,
+            tl.where(slot < real_selected, selected, -1),
+            mask=q_valid,
+        )
+        available = available & (block_ids[None, :] != selected[:, None])
+        values = tl.where(available, values, float("-inf"))
+
+
 @torch.no_grad()
 def minimax_m3_index_topk(
     score: torch.Tensor,
@@ -757,7 +983,7 @@ def minimax_m3_index_topk(
     local_blocks: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """S60 device-resident reduction TopK for MSA prefill."""
+    """S60 prefill TopK using reduction or streaming selection."""
     if score.ndim != 3:
         raise ValueError(
             "score must have shape "
@@ -816,6 +1042,38 @@ def minimax_m3_index_topk(
         ]
 
     if total_q == 0:
+        return topk_idx
+
+    if (
+        _select_prefill_topk_path(score, topk, max_query_len) == "streaming"
+        and batch <= 255
+        and num_heads <= 255
+    ):
+        # Bound the live FP32 score tile to 4096 elements. Wider rows retain
+        # streaming selection rather than expanding local work without limit.
+        row_tile = 8 if max_blocks <= 512 and topk <= 32 else 1
+        kernel = _prefill_topk_rows_enflame if row_tile > 1 else _prefill_topk_streaming_enflame
+        kernel[(triton.cdiv(max_query_len, row_tile), batch, num_heads)](
+            score,
+            topk_idx,
+            cu_seqlens_q,
+            prefix_lens,
+            init_blocks,
+            local_blocks,
+            max_blocks,
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            TOPK=topk,
+            BLOCK_SIZE_N=triton.next_power_of_2(max_blocks) if row_tile > 1 else 64,
+            SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+            **({"BLOCK_SIZE_Q": row_tile} if row_tile > 1 else {}),
+            num_warps=1,
+            num_stages=1,
+        )
         return topk_idx
 
     block_size_n = triton.next_power_of_2(
@@ -950,6 +1208,89 @@ def _decode_topk_reduction_enflame(
 
 
 @triton.jit
+def _decode_topk_rows_enflame(
+    score_ptr,
+    output_ptr,
+    seq_lens,
+    decode_query_len: tl.constexpr,
+    max_blocks: tl.constexpr,
+    total_q,
+    stride_sh,
+    stride_sn,
+    stride_sk,
+    stride_oh,
+    stride_on,
+    stride_ok,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    SPARSE_BLOCK: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    STORE_TILE: tl.constexpr,
+):
+    """Amortize bounded TopK reduction overhead across adjacent query rows."""
+    query_id = tl.program_id(0) * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    query_valid = query_id < total_q
+    head_id = tl.program_id(1)
+    request_id = query_id // decode_query_len
+    query_offset = query_id - request_id * decode_query_len
+
+    seq_len = tl.load(seq_lens + request_id, mask=query_valid, other=0).to(tl.int32)
+    query_pos = seq_len - decode_query_len + query_offset
+    valid_blocks = (tl.maximum(query_pos + 1, 0) + SPARSE_BLOCK - 1) // SPARSE_BLOCK
+    valid_blocks = tl.minimum(valid_blocks, max_blocks)
+    real_selected = tl.minimum(valid_blocks, TOPK)
+
+    block_ids = tl.arange(0, BLOCK_SIZE_N)
+    available = query_valid[:, None] & (block_ids[None, :] < valid_blocks[:, None])
+    values = tl.load(
+        score_ptr
+        + head_id * stride_sh
+        + query_id[:, None] * stride_sn
+        + block_ids[None, :] * stride_sk,
+        mask=query_valid[:, None] & (block_ids[None, :] < max_blocks),
+        other=float("-inf"),
+    )
+    values = tl.where((values == values) & available, values, float("-inf"))
+
+    if STORE_TILE:
+        slots = tl.arange(0, BLOCK_SIZE_T)
+        selected_ids = tl.full((BLOCK_SIZE_Q, BLOCK_SIZE_T), -1, tl.int32)
+    for slot in tl.static_range(0, TOPK):
+        maximum = tl.max(values, axis=1)
+        candidate_mask = available & (values == maximum[:, None])
+        # Match deterministic page ordering by resolving ties to the lowest id.
+        selected = -tl.max(
+            tl.where(candidate_mask, -block_ids[None, :], -BLOCK_SIZE_N),
+            axis=1,
+        )
+        if STORE_TILE:
+            selected_ids = tl.where(
+                slots[None, :] == slot,
+                tl.where(slot < real_selected, selected, -1)[:, None],
+                selected_ids,
+            )
+        else:
+            tl.store(
+                output_ptr + head_id * stride_oh
+                + query_id * stride_on + slot * stride_ok,
+                tl.where(slot < real_selected, selected, -1),
+                mask=query_valid,
+            )
+        available = available & (block_ids[None, :] != selected[:, None])
+        values = tl.where(available, values, float("-inf"))
+
+    if STORE_TILE:
+        # Write a regular query/slot tile once instead of tiny per-slot stores.
+        tl.store(
+            output_ptr + head_id * stride_oh
+            + query_id[:, None] * stride_on + slots[None, :] * stride_ok,
+            selected_ids,
+            mask=query_valid[:, None] & (slots[None, :] < TOPK),
+        )
+
+
+@triton.jit
 def _decode_topk_identity_enflame(
     output_ptr,
     seq_lens,
@@ -1007,7 +1348,6 @@ def _decode_index_score_kernel_enflame(
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     BLOCK_SIZE_Q: tl.constexpr,
     num_kv_chunks: tl.constexpr,
-    USE_PDL: tl.constexpr,
 ):
     BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
@@ -1022,9 +1362,6 @@ def _decode_index_score_kernel_enflame(
     q_mask = q_offsets < decode_query_len
     q_ids = pid_r * decode_query_len + q_offsets
 
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
     seq_len = tl.load(seq_lens + pid_r)
     query_pos = seq_len - decode_query_len + q_offsets
@@ -1183,7 +1520,6 @@ def minimax_m3_index_decode_score(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         BLOCK_SIZE_Q=block_size_q,
         num_kv_chunks=num_kv_chunks,
-        USE_PDL=False,
         num_warps=1,
         num_stages=1,
     )
@@ -1252,22 +1588,48 @@ def minimax_m3_index_decode(
         score_out=score_out,
     )
 
-    # The benchmark Decode rows have at most 64 pages. Keep their TopK
-    # selection entirely on GCU and retain the generic Torch fallback for
-    # larger or differently configured rows.
-    if max_block <= 128 and topk == 4:
-        _decode_topk_reduction_enflame[(total_q, num_idx_heads)](
+    # Bound live FP32 scores to 4096 elements while batching up to 8 rows.
+    if 0 < max_block <= 4096 and 0 < topk <= 32:
+        block_size_n = triton.next_power_of_2(max_block)
+        block_size_q = min(8, 4096 // block_size_n)
+        if block_size_q == 1 and score.stride(2) != 1:
+            # Avoid the backend's unsupported singleton-axis strided load.
+            # The existing 1D reduction preserves the same deterministic TopK.
+            _decode_topk_reduction_enflame[(total_q, num_idx_heads)](
+                score,
+                topk_idx,
+                seq_lens,
+                decode_query_len,
+                max_block,
+                score.stride(0),
+                score.stride(1),
+                score.stride(2),
+                topk_idx.stride(0),
+                topk_idx.stride(1),
+                topk_idx.stride(2),
+                TOPK=topk,
+                BLOCK_SIZE_N=block_size_n,
+                SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+                num_warps=1,
+                num_stages=1,
+            )
+            return topk_idx
+        _decode_topk_rows_enflame[(triton.cdiv(total_q, block_size_q), num_idx_heads)](
             score,
             topk_idx,
             seq_lens,
             decode_query_len,
             max_block,
+            total_q,
             score.stride(0),
             score.stride(1),
             score.stride(2),
             topk_idx.stride(0),
             topk_idx.stride(1),
             topk_idx.stride(2),
+            BLOCK_SIZE_Q=block_size_q,
+            BLOCK_SIZE_T=triton.next_power_of_2(topk),
+            STORE_TILE=(block_size_q > 1 and topk_idx.stride(2) == 1),
             TOPK=topk,
             BLOCK_SIZE_N=triton.next_power_of_2(max_block),
             SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
