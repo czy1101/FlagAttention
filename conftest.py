@@ -58,6 +58,25 @@ _BENCHMARK_METRIC_FIELDS = (
 def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("flagattention", "FlagAttention test reporting")
     group.addoption(
+        "--msa-cases", choices=("all", "existing", "gqa8"), default="all",
+        help="MSA benchmark case set: existing cases, GQA=8 / KV heads=1 cases, or both",
+    )
+    group.addoption(
+        "--stage", choices=("all", "prefill", "decode"), default="all",
+        help="MSA benchmark phase (default: all)",
+    )
+    group.addoption(
+        "--dtype", choices=("both", "bf16", "fp8"), default="both",
+        help="MSA benchmark precision (default: both)",
+    )
+    group.addoption(
+        "--step",
+        choices=("all", "index_score", "index_topk", "attention",
+                 "index_decode", "attention_decode"),
+        default="all",
+        help="MSA benchmark kernel to time; all includes the full pipeline",
+    )
+    group.addoption(
         "--record",
         action="store",
         choices=("none", "json"),

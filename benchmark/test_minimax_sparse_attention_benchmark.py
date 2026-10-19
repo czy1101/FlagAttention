@@ -14,8 +14,8 @@
 
 """CUDA benchmark for the MiniMax M3 paged MSA kernels.
 
-The benchmark compares the FlagAttention and vLLM implementations on the same
-inputs.  ``fp8`` means FP8 index queries/index keys and FP8 main KV cache,
+The benchmark times the FlagAttention and vLLM implementations on the same
+inputs. Output correctness is covered by the separate correctness suite.  ``fp8`` means FP8 index queries/index keys and FP8 main KV cache,
 with scalar K/V dequantization scales passed to both implementations.
 """
 
@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import ast
 import inspect
-import math
 import sys
 import textwrap
 import warnings
@@ -116,9 +115,6 @@ FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 DEFAULT_WARMUP = 200
 DEFAULT_REP = 300
 KV_SCALE = 0.5
-BF16_ATOL = BF16_RTOL = 2e-2
-FP8_ATOL, FP8_RTOL = 6e-2, 8e-2
-OUTPUT_CHECK_CHUNK_ELEMENTS = 1 << 20
 
 PREFILL_SHAPES = [
     (1, 8192, 16, 96),
@@ -141,9 +137,36 @@ DECODE_SHAPES = [
 ]
 
 
+# PR #85, description at head 027ebdc9eb23e37aa3238d4a8b09296bc64e0dd8:
+# https://github.com/flagos-ai/FlagAttention/pull/85
+# TP=8 / GQA=8 maps MiniMax-M3 to local KVH=1, QH=8. No TP communication.
+# Prefill entries are (batch, query_len, total_kv_len), including cached prefix.
+GQA8_PREFILL_CASES = [
+    (1, 128, 4096), (1, 512, 4096), (1, 1024, 4096), (1, 4096, 4096),
+    (1, 128, 16384), (1, 512, 16384), (1, 1024, 16384),
+    (1, 4096, 16384), (1, 8192, 16384),
+    (1, 128, 65536), (1, 1024, 65536),
+    (4, 128, 4096), (4, 512, 4096), (4, 1024, 4096),
+    (8, 128, 4096), (8, 512, 4096), (8, 1024, 4096),
+    (16, 128, 4096), (16, 512, 4096), (32, 128, 4096), (64, 128, 4096),
+]
+# Decode query_len=1 by default. The PR lists 1024x3072 as not measured;
+# include it for coverage, without implying a published performance result.
+GQA8_DECODE_CASES = [
+    (1, 4096), (1, 16384), (1, 65536), (1, 131072),
+    (4, 4096), (4, 16384), (4, 65536),
+    (16, 4096), (16, 16384), (32, 4096), (32, 16384),
+    (64, 4096), (64, 16384), (128, 4096), (128, 8192),
+    (256, 4096), (512, 3072), (1024, 3072),
+]
+
+
 @dataclass
 class MSABenchmarkArgs:
     dtype: str = "both"
+    stage: str = "all"
+    step: str = "all"
+    cases: str = "all"
     shape: str | None = None
     topk: int = 16
     init_blocks: int = 1
@@ -174,6 +197,7 @@ class MSAData:
     sm_scale: float
     k_scale: torch.Tensor | None
     v_scale: torch.Tensor | None
+    query_len: int | None = None
 
 
 def _require_cuda() -> None:
@@ -224,6 +248,7 @@ def make_data(
     *,
     decode: bool,
     decode_qlen: int,
+    prefill_qlen: int | None = None,
     randomize_pages: bool = True,
     generator: torch.Generator | None = None,
 ) -> MSAData:
@@ -237,7 +262,12 @@ def make_data(
     storage_dtype = torch.bfloat16 if dtype_name == "bf16" else FP8_DTYPE
     blocks_per_request = (seq_len + BLOCK - 1) // BLOCK
     total_blocks = batch * blocks_per_request
-    total_q = batch * decode_qlen if decode else batch * seq_len
+    query_len = decode_qlen if decode else (
+        seq_len if prefill_qlen is None else prefill_qlen
+    )
+    if not 1 <= query_len <= seq_len:
+        raise ValueError("query_len must be positive and no greater than seq_len")
+    total_q = batch * query_len
 
     q = (
         torch.randn(
@@ -302,7 +332,7 @@ def make_data(
         kv_cache = kv_cache[physical_pages.argsort()].contiguous()
         index_kv_cache = index_kv_cache[physical_pages.argsort()].contiguous()
 
-    q_stride = decode_qlen if decode else seq_len
+    q_stride = query_len
     cu_q = torch.arange(
         0,
         (batch + 1) * q_stride,
@@ -311,7 +341,7 @@ def make_data(
         dtype=torch.int32,
     )
     seq_lens = torch.full((batch,), seq_len, device=device, dtype=torch.int32)
-    prefix_lens = torch.zeros_like(seq_lens)
+    prefix_lens = torch.full_like(seq_lens, 0 if decode else seq_len - query_len)
     if dtype_name == "fp8":
         k_scale = torch.tensor([KV_SCALE], device=device, dtype=torch.float32)
         v_scale = torch.tensor([KV_SCALE], device=device, dtype=torch.float32)
@@ -329,6 +359,7 @@ def make_data(
         HEAD_DIM**-0.5,
         k_scale,
         v_scale,
+        query_len=query_len,
     )
 
 
@@ -382,6 +413,7 @@ def run_prefill(
     local_blocks: int,
     output: torch.Tensor,
 ) -> None:
+    query_len = data.query_len if data.query_len is not None else seq_len
     scores = index_score(
         data.idx_q,
         data.index_kv_cache,
@@ -389,7 +421,7 @@ def run_prefill(
         data.cu_q,
         data.seq_lens,
         data.prefix_lens,
-        seq_len,
+        query_len,
         seq_len,
         num_kv_heads,
     )
@@ -397,7 +429,7 @@ def run_prefill(
         scores,
         data.cu_q,
         data.prefix_lens,
-        seq_len,
+        query_len,
         topk,
         init_blocks,
         local_blocks,
@@ -408,7 +440,7 @@ def run_prefill(
         topk_idx,
         output,
         decode=False,
-        max_query_len=seq_len,
+        max_query_len=query_len,
         num_kv_heads=num_kv_heads,
         decode_qlen=1,
     )
@@ -551,84 +583,6 @@ def _vllm_data(data: MSAData, layout: str) -> MSAData:
     return replace(data, kv_cache=legacy_cache)
 
 
-def _check_outputs(
-    flag_output: torch.Tensor,
-    vllm_output: torch.Tensor,
-    *,
-    shape: tuple[int, int, int, int],
-    dtype_name: str,
-    mode: str,
-    layout: str,
-) -> float:
-    context = f"{mode}, {dtype_name}, shape={shape}, vLLM layout={layout}"
-    # Keep the benchmark outputs on GPU, but do the accuracy work on CPU. A
-    # full-size GPU assert_close can need several times the output's size in
-    # temporary tensors, even when the two outputs match.
-    flag_cpu = flag_output.detach().cpu()
-    vllm_cpu = vllm_output.detach().cpu()
-    for provider, output in (("FlagAttention", flag_cpu), ("vLLM", vllm_cpu)):
-        for chunk in output.reshape(-1).split(OUTPUT_CHECK_CHUNK_ELEMENTS):
-            if not torch.isfinite(chunk).all().item():
-                raise AssertionError(f"{provider} produced NaN or Inf ({context})")
-
-    atol, rtol = (
-        (FP8_ATOL, FP8_RTOL) if dtype_name == "fp8" else (BF16_ATOL, BF16_RTOL)
-    )
-    if (
-        flag_output.shape != vllm_output.shape
-        or flag_output.dtype != vllm_output.dtype
-        or flag_output.device != vllm_output.device
-        or flag_output.layout != vllm_output.layout
-    ):
-        raise AssertionError(
-            f"FlagAttention/vLLM output mismatch ({context}); "
-            f"metadata differs: shape={tuple(flag_output.shape)}/{tuple(vllm_output.shape)}, "
-            f"dtype={flag_output.dtype}/{vllm_output.dtype}, "
-            f"device={flag_output.device}/{vllm_output.device}, "
-            f"layout={flag_output.layout}/{vllm_output.layout}"
-        )
-
-    flag_flat = flag_cpu.reshape(-1)
-    vllm_flat = vllm_cpu.reshape(-1)
-    try:
-        for flag_chunk, vllm_chunk in zip(
-            flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
-            vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
-        ):
-            torch.testing.assert_close(flag_chunk, vllm_chunk, atol=atol, rtol=rtol)
-    except AssertionError as exc:
-        max_abs_diff = 0.0
-        for flag_chunk, vllm_chunk in zip(
-            flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
-            vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
-        ):
-            if flag_chunk.numel():
-                diff = (flag_chunk.float() - vllm_chunk.float()).abs()
-                max_abs_diff = max(max_abs_diff, diff.max().item())
-        raise AssertionError(
-            f"FlagAttention/vLLM output mismatch ({context}); "
-            f"max_abs_diff={max_abs_diff:.6g}, atol={atol}, rtol={rtol}"
-        ) from exc
-
-    dot = flag_norm_sq = vllm_norm_sq = 0.0
-    for flag_chunk, vllm_chunk in zip(
-        flag_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
-        vllm_flat.split(OUTPUT_CHECK_CHUNK_ELEMENTS),
-    ):
-        flag_values = flag_chunk.float().double()
-        vllm_values = vllm_chunk.float().double()
-        dot += torch.dot(flag_values, vllm_values).item()
-        flag_norm_sq += torch.dot(flag_values, flag_values).item()
-        vllm_norm_sq += torch.dot(vllm_values, vllm_values).item()
-    if flag_norm_sq == 0 and vllm_norm_sq == 0:
-        return 1.0
-    denominator = max(
-        math.sqrt(flag_norm_sq) * math.sqrt(vllm_norm_sq),
-        torch.finfo(torch.float32).tiny,
-    )
-    return max(-1.0, min(1.0, dot / denominator))
-
-
 def _bench_steps(
     data: MSAData,
     decode: bool,
@@ -636,6 +590,7 @@ def _bench_steps(
     shape: tuple[int, int, int, int],
 ) -> dict[str, float]:
     batch, seq_len, num_kv_heads, _ = shape
+    query_len = data.query_len if data.query_len is not None else seq_len
     output = torch.empty_like(data.q)
     if decode:
 
@@ -654,6 +609,8 @@ def _bench_steps(
                 args.decode_qlen,
             )
 
+        if args.step == "index_decode":
+            return {"index_decode": bench_fn(index_decode, args.warmup, args.rep)}
         topk_idx = index_decode()
 
         def attention() -> None:
@@ -670,9 +627,11 @@ def _bench_steps(
 
         attention()
         test_backend.device_fn.synchronize()
+        functions = {"index_decode": index_decode, "attention_decode": attention}
         return {
-            "index_decode": bench_fn(index_decode, args.warmup, args.rep),
-            "attention_decode": bench_fn(attention, args.warmup, args.rep),
+            name: bench_fn(fn, args.warmup, args.rep)
+            for name, fn in functions.items()
+            if args.step in ("all", name)
         }
 
     scores: torch.Tensor | None = None
@@ -687,7 +646,7 @@ def _bench_steps(
             data.cu_q,
             data.seq_lens,
             data.prefix_lens,
-            seq_len,
+            query_len,
             seq_len,
             num_kv_heads,
         )
@@ -699,7 +658,7 @@ def _bench_steps(
             scores,
             data.cu_q,
             data.prefix_lens,
-            seq_len,
+            query_len,
             args.topk,
             args.init_blocks,
             args.local_blocks,
@@ -713,19 +672,24 @@ def _bench_steps(
             topk_idx,
             output,
             decode=False,
-            max_query_len=seq_len,
+            max_query_len=query_len,
             num_kv_heads=num_kv_heads,
             decode_qlen=1,
         )
 
+    # Prepare dependencies outside the measured region; do not run later stages.
     index_score()
-    index_topk()
-    attention()
+    if args.step != "index_score":
+        index_topk()
+    if args.step in ("all", "attention"):
+        attention()
     test_backend.device_fn.synchronize()
+    functions = {"index_score": index_score, "index_topk": index_topk,
+                 "attention": attention}
     return {
-        "index_score": bench_fn(index_score, args.warmup, args.rep),
-        "index_topk": bench_fn(index_topk, args.warmup, args.rep),
-        "attention": bench_fn(attention, args.warmup, args.rep),
+        name: bench_fn(fn, args.warmup, args.rep)
+        for name, fn in functions.items()
+        if args.step in ("all", name)
     }
 
 
@@ -751,6 +715,27 @@ def _get_shapes(args: MSABenchmarkArgs) -> list[tuple[int, int, int, int]]:
     return DECODE_SHAPES if args.decode else PREFILL_SHAPES
 
 
+def _get_cases(args: MSABenchmarkArgs) -> list[tuple[tuple[int, int, int, int], int]]:
+    """Return (legacy shape, query length), preserving the explicit shape API."""
+    if args.cases not in ("all", "existing", "gqa8"):
+        raise ValueError("cases must be all, existing or gqa8")
+    cases = []
+    if args.shape is not None and not args.all_shapes:
+        shape = _parse_shape(args.shape)
+        return [(shape, args.decode_qlen if args.decode else shape[1])]
+    if args.cases in ("all", "existing"):
+        cases.extend((shape, args.decode_qlen if args.decode else shape[1])
+                     for shape in _get_shapes(args))
+    if args.cases in ("all", "gqa8"):
+        if args.decode:
+            cases.extend(((batch, seq_len, 1, 8), args.decode_qlen)
+                         for batch, seq_len in GQA8_DECODE_CASES)
+        else:
+            cases.extend(((batch, seq_len, 1, 8), query_len)
+                         for batch, query_len, seq_len in GQA8_PREFILL_CASES)
+    return list(dict.fromkeys(cases))
+
+
 def _format_columns(columns: list[tuple[str, int]]) -> str:
     return "  ".join(f"{value:>{width}s}" for value, width in columns)
 
@@ -760,7 +745,7 @@ def _run_dtype(
     dtype_name: str,
     record_property: Callable[[str, object], None] | None = None,
 ) -> None:
-    run_vllm = VLLM_AVAILABLE and not args.no_vllm
+    run_vllm = VLLM_AVAILABLE and not args.no_vllm and args.step == "all"
     if dtype_name == "fp8" and run_vllm and not _supports_fp8_scales():
         print("[baseline] vLLM FP8 skipped: k_scale/v_scale are unavailable")
         run_vllm = False
@@ -782,21 +767,25 @@ def _run_dtype(
     )
     print("Timing: eager execution with CUDA events")
     if run_vllm:
-        print(f"vLLM KV cache layout: {vllm_layout}; outputs checked before timing")
+        print(f"vLLM KV cache layout: {vllm_layout}")
         print("Provider order: alternates by shape")
+    elif args.step != "all":
+        print(f"Selected kernel: {args.step}; FlagAttn only, dependencies excluded from timing")
     else:
         print("vLLM baseline: unavailable; FlagAttn only")
 
-    headers = [("Shape [B,S,KVH,H]", 22), ("FlagAttn(ms)", 13)]
+    headers = [("Shape [B,Q,S,KVH,H]", 30), ("FlagAttn(ms)", 13)]
     if run_vllm:
         headers.extend(
-            [("vLLM(ms)", 10), ("vLLM/ours", 10), ("Cosine", 9), ("Match", 6)]
+            [("vLLM(ms)", 10), ("vLLM/ours", 10)]
         )
     if args.per_step:
         if args.decode:
             headers.extend([("IdxDec(ms)", 11), ("AttnDec(ms)", 11)])
         else:
             headers.extend([("Score(ms)", 10), ("TopK(ms)", 10), ("Attn(ms)", 10)])
+    if args.step != "all":
+        headers = [("Shape [B,Q,S,KVH,H]", 30), (f"{args.step}(ms)", 22)]
     separator = "-" * len(_format_columns(headers))
     print(separator)
     print(_format_columns(headers))
@@ -813,7 +802,7 @@ def _run_dtype(
         topk=args.topk,
         decode_qlen=args.decode_qlen if args.decode else None,
     )
-    for shape_index, shape in enumerate(_get_shapes(args)):
+    for shape_index, (shape, query_len) in enumerate(_get_cases(args)):
         batch, seq_len, num_kv_heads, num_heads = shape
         if num_heads % num_kv_heads != 0:
             raise ValueError(
@@ -836,9 +825,19 @@ def _run_dtype(
             dtype_name,
             decode=args.decode,
             decode_qlen=args.decode_qlen,
+            prefill_qlen=query_len if not args.decode else None,
             randomize_pages=not use_identity_pages,
             generator=generator,
         )
+        if args.step != "all":
+            steps = _bench_steps(data, args.decode, args, shape)
+            print(_format_columns([
+                (f"{batch}x{query_len}x{seq_len}x{num_kv_heads}x{num_heads}", 30),
+                (f"{steps[args.step]:.4f}", 22),
+            ]), flush=True)
+            del data, generator
+            test_backend.device_fn.empty_cache()
+            continue
         vllm_data = _vllm_data(data, vllm_layout) if vllm_layout else None
         flag_attn_output = torch.empty_like(data.q)
         vllm_output = torch.empty_like(data.q) if run_vllm else None
@@ -902,20 +901,7 @@ def _run_dtype(
                 )
 
         vllm_ms = None
-        accuracy = None
         if run_vllm:
-            flag_attn_run()
-            vllm_run()
-            test_backend.device_fn.synchronize()
-            assert vllm_output is not None and vllm_layout is not None
-            accuracy = _check_outputs(
-                flag_attn_output,
-                vllm_output,
-                shape=shape,
-                dtype_name=dtype_name,
-                mode=mode,
-                layout=vllm_layout,
-            )
             providers = (
                 (("flag_attn", flag_attn_run), ("vllm", vllm_run))
                 if shape_index % 2 == 0
@@ -931,7 +917,7 @@ def _run_dtype(
 
         steps = _bench_steps(data, args.decode, args, shape) if args.per_step else {}
         row = [
-            (f"{batch}x{seq_len}x{num_kv_heads}x{num_heads}", 22),
+            (f"{batch}x{query_len}x{seq_len}x{num_kv_heads}x{num_heads}", 30),
             (f"{flag_attn_ms:.4f}", 13),
         ]
         if run_vllm:
@@ -939,8 +925,6 @@ def _run_dtype(
                 [
                     (f"{vllm_ms:.4f}", 10),
                     (f"{vllm_ms / flag_attn_ms:.2f}x", 10),
-                    (f"{accuracy:.6f}", 9),
-                    ("pass", 6),
                 ]
             )
         if args.per_step:
@@ -962,10 +946,9 @@ def _run_dtype(
         print(_format_columns(row))
         sys.stdout.flush()
         recorder.add(
-            shape_detail=shape,
+            shape_detail=(batch, query_len, seq_len, num_kv_heads, num_heads),
             latency_base=vllm_ms,
             latency=flag_attn_ms,
-            accuracy=accuracy,
             steps=steps,
         )
 
@@ -979,10 +962,35 @@ def _run_dtype(
     recorder.record()
 
 
+def _selected_modes(args: MSABenchmarkArgs) -> tuple[bool, ...]:
+    if args.dtype not in ("both", "bf16", "fp8"):
+        raise ValueError("dtype must be both, bf16 or fp8")
+    if args.stage not in ("all", "prefill", "decode"):
+        raise ValueError("stage must be all, prefill or decode")
+    step_modes = {"index_score": False, "index_topk": False, "attention": False,
+                  "index_decode": True, "attention_decode": True}
+    if args.step != "all" and args.step not in step_modes:
+        raise ValueError(f"Unknown MSA step: {args.step}")
+    requested = set()
+    if args.prefill_only or args.stage == "prefill":
+        requested.add(False)
+    if args.decode_only or args.stage == "decode":
+        requested.add(True)
+    if len(requested) > 1:
+        raise ValueError("Conflicting prefill/decode selections")
+    if args.step != "all":
+        mode = step_modes[args.step]
+        if requested and mode not in requested:
+            raise ValueError(f"step {args.step} is incompatible with the selected stage")
+        return (mode,)
+    return tuple(sorted(requested)) if requested else (False, True)
+
+
 def run_benchmark(
     args: MSABenchmarkArgs,
     record_property: Callable[[str, object], None] | None = None,
 ) -> None:
+    modes = _selected_modes(args)
     _require_cuda()
     if args.topk < 1:
         raise ValueError("--topk must be positive")
@@ -995,12 +1003,6 @@ def run_benchmark(
         f"[device] {test_backend.get_device_name()} "
         f"capability={capability[0]}.{capability[1]}"
     )
-    if args.prefill_only:
-        modes = (False,)
-    elif args.decode_only:
-        modes = (True,)
-    else:
-        modes = (False, True)
     if args.dtype in {"fp8", "both"} and not _supports_fp8():
         print("[FP8] skipped: this GPU or PyTorch build does not support FP8")
     if args.dtype == "fp8" and not _supports_fp8():
@@ -1011,7 +1013,9 @@ def run_benchmark(
         else ("bf16",) if args.dtype == "both" else (args.dtype,)
     )
 
-    if args.no_vllm:
+    if args.step != "all":
+        print("[baseline] vLLM skipped for individual kernel timing")
+    elif args.no_vllm:
         print("[baseline] vLLM skipped (--no-vllm)")
     elif VLLM_AVAILABLE:
         print("[baseline] vLLM enabled")
@@ -1034,6 +1038,10 @@ def run_benchmark(
 def test_msa_benchmark(request, record_property) -> None:
     """Run the MSA benchmark through pytest using benchmark CLI timing options."""
     args = MSABenchmarkArgs(
+        stage=request.config.getoption("--stage"),
+        dtype=request.config.getoption("--dtype"),
+        step=request.config.getoption("--step"),
+        cases=request.config.getoption("--msa-cases"),
         topk=int(request.config.getoption("--topk", default=16)),
         warmup=int(request.config.getoption("--warmup", default=DEFAULT_WARMUP)),
         rep=int(request.config.getoption("--iter", default=DEFAULT_REP)),

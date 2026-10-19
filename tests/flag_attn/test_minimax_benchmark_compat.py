@@ -1,7 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host checks for MiniMax benchmark baseline compatibility and accuracy guards."""
+"""Host checks for MiniMax benchmark baseline compatibility."""
 
 from __future__ import annotations
 
@@ -186,100 +186,3 @@ def test_vllm_legacy_cache_keeps_each_physical_page_and_kv_channel():
 def test_vllm_packed_cache_reuses_original_data():
     data = _data_with_remapped_pages()
     assert benchmark._vllm_data(data, "packed4d") is data
-
-
-def _check_outputs(flag, vllm, dtype_name="bf16"):
-    return benchmark._check_outputs(
-        flag,
-        vllm,
-        shape=(1, 128, 2, 4),
-        dtype_name=dtype_name,
-        mode="prefill",
-        layout="split5d",
-    )
-
-
-@pytest.mark.parametrize("dtype_name", ["bf16", "fp8"])
-def test_output_check_accepts_identical_results(dtype_name):
-    output = torch.tensor([0.25, -0.5], dtype=torch.float32)
-    accuracy = _check_outputs(output, output.clone(), dtype_name)
-    assert accuracy == pytest.approx(1.0)
-    assert accuracy <= 1.0
-
-
-def test_output_check_treats_matching_zero_outputs_as_exact():
-    output = torch.zeros(4)
-    assert _check_outputs(output, output.clone()) == 1.0
-
-
-@pytest.mark.parametrize("dtype_name", ["bf16", "fp8"])
-def test_output_check_rejects_wrong_baseline_results(dtype_name):
-    with pytest.raises(AssertionError, match="output mismatch.*max_abs_diff"):
-        _check_outputs(torch.tensor([0.0]), torch.tensor([1.0]), dtype_name)
-
-
-@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
-def test_output_check_rejects_nonfinite_results(bad_value):
-    with pytest.raises(AssertionError, match="vLLM produced NaN or Inf"):
-        _check_outputs(torch.tensor([0.0]), torch.tensor([bad_value]))
-
-
-@pytest.mark.parametrize("dtype_name", ["bf16", "fp8"])
-def test_output_check_compares_every_chunk_and_preserves_cosine(monkeypatch, dtype_name):
-    monkeypatch.setattr(benchmark, "OUTPUT_CHECK_CHUNK_ELEMENTS", 3)
-    baseline = torch.tensor([0, 0.25, -0.5, 1, -1, 2, 0], dtype=torch.bfloat16)
-    actual = baseline.clone()
-    actual[3] += 0.015625
-    atol, rtol = (
-        (benchmark.FP8_ATOL, benchmark.FP8_RTOL)
-        if dtype_name == "fp8"
-        else (benchmark.BF16_ATOL, benchmark.BF16_RTOL)
-    )
-    original_assert_close = torch.testing.assert_close
-    original_assert_close(actual, baseline, atol=atol, rtol=rtol)
-    actual_float, baseline_float = actual.float(), baseline.float()
-    expected_cosine = (
-        torch.dot(actual_float, baseline_float)
-        / (torch.linalg.vector_norm(actual_float) * torch.linalg.vector_norm(baseline_float))
-    ).item()
-
-    checked_chunk_sizes = []
-
-    def assert_close_bounded(flag_chunk, vllm_chunk, **kwargs):
-        assert flag_chunk.device.type == vllm_chunk.device.type == "cpu"
-        assert flag_chunk.numel() <= benchmark.OUTPUT_CHECK_CHUNK_ELEMENTS
-        checked_chunk_sizes.append(flag_chunk.numel())
-        return original_assert_close(flag_chunk, vllm_chunk, **kwargs)
-
-    monkeypatch.setattr(torch.testing, "assert_close", assert_close_bounded)
-    assert _check_outputs(actual, baseline, dtype_name) == pytest.approx(expected_cosine, abs=1e-6)
-    assert checked_chunk_sizes == [3, 3, 1]
-
-    bad = actual.clone()
-    bad[1] = 0.5
-    bad[-1] = 1
-    with pytest.raises(AssertionError, match=r"output mismatch.*max_abs_diff=1(?:\.0)?[,;]"):
-        _check_outputs(bad, baseline, dtype_name)
-
-
-def test_output_check_rejects_shape_mismatch_with_equal_element_count():
-    with pytest.raises(AssertionError, match="metadata differs: shape="):
-        _check_outputs(torch.zeros(2, 2), torch.zeros(4))
-
-
-@pytest.mark.parametrize(
-    "dtype_name,difference,passes",
-    [
-        ("bf16", 0.03125, False),
-        ("fp8", 0.03125, True),
-        ("fp8", 0.0703125, False),
-    ],
-)
-def test_output_check_keeps_dtype_tolerance_thresholds(dtype_name, difference, passes):
-    actual = torch.tensor([difference], dtype=torch.bfloat16)
-    baseline = torch.zeros_like(actual)
-    if passes:
-        assert _check_outputs(actual, baseline, dtype_name) == 0.0
-    else:
-        with pytest.raises(AssertionError, match="output mismatch.*max_abs_diff"):
-            _check_outputs(actual, baseline, dtype_name)
