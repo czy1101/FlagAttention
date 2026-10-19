@@ -38,6 +38,16 @@ def has_triton_tle(major: int = 0, minor: int = 0, patch: int = 0) -> bool:
     return tuple(values[:3]) >= (major, minor, patch)
 
 
+def is_sm90_device(device: torch.device | None = None) -> bool:
+    """Return whether a CUDA device has compute capability 9.0."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        capability = torch.cuda.get_device_capability(device)
+    except (RuntimeError, TypeError, ValueError):
+        return False
+    return capability == (9, 0)
+
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """Cache the eight most recent calls using tensor identity as the key."""
     cache_entries: list[tuple[tuple[Any, ...], dict[str, Any], Any]] = []

@@ -69,6 +69,7 @@ pythonpath = [
     "tests/flag_attn",
 ]
 markers = [
+    "hy3_attention: Hy3 prefill and BF16/FP8 static/dynamic decode tests and benchmarks",
     "chunk_gated_delta_rule: chunked gated delta rule tests and benchmarks",
     "chunk_gdn2: chunked GDN2 tests and benchmarks",
     "chunk_gla: chunked gated linear attention tests and benchmarks",

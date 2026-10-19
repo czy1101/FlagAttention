@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .device_finder import DeviceDetector, detect_vendor
+from .op_registry import resolve_operator
 
 
 def get_backend_name() -> str:
@@ -24,4 +25,4 @@ def is_metax_backend() -> bool:
     return get_backend_name() == "metax"
 
 
-__all__ = ["DeviceDetector", "get_backend_name", "is_metax_backend"]
+__all__ = ["DeviceDetector", "get_backend_name", "is_metax_backend", "resolve_operator"]

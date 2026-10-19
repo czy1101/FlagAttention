@@ -38,6 +38,7 @@ from flag_attn.paged import attention as paged_attention  # noqa: E402, F401
 from flag_attn import testing  # noqa: E402, F401
 
 _OPERATOR_EXPORTS = {
+    "hy3_attention": ("flag_attn.hpc_ops_attention", "hy3_attention"),
     "chunk_gated_delta_rule": (
         "flag_attn.FLA.gated_delta_rule",
         "chunk_gated_delta_rule",
@@ -81,6 +82,7 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "hy3_attention",
     "device",
     "vendor",
     "vendor_name",
