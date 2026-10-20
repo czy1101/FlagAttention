@@ -14,73 +14,114 @@ from flag_attn.minimax_sparse_attention.sparse_attn import (
     _KV_SCALE_NONE,
     _kv_scale_args,
 )
-from ..utils import SPARSE_BLOCK_SIZE
+from flag_attn.runtime.backend._enflame.utils import SPARSE_BLOCK_SIZE
 
 
 _PREFILL_HALF_KV_MAX_BLOCK_SIZE_QH = 8
 
+
 @triton.jit
-def _gqa_sparse_common_prefix(q,kv,ids,table,cu,seq,prefix,partial,maximum,denom,counts,
-                   H:tl.constexpr,D:tl.constexpr,K:tl.constexpr,SCALE:tl.constexpr,
-                   SQ:tl.constexpr,SH:tl.constexpr,SD:tl.constexpr,
-                   KB:tl.constexpr,KH:tl.constexpr,KN:tl.constexpr,KD:tl.constexpr,
-                   IH:tl.constexpr,IQ:tl.constexpr,IK:tl.constexpr,BT:tl.constexpr,
-                   PN:tl.constexpr,PH:tl.constexpr,PD:tl.constexpr,SN:tl.constexpr,
-                   KVH:tl.constexpr,NG:tl.constexpr,GQ:tl.constexpr,BH:tl.constexpr,BD:tl.constexpr):
-    group=tl.program_id(0)
-    head=tl.program_id(1)
-    req=tl.program_id(2)
-    begin=tl.load(cu+req)
-    length=tl.load(cu+req+1)-begin
-    local=group*GQ
+def _gqa_sparse_common_prefix(
+    q,
+    kv,
+    ids,
+    table,
+    cu,
+    seq,
+    prefix,
+    partial,
+    maximum,
+    denom,
+    counts,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SH: tl.constexpr,
+    SD: tl.constexpr,
+    KB: tl.constexpr,
+    KH: tl.constexpr,
+    KN: tl.constexpr,
+    KD: tl.constexpr,
+    IH: tl.constexpr,
+    IQ: tl.constexpr,
+    IK: tl.constexpr,
+    BT: tl.constexpr,
+    PN: tl.constexpr,
+    PH: tl.constexpr,
+    PD: tl.constexpr,
+    SN: tl.constexpr,
+    KVH: tl.constexpr,
+    NG: tl.constexpr,
+    GQ: tl.constexpr,
+    BH: tl.constexpr,
+    BD: tl.constexpr,
+):
+    group = tl.program_id(0)
+    head = tl.program_id(1)
+    req = tl.program_id(2)
+    begin = tl.load(cu + req)
+    length = tl.load(cu + req + 1) - begin
+    local = group * GQ
     if local >= length:
         return
-    prefix_len=tl.load(prefix+req)
-    seq_len=tl.load(seq+req)
-    oq=tl.arange(0,GQ)
-    rows=tl.arange(0,GQ*BH)
-    on=tl.arange(0,128)
-    qvalid=local+oq<length
-    qp=tl.make_block_ptr(q+begin*SQ+head*H*SH,(length,H,D),(SQ,SH,SD),(local,0,0),(GQ,BH,BD),(2,1,0))
-    qt=tl.load(qp,boundary_check=(0,1,2),padding_option='zero').reshape(GQ*BH,BD)
-    m=tl.full((GQ*BH,),float('-inf'),tl.float32)
-    l=tl.zeros((GQ*BH,),tl.float32)
-    acc=tl.zeros((GQ*BH,BD),tl.float32)
-    active=True
-    count=0
-    for slot in range(min(4,K)):
-        first=tl.load(ids+head*IH+(begin+local)*IQ+slot*IK)
-        values=tl.load(ids+head*IH+(begin+local+oq)*IQ+slot*IK,mask=qvalid,other=-1)
-        exists=slot<tl.minimum(K,(prefix_len+local+128)//128)
-        shared=tl.sum(tl.where(qvalid,(values==first).to(tl.int32),1),axis=0)==GQ
-        active=active & exists & (first>=0) & shared
+    prefix_len = tl.load(prefix + req)
+    seq_len = tl.load(seq + req)
+    oq = tl.arange(0, GQ)
+    rows = tl.arange(0, GQ * BH)
+    on = tl.arange(0, 128)
+    qvalid = local + oq < length
+    qp = tl.make_block_ptr(
+        q + begin * SQ + head * H * SH, (length, H, D), (SQ, SH, SD), (local, 0, 0), (GQ, BH, BD), (2, 1, 0)
+    )
+    qt = tl.load(qp, boundary_check=(0, 1, 2), padding_option="zero").reshape(GQ * BH, BD)
+    m = tl.full((GQ * BH,), float("-inf"), tl.float32)
+    l = tl.zeros((GQ * BH,), tl.float32)
+    acc = tl.zeros((GQ * BH, BD), tl.float32)
+    active = True
+    count = 0
+    for slot in range(min(4, K)):
+        first = tl.load(ids + head * IH + (begin + local) * IQ + slot * IK)
+        values = tl.load(ids + head * IH + (begin + local + oq) * IQ + slot * IK, mask=qvalid, other=-1)
+        exists = slot < tl.minimum(K, (prefix_len + local + 128) // 128)
+        shared = tl.sum(tl.where(qvalid, (values == first).to(tl.int32), 1), axis=0) == GQ
+        active = active & exists & (first >= 0) & shared
         if active:
-            count+=1
-            page=tl.load(table+req*BT+first)
-            base=kv+page*KB+head*KH
-            kp=tl.make_block_ptr(base,(128,D),(KN,KD),(0,0),(128,BD),(1,0))
-            kt=tl.load(kp,boundary_check=(0,1),padding_option='zero')
-            positions=first*128+on
-            valid=(rows[:,None]//BH+local<length)&(rows[:,None]%BH<H)&(positions[None,:]<seq_len)&(positions[None,:]<=prefix_len+local+rows[:,None]//BH)
-            scores=tl.dot(qt,tl.trans(kt))*(SCALE*1.4426950409)
-            scores=tl.where(valid,scores,float('-inf'))
-            updated=tl.maximum(m,tl.max(scores,axis=1))
-            safe=tl.where(updated>float('-inf'),updated,0.)
-            p=tl.where(valid,tl.exp2(scores-safe[:,None]),0.)
-            alpha=tl.where(m>float('-inf'),tl.exp2(m-safe),0.)
-            l=l*alpha+tl.sum(p,axis=1)
-            acc=acc*alpha[:,None]
-            vp=tl.make_block_ptr(base+D*KD,(128,D),(KN,KD),(0,0),(128,BD),(1,0))
-            vt=tl.load(vp,boundary_check=(0,1),padding_option='zero')
-            acc+=tl.dot(p.to(vt.dtype),vt)
-            m=updated
-    ap=tl.make_block_ptr(partial+begin*PN+head*H*PH,(length,H,D),(PN,PH,PD),(local,0,0),(GQ,BH,BD),(2,1,0))
-    tl.store(ap,acc.reshape(GQ,BH,BD),boundary_check=(0,1,2))
-    mp=tl.make_block_ptr(maximum+begin*SN+head*H,(length,H),(SN,1),(local,0),(GQ,BH),(1,0))
-    lp=tl.make_block_ptr(denom+begin*SN+head*H,(length,H),(SN,1),(local,0),(GQ,BH),(1,0))
-    tl.store(mp,m.reshape(GQ,BH),boundary_check=(0,1))
-    tl.store(lp,l.reshape(GQ,BH),boundary_check=(0,1))
-    tl.store(counts+(req*KVH+head)*NG+group,count)
+            count += 1
+            page = tl.load(table + req * BT + first)
+            base = kv + page * KB + head * KH
+            kp = tl.make_block_ptr(base, (128, D), (KN, KD), (0, 0), (128, BD), (1, 0))
+            kt = tl.load(kp, boundary_check=(0, 1), padding_option="zero")
+            positions = first * 128 + on
+            valid = (
+                (rows[:, None] // BH + local < length)
+                & (rows[:, None] % BH < H)
+                & (positions[None, :] < seq_len)
+                & (positions[None, :] <= prefix_len + local + rows[:, None] // BH)
+            )
+            scores = tl.dot(qt, tl.trans(kt)) * (SCALE * 1.4426950409)
+            scores = tl.where(valid, scores, float("-inf"))
+            updated = tl.maximum(m, tl.max(scores, axis=1))
+            safe = tl.where(updated > float("-inf"), updated, 0.0)
+            p = tl.where(valid, tl.exp2(scores - safe[:, None]), 0.0)
+            alpha = tl.where(m > float("-inf"), tl.exp2(m - safe), 0.0)
+            l = l * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None]
+            vp = tl.make_block_ptr(base + D * KD, (128, D), (KN, KD), (0, 0), (128, BD), (1, 0))
+            vt = tl.load(vp, boundary_check=(0, 1), padding_option="zero")
+            acc += tl.dot(p.to(vt.dtype), vt)
+            m = updated
+    ap = tl.make_block_ptr(
+        partial + begin * PN + head * H * PH, (length, H, D), (PN, PH, PD), (local, 0, 0), (GQ, BH, BD), (2, 1, 0)
+    )
+    tl.store(ap, acc.reshape(GQ, BH, BD), boundary_check=(0, 1, 2))
+    mp = tl.make_block_ptr(maximum + begin * SN + head * H, (length, H), (SN, 1), (local, 0), (GQ, BH), (1, 0))
+    lp = tl.make_block_ptr(denom + begin * SN + head * H, (length, H), (SN, 1), (local, 0), (GQ, BH), (1, 0))
+    tl.store(mp, m.reshape(GQ, BH), boundary_check=(0, 1))
+    tl.store(lp, l.reshape(GQ, BH), boundary_check=(0, 1))
+    tl.store(counts + (req * KVH + head) * NG + group, count)
+
 
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
 def _gqa_sparse_fwd_direct(
@@ -126,10 +167,16 @@ def _gqa_sparse_fwd_direct(
     BLOCK_SIZE_QH: tl.constexpr,
     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
-    partial_ptr=0, maximum_ptr=0, denom_ptr=0, count_ptr=0,
-    GROUP_Q: tl.constexpr = 1, NUM_GROUPS: tl.constexpr = 1,
-    STRIDE_PN: tl.constexpr = 0, STRIDE_PH: tl.constexpr = 0,
-    STRIDE_PD: tl.constexpr = 0, STRIDE_SN: tl.constexpr = 0,
+    partial_ptr=0,
+    maximum_ptr=0,
+    denom_ptr=0,
+    count_ptr=0,
+    GROUP_Q: tl.constexpr = 1,
+    NUM_GROUPS: tl.constexpr = 1,
+    STRIDE_PN: tl.constexpr = 0,
+    STRIDE_PH: tl.constexpr = 0,
+    STRIDE_PD: tl.constexpr = 0,
+    STRIDE_SN: tl.constexpr = 0,
     USE_SHARED_PREFIX: tl.constexpr = False,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -182,13 +229,18 @@ def _gqa_sparse_fwd_direct(
             shared_count = tl.load(count_ptr + (pid_b * num_kv_heads + pid_kh) * NUM_GROUPS + pid_q_j // GROUP_Q)
             hs = tl.arange(0, BLOCK_SIZE_QH)
             state_base = (q_start + pid_q_j) * STRIDE_SN + pid_kh * gqa_group_size
-            m_i = tl.load(maximum_ptr + state_base + hs, mask=hs < gqa_group_size, other=float('-inf'))
-            l_i = tl.load(denom_ptr + state_base + hs, mask=hs < gqa_group_size, other=0.)
-            pp = tl.make_block_ptr(partial_ptr + (q_start + pid_q_j) * STRIDE_PN + pid_kh * gqa_group_size * STRIDE_PH,
-                                   (gqa_group_size, head_dim), (STRIDE_PH, STRIDE_PD), (0, 0),
-                                   (BLOCK_SIZE_QH, BLOCK_SIZE_D), (1, 0))
-            acc_o = tl.load(pp, boundary_check=(0, 1), padding_option='zero')
-            l_acc = tl.where(off_n[None, :] == 0, l_i[:, None], 0.)
+            m_i = tl.load(maximum_ptr + state_base + hs, mask=hs < gqa_group_size, other=float("-inf"))
+            l_i = tl.load(denom_ptr + state_base + hs, mask=hs < gqa_group_size, other=0.0)
+            pp = tl.make_block_ptr(
+                partial_ptr + (q_start + pid_q_j) * STRIDE_PN + pid_kh * gqa_group_size * STRIDE_PH,
+                (gqa_group_size, head_dim),
+                (STRIDE_PH, STRIDE_PD),
+                (0, 0),
+                (BLOCK_SIZE_QH, BLOCK_SIZE_D),
+                (1, 0),
+            )
+            acc_o = tl.load(pp, boundary_check=(0, 1), padding_option="zero")
+            l_acc = tl.where(off_n[None, :] == 0, l_i[:, None], 0.0)
             t_ptr_j += shared_count * stride_tk
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
         if USE_FP8:
@@ -196,9 +248,7 @@ def _gqa_sparse_fwd_direct(
             # scaled once, then its scale is restored on the FP32 logits.
             # This keeps the existing K cache in FP8 through tl.dot instead
             # of materializing a BF16 K tile for every selected page.
-            qk_q_scale = tl.maximum(
-                tl.max(tl.abs(q), axis=1) * (1.0 / 448.0), 1.0e-8
-            )
+            qk_q_scale = tl.maximum(tl.max(tl.abs(q), axis=1) * (1.0 / 448.0), 1.0e-8)
             q_qk = (q / qk_q_scale[:, None]).to(tl.float8e4nv)
         else:
             q_qk = q
@@ -228,9 +278,7 @@ def _gqa_sparse_fwd_direct(
             if USE_FP8:
                 if KV_SCALE_MODE == 2:
                     k_scale = tl.load(
-                        k_scale_ptr
-                        + pid_kh * stride_ks_h
-                        + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
+                        k_scale_ptr + pid_kh * stride_ks_h + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
                         mask=pos_mask,
                         other=1.0,
                     )
@@ -239,7 +287,7 @@ def _gqa_sparse_fwd_direct(
                 qk_dot *= qk_q_scale[:, None]
 
             is_full_causal = (c + BLOCK_SIZE_K) <= q_abs
-            is_full_seq    = (c + BLOCK_SIZE_K) <= seq_len
+            is_full_seq = (c + BLOCK_SIZE_K) <= seq_len
 
             qk = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_K), dtype=tl.float32)
             if not is_full_causal:
@@ -291,9 +339,7 @@ def _gqa_sparse_fwd_direct(
             if USE_FP8:
                 if KV_SCALE_MODE == 2:
                     v_scale = tl.load(
-                        v_scale_ptr
-                        + pid_kh * stride_vs_h
-                        + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
+                        v_scale_ptr + pid_kh * stride_vs_h + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
                         mask=pos_mask,
                         other=1.0,
                     )
@@ -305,9 +351,7 @@ def _gqa_sparse_fwd_direct(
                 pv_p = p
                 if KV_SCALE_MODE == 2:
                     pv_p *= v_scale[None, :]
-                pv_p_scale = tl.maximum(
-                    tl.max(tl.abs(pv_p), axis=1) * (1.0 / 448.0), 1.0e-8
-                )
+                pv_p_scale = tl.maximum(tl.max(tl.abs(pv_p), axis=1) * (1.0 / 448.0), 1.0e-8)
                 p_dot = (pv_p / pv_p_scale[:, None]).to(tl.float8e4nv)
                 acc_o += tl.dot(p_dot, v) * pv_p_scale[:, None]
             else:
@@ -390,10 +434,7 @@ def _gqa_sparse_fwd_grouped8(
         prefix_len = seq_len - decode_query_len
     else:
         q_start = tl.load(cu_seqlens_q + pid_b)
-        q_len = (
-            tl.load(cu_seqlens_q + pid_b + 1)
-            - q_start
-        )
+        q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
         prefix_len = tl.load(prefix_lens + pid_b)
 
     group_start = pid_g * GROUP_SIZE_Q
@@ -408,13 +449,7 @@ def _gqa_sparse_fwd_grouped8(
     q_valid = q_local < q_len
 
     q_ptrs = tl.make_block_ptr(
-        base=(
-            q_ptr
-            + q_start * stride_qn
-            + pid_kh
-            * gqa_group_size
-            * stride_qh
-        ),
+        base=(q_ptr + q_start * stride_qn + pid_kh * gqa_group_size * stride_qh),
         shape=(
             q_len,
             gqa_group_size,
@@ -449,19 +484,10 @@ def _gqa_sparse_fwd_grouped8(
         BLOCK_SIZE_D,
     )
 
-    topk_mask = (
-        q_valid[:, None]
-        & (off_t[None, :] < MAX_TOPK)
-    )
+    topk_mask = q_valid[:, None] & (off_t[None, :] < MAX_TOPK)
 
     topk_values = tl.load(
-        t_ptr
-        + pid_kh * stride_th
-        + (
-            q_start
-            + q_local[:, None]
-        ) * stride_tn
-        + off_t[None, :] * stride_tk,
+        t_ptr + pid_kh * stride_th + (q_start + q_local[:, None]) * stride_tn + off_t[None, :] * stride_tk,
         mask=topk_mask,
         other=-1,
     ).to(tl.int32)
@@ -484,20 +510,14 @@ def _gqa_sparse_fwd_grouped8(
     offset_lhs = candidate_offsets[:, None]
     offset_rhs = candidate_offsets[None, :]
 
-    prior_matches = (
-        (candidate_lhs == candidate_rhs)
-        & (offset_rhs < offset_lhs)
-    )
+    prior_matches = (candidate_lhs == candidate_rhs) & (offset_rhs < offset_lhs)
 
     prior_count = tl.sum(
         prior_matches,
         axis=1,
     )
 
-    unique_mask = (
-        (candidates >= 0)
-        & (prior_count == 0)
-    )
+    unique_mask = (candidates >= 0) & (prior_count == 0)
 
     # First-occurrence ranks are an inclusive prefix sum of unique flags.
     unique_rank = tl.cumsum(unique_mask.to(tl.int32), axis=0) - 1
@@ -521,10 +541,7 @@ def _gqa_sparse_fwd_grouped8(
         dtype=tl.float32,
     )
 
-    bt_row = (
-        block_table_ptr
-        + pid_b * stride_bt_b
-    )
+    bt_row = block_table_ptr + pid_b * stride_bt_b
     # Match the [query * padded-head, token] matrix rows directly.
     off_m = tl.arange(0, BLOCK_SIZE_M)
     row_query = group_start + off_m // BLOCK_SIZE_H
@@ -532,13 +549,10 @@ def _gqa_sparse_fwd_grouped8(
     row_abs = prefix_len + row_query
     sm_scale_log2e = sm_scale * 1.4426950409
 
-    for unique_index in range(
-        unique_count
-    ):
+    for unique_index in range(unique_count):
         candidate = tl.sum(
             tl.where(
-                unique_mask
-                & (unique_rank == unique_index),
+                unique_mask & (unique_rank == unique_index),
                 candidates,
                 0,
             ),
@@ -548,8 +562,7 @@ def _gqa_sparse_fwd_grouped8(
         selected_q = (
             tl.sum(
                 tl.where(
-                    (topk_values == candidate)
-                    & topk_mask,
+                    (topk_values == candidate) & topk_mask,
                     1,
                     0,
                 ),
@@ -558,20 +571,12 @@ def _gqa_sparse_fwd_grouped8(
             > 0
         )
 
-        page = tl.load(
-            bt_row + candidate
-        ).to(tl.int32)
+        page = tl.load(bt_row + candidate).to(tl.int32)
 
-        page_position = (
-            candidate * BLOCK_SIZE_K
-        )
+        page_position = candidate * BLOCK_SIZE_K
         positions = page_position + off_n
 
-        kv_base = (
-            kv_cache_ptr
-            + page * stride_kv_blk
-            + pid_kh * stride_kv_h
-        )
+        kv_base = kv_cache_ptr + page * stride_kv_blk + pid_kh * stride_kv_h
 
         k_ptrs = tl.make_block_ptr(
             base=kv_base,
@@ -635,10 +640,7 @@ def _gqa_sparse_fwd_grouped8(
         l_i = l_i * alpha + l_ij
 
         v_ptrs = tl.make_block_ptr(
-            base=(
-                kv_base
-                + head_dim * stride_kv_d
-            ),
+            base=(kv_base + head_dim * stride_kv_d),
             shape=(
                 BLOCK_SIZE_K,
                 head_dim,
@@ -681,13 +683,7 @@ def _gqa_sparse_fwd_grouped8(
     )
 
     o_ptrs = tl.make_block_ptr(
-        base=(
-            o_ptr
-            + q_start * stride_on
-            + pid_kh
-            * gqa_group_size
-            * stride_oh
-        ),
+        base=(o_ptr + q_start * stride_on + pid_kh * gqa_group_size * stride_oh),
         shape=(
             q_len,
             gqa_group_size,
@@ -737,9 +733,7 @@ def minimax_m3_sparse_attn(
     """S60 BF16 prefill using the direct Triton kernel."""
 
     if k_scale is not None or v_scale is not None:
-        raise NotImplementedError(
-            "S60 initial prefill adaptation does not support FP8 scales"
-        )
+        raise NotImplementedError("S60 initial prefill adaptation does not support FP8 scales")
 
     if q.dtype != torch.bfloat16:
         raise ValueError("S60 initial prefill path requires BF16 q")
@@ -761,7 +755,6 @@ def minimax_m3_sparse_attn(
             raise ValueError(f"{name} must use int32 on S60")
 
     total_q, num_heads, head_dim = q.shape
-
 
     if num_kv_heads <= 0:
         raise ValueError("num_kv_heads must be positive")
@@ -833,14 +826,10 @@ def minimax_m3_sparse_attn(
             block_table.stride(0),
             GROUP_SIZE_Q=grouped_query_size,
             BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-            BLOCK_SIZE_D=triton.next_power_of_2(
-                head_dim
-            ),
+            BLOCK_SIZE_D=triton.next_power_of_2(head_dim),
             BLOCK_SIZE_H=block_size_h,
             MAX_TOPK=topk,
-            BLOCK_TOPK=triton.next_power_of_2(
-                topk
-            ),
+            BLOCK_TOPK=triton.next_power_of_2(topk),
             DECODE_MODE=False,
             num_warps=1,
             num_stages=1,
@@ -852,7 +841,9 @@ def minimax_m3_sparse_attn(
     prefix_group = 16
     prefix_groups = triton.cdiv(max_query_len, prefix_group)
     use_shared_prefix = (
-        head_dim == 128 and block_size_h <= 8 and topk >= 8
+        head_dim == 128
+        and block_size_h <= 8
+        and topk >= 8
         and triton.cdiv(total_q, prefix_group) * num_kv_heads >= 64
         and total_q * num_heads * (head_dim + 2) * 4 <= 64 * 1024 * 1024
     )
@@ -863,13 +854,34 @@ def minimax_m3_sparse_attn(
         denom = torch.empty_like(maximum)
         counts = torch.empty((batch, num_kv_heads, prefix_groups), device=q.device, dtype=torch.int32)
         _gqa_sparse_common_prefix[(prefix_groups, num_kv_heads, batch)](
-            q, kv_cache, topk_idx, block_table, cu_seqlens_q, seq_lens, prefix_lens,
-            partial, maximum, denom, counts,
-            gqa_group_size, head_dim, topk, sm_scale,
-            *q.stride(), *kv_cache.stride(), *topk_idx.stride(), block_table.stride(0),
-            *partial.stride(), maximum.stride(0), num_kv_heads, prefix_groups,
-            prefix_group, block_size_h, triton.next_power_of_2(head_dim),
-            num_warps=1, num_stages=1,
+            q,
+            kv_cache,
+            topk_idx,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            partial,
+            maximum,
+            denom,
+            counts,
+            gqa_group_size,
+            head_dim,
+            topk,
+            sm_scale,
+            *q.stride(),
+            *kv_cache.stride(),
+            *topk_idx.stride(),
+            block_table.stride(0),
+            *partial.stride(),
+            maximum.stride(0),
+            num_kv_heads,
+            prefix_groups,
+            prefix_group,
+            block_size_h,
+            triton.next_power_of_2(head_dim),
+            num_warps=1,
+            num_stages=1,
         )
 
     grid = (
@@ -923,10 +935,17 @@ def minimax_m3_sparse_attn(
         KV_SCALE_MODE=0,
         num_warps=1,
         num_stages=1,
-        partial_ptr=partial, maximum_ptr=maximum, denom_ptr=denom, count_ptr=counts,
-        GROUP_Q=prefix_group, NUM_GROUPS=prefix_groups,
-        STRIDE_PN=partial.stride(0), STRIDE_PH=partial.stride(1), STRIDE_PD=partial.stride(2),
-        STRIDE_SN=maximum.stride(0), USE_SHARED_PREFIX=use_shared_prefix,
+        partial_ptr=partial,
+        maximum_ptr=maximum,
+        denom_ptr=denom,
+        count_ptr=counts,
+        GROUP_Q=prefix_group,
+        NUM_GROUPS=prefix_groups,
+        STRIDE_PN=partial.stride(0),
+        STRIDE_PH=partial.stride(1),
+        STRIDE_PD=partial.stride(2),
+        STRIDE_SN=maximum.stride(0),
+        USE_SHARED_PREFIX=use_shared_prefix,
     )
 
 
@@ -997,7 +1016,6 @@ def _gqa_sparse_decode_kernel_enflame(
     chunk_start_topk = pid_c * chunk_size_topk
     chunk_end_compiletime = chunk_start_topk + chunk_size_topk
 
-
     seq_len = tl.load(seq_lens + req_id)
     query_pos = seq_len - decode_query_len + q_offset
     # Full-CG padding uses zero-length request rows. Clamp to an empty
@@ -1051,9 +1069,7 @@ def _gqa_sparse_decode_kernel_enflame(
                 k = (k * tl.load(k_scale_ptr)).to(q.dtype)
             elif KV_SCALE_MODE == 2:
                 k_scale = tl.load(
-                    k_scale_ptr
-                    + pid_kh * stride_ks_h
-                    + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
+                    k_scale_ptr + pid_kh * stride_ks_h + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
                     mask=pos_mask,
                     other=1.0,
                 )
@@ -1081,9 +1097,7 @@ def _gqa_sparse_decode_kernel_enflame(
                 v = (v * tl.load(v_scale_ptr)).to(q.dtype)
             elif KV_SCALE_MODE == 2:
                 v_scale = tl.load(
-                    v_scale_ptr
-                    + pid_kh * stride_vs_h
-                    + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
+                    v_scale_ptr + pid_kh * stride_vs_h + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
                     mask=pos_mask,
                     other=1.0,
                 )
@@ -1091,7 +1105,6 @@ def _gqa_sparse_decode_kernel_enflame(
         acc_o += tl.dot(p.to(v.dtype), v)
         m_i = m_ij
         l_i = l_i * alpha + l_ij
-
 
     # Empty chunks for active rows must store zero output; otherwise the merge
     # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
@@ -1109,12 +1122,7 @@ def _gqa_sparse_decode_kernel_enflame(
     if not DIRECT_OUTPUT:
         lse_i = m_i + tl.log2(l_i)
         lse_ptrs = tl.make_block_ptr(
-            base=(
-                lse_ptr
-                + pid_c * stride_l_c
-                + pid_b * stride_l_b
-                + pid_h * stride_l_h
-            ),
+            base=(lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h),
             shape=(gqa_group_size,),
             strides=(stride_l_h,),
             offsets=(0,),
@@ -1124,9 +1132,7 @@ def _gqa_sparse_decode_kernel_enflame(
         tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.heuristics(
-    {"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])}
-)
+@triton.heuristics({"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])})
 @triton.jit
 def _merge_topk_attn_out_kernel_enflame(
     o_ptr,  # partials: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
@@ -1148,7 +1154,6 @@ def _merge_topk_attn_out_kernel_enflame(
 ):
     pid_b, pid_h = tl.program_id(0), tl.program_id(1)
 
-
     off_c = tl.arange(0, NUM_TOPK_CHUNKS)
     off_d = tl.arange(0, BLOCK_SIZE_D)
     o_ptrs = tl.make_block_ptr(
@@ -1166,22 +1171,28 @@ def _merge_topk_attn_out_kernel_enflame(
     weights = tl.exp2(lse - lse_max)
     weights = weights / tl.sum(weights, axis=0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
-    out_ptrs = (
-        out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
-    )
+    out_ptrs = out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
     tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=off_d < head_dim)
 
 
-@triton.heuristics(
-    {"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])}
-)
+@triton.heuristics({"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])})
 @triton.jit
 def _merge_topk_attn_heads_kernel_enflame(
-    o_ptr, lse_ptr, out_ptr,
-    head_dim, num_heads: tl.constexpr,
-    stride_o_c, stride_o_b, stride_o_h, stride_o_d,
-    stride_l_c, stride_l_b, stride_l_h,
-    stride_out_n, stride_out_h, stride_out_d,
+    o_ptr,
+    lse_ptr,
+    out_ptr,
+    head_dim,
+    num_heads: tl.constexpr,
+    stride_o_c,
+    stride_o_b,
+    stride_o_h,
+    stride_o_d,
+    stride_l_c,
+    stride_l_b,
+    stride_l_h,
+    stride_out_n,
+    stride_out_h,
+    stride_out_d,
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
@@ -1264,13 +1275,7 @@ def minimax_m3_sparse_attn_decode(
         batch = seq_lens.shape[0]
         # Two-query groups give D4 enough independent programs on S60 while
         # retaining adjacent-query K/V reuse.
-        grouped_query_size = (
-            2
-            if decode_query_len == 4
-            else triton.next_power_of_2(
-                decode_query_len
-            )
-        )
+        grouped_query_size = 2 if decode_query_len == 4 else triton.next_power_of_2(decode_query_len)
         grouped_grid = (
             triton.cdiv(
                 decode_query_len,
@@ -1349,11 +1354,7 @@ def minimax_m3_sparse_attn_decode(
     # write the final normalized result directly, avoiding partial buffers and
     # the merge launch. This is the profitable D3 path on S60.
     direct_output = (
-        not use_fp8
-        and max_topk <= 4
-        and group_size == 8
-        and head_dim == 128
-        and total_q * num_kv_heads >= 16
+        not use_fp8 and max_topk <= 4 and group_size == 8 and head_dim == 128 and total_q * num_kv_heads >= 16
     )
 
     if direct_output:
@@ -1377,15 +1378,14 @@ def minimax_m3_sparse_attn_decode(
             min(
                 max_topk,
                 max_chunks_by_grid,
-                (32 if q.dtype == torch.bfloat16 and not use_fp8 else 256) // max(
+                (32 if q.dtype == torch.bfloat16 and not use_fp8 else 256)
+                // max(
                     1,
                     total_q * num_kv_heads,
                 ),
             ),
         )
-        num_topk_chunks = 1 << (
-            target.bit_length() - 1
-        )
+        num_topk_chunks = 1 << (target.bit_length() - 1)
 
         if num_topk_chunks == 1 and not use_fp8:
             # A single chunk already owns the complete normalized result.
@@ -1484,26 +1484,35 @@ def minimax_m3_sparse_attn_decode(
 
     # Bound the live FP32 merge tile and retain the original singleton path.
     merge_head_tile = (
-        min(8, triton.next_power_of_2(num_heads), max(
-            1, 32768 // (num_topk_chunks * triton.next_power_of_2(head_dim))
-        ))
-        if not use_fp8 and q.dtype == torch.bfloat16 else 1
+        min(8, triton.next_power_of_2(num_heads), max(1, 32768 // (num_topk_chunks * triton.next_power_of_2(head_dim))))
+        if not use_fp8 and q.dtype == torch.bfloat16
+        else 1
     )
     # Retain at least 32 merge programs when coarsening adjacent heads.
     parallel_budget = max(1, total_q * num_heads // 32)
     parallel_tile = 1 << (parallel_budget.bit_length() - 1)
     merge_head_tile = min(merge_head_tile, parallel_tile)
     if merge_head_tile > 1:
-        _merge_topk_attn_heads_kernel_enflame[(
-            total_q, triton.cdiv(num_heads, merge_head_tile)
-        )](
-            partial_output, partial_lse, output, head_dim, num_heads,
-            stride_o_c, stride_o_b, stride_o_h, stride_o_d,
-            stride_l_c, stride_l_b, stride_l_h,
-            output.stride(0), output.stride(1), output.stride(2),
+        _merge_topk_attn_heads_kernel_enflame[(total_q, triton.cdiv(num_heads, merge_head_tile))](
+            partial_output,
+            partial_lse,
+            output,
+            head_dim,
+            num_heads,
+            stride_o_c,
+            stride_o_b,
+            stride_o_h,
+            stride_o_d,
+            stride_l_c,
+            stride_l_b,
+            stride_l_h,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
             NUM_TOPK_CHUNKS=num_topk_chunks,
             BLOCK_SIZE_H=merge_head_tile,
-            num_warps=1, num_stages=1,
+            num_warps=1,
+            num_stages=1,
         )
         return
 

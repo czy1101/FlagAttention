@@ -14,7 +14,7 @@ from flag_attn.minimax_sparse_attention.index_topk import _index_block_score_ker
 
 # The standalone prefill scorer uses the portable Triton implementation;
 # Enflame specializes fused score/TopK and decode scoring below.
-from ..utils import SPARSE_BLOCK_SIZE, round_up
+from flag_attn.runtime.backend._enflame.utils import SPARSE_BLOCK_SIZE, round_up
 
 
 # Preserve the portable score algorithm; specialize its launch on S60.
@@ -36,9 +36,7 @@ def minimax_m3_index_score(
     max over a 128-token index-K block. M3 has num_idx_heads == num_kv_heads.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
-    assert (
-        num_idx_heads == num_kv_heads
-    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
+    assert num_idx_heads == num_kv_heads, "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
 
@@ -78,7 +76,6 @@ def minimax_m3_index_score(
     return score
 
 
-
 # S60 cannot lower the TLE radix kernel or the generic uint64 packed keys.
 _HAS_TLE_RADIX = False
 _MAX_STREAMING_TOPK = 64
@@ -114,12 +111,7 @@ def _insert_topk_slot(
     best_valid = best_id >= 0
 
     better = candidate_valid & (
-        (~best_valid)
-        | (candidate_score > best_score)
-        | (
-            (candidate_score == best_score)
-            & (candidate_id < best_id)
-        )
+        (~best_valid) | (candidate_score > best_score) | ((candidate_score == best_score) & (candidate_id < best_id))
     )
 
     next_score = tl.where(
@@ -194,36 +186,22 @@ def _prefill_score_topk4_enflame(
 ):
     tl.static_assert(TOPK == 4)
 
-    query_tile = (
-        tl.program_id(0)
-        + query_tile_offset
-    )
-    batch_head = (
-        tl.program_id(1)
-        + batch_head_offset
-    )
+    query_tile = tl.program_id(0) + query_tile_offset
+    batch_head = tl.program_id(1) + batch_head_offset
 
     request_id = batch_head // num_idx_heads
     head_id = batch_head % num_idx_heads
 
-    query_start = tl.load(
-        cu_seqlens_q + request_id
-    )
-    query_end = tl.load(
-        cu_seqlens_q + request_id + 1
-    )
+    query_start = tl.load(cu_seqlens_q + request_id)
+    query_end = tl.load(cu_seqlens_q + request_id + 1)
     query_length = query_end - query_start
 
     tile_start = query_tile * BLOCK_SIZE_Q
     if tile_start >= query_length:
         return
 
-    sequence_length = tl.load(
-        seq_lens + request_id
-    )
-    prefix_length = tl.load(
-        prefix_lens + request_id
-    )
+    sequence_length = tl.load(seq_lens + request_id)
+    prefix_length = tl.load(prefix_lens + request_id)
 
     off_q = tl.arange(0, BLOCK_SIZE_Q)
     off_k = tl.arange(0, BLOCK_SIZE_K)
@@ -235,21 +213,14 @@ def _prefill_score_topk4_enflame(
     absolute_query = prefix_length + local_query
 
     q = tl.load(
-        q_ptr
-        + global_query[:, None] * stride_qn
-        + head_id * stride_qh
-        + off_d[None, :] * stride_qd,
+        q_ptr + global_query[:, None] * stride_qn + head_id * stride_qh + off_d[None, :] * stride_qd,
         mask=query_valid[:, None],
         other=0.0,
     )
 
-    valid_blocks = (
-        absolute_query + BLOCK_SIZE_K
-    ) // BLOCK_SIZE_K
+    valid_blocks = (absolute_query + BLOCK_SIZE_K) // BLOCK_SIZE_K
 
-    sequence_blocks = (
-        sequence_length + BLOCK_SIZE_K - 1
-    ) // BLOCK_SIZE_K
+    sequence_blocks = (sequence_length + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
 
     valid_blocks = tl.minimum(
         valid_blocks,
@@ -300,15 +271,11 @@ def _prefill_score_topk4_enflame(
         tl.int32,
     )
 
-    block_table_row = (
-        block_table_ptr
-        + request_id * stride_bt
-    )
+    block_table_row = block_table_ptr + request_id * stride_bt
 
     high = tl.minimum(
         sequence_length,
-        prefix_length
-        + (query_tile + 1) * BLOCK_SIZE_Q,
+        prefix_length + (query_tile + 1) * BLOCK_SIZE_Q,
     )
 
     for block_position in tl.range(
@@ -316,20 +283,11 @@ def _prefill_score_topk4_enflame(
         high,
         BLOCK_SIZE_K,
     ):
-        block_id = (
-            block_position // BLOCK_SIZE_K
-        )
+        block_id = block_position // BLOCK_SIZE_K
 
-        page = tl.load(
-            block_table_row + block_id
-        ).to(tl.int32)
+        page = tl.load(block_table_row + block_id).to(tl.int32)
 
-        k = tl.load(
-            index_kv_ptr
-            + page * stride_kb
-            + off_d[:, None] * stride_kd
-            + off_k[None, :] * stride_kn
-        )
+        k = tl.load(index_kv_ptr + page * stride_kb + off_d[:, None] * stride_kd + off_k[None, :] * stride_kn)
 
         qk = tl.dot(
             q,
@@ -337,22 +295,11 @@ def _prefill_score_topk4_enflame(
             out_dtype=tl.float32,
         )
 
-        token_position = (
-            block_position + off_k
-        )
+        token_position = block_position + off_k
 
-        available = (
-            query_valid
-            & (block_id < valid_blocks)
-        )
+        available = query_valid & (block_id < valid_blocks)
 
-        causal_mask = (
-            available[:, None]
-            & (
-                absolute_query[:, None]
-                >= token_position[None, :]
-            )
-        )
+        causal_mask = available[:, None] & (absolute_query[:, None] >= token_position[None, :])
 
         qk = tl.where(
             causal_mask,
@@ -376,10 +323,7 @@ def _prefill_score_topk4_enflame(
             0,
         )
 
-        local_mask = (
-            available
-            & (block_id >= local_start)
-        )
+        local_mask = available & (block_id >= local_start)
 
         candidate_score = tl.where(
             local_mask,
@@ -387,11 +331,7 @@ def _prefill_score_topk4_enflame(
             candidate_score,
         )
 
-        init_mask = (
-            available
-            & (block_id < init_blocks)
-            & (candidate_score < 1.0e29)
-        )
+        init_mask = available & (block_id < init_blocks) & (candidate_score < 1.0e29)
 
         candidate_score = tl.where(
             init_mask,
@@ -399,12 +339,9 @@ def _prefill_score_topk4_enflame(
             candidate_score,
         )
 
-        candidate_id = (
-            block_id
-            + tl.zeros(
-                (BLOCK_SIZE_Q,),
-                dtype=tl.int32,
-            )
+        candidate_id = block_id + tl.zeros(
+            (BLOCK_SIZE_Q,),
+            dtype=tl.int32,
         )
         candidate_valid = available
 
@@ -469,11 +406,7 @@ def _prefill_score_topk4_enflame(
         TOPK,
     )
 
-    output_base = (
-        output_ptr
-        + head_id * stride_oh
-        + global_query * stride_on
-    )
+    output_base = output_ptr + head_id * stride_oh + global_query * stride_on
 
     tl.store(
         output_base,
@@ -536,17 +469,11 @@ def minimax_m3_index_score_topk(
     if idx_q.dtype != torch.bfloat16:
         raise ValueError("idx_q must use BF16")
     if index_kv_cache.dtype != torch.bfloat16:
-        raise ValueError(
-            "index_kv_cache must use BF16"
-        )
+        raise ValueError("index_kv_cache must use BF16")
     if idx_q.shape[-1] != 128:
-        raise ValueError(
-            "fused path requires index head_dim=128"
-        )
+        raise ValueError("fused path requires index head_dim=128")
     if topk != 4:
-        raise ValueError(
-            "fused path currently requires topk=4"
-        )
+        raise ValueError("fused path currently requires topk=4")
 
     for name, tensor in (
         ("block_table", block_table),
@@ -555,16 +482,12 @@ def minimax_m3_index_score_topk(
         ("prefix_lens", prefix_lens),
     ):
         if tensor.dtype != torch.int32:
-            raise ValueError(
-                f"{name} must use int32"
-            )
+            raise ValueError(f"{name} must use int32")
 
     total_q, num_idx_heads, _ = idx_q.shape
 
     if num_idx_heads != num_kv_heads:
-        raise ValueError(
-            "num_idx_heads must equal num_kv_heads"
-        )
+        raise ValueError("num_idx_heads must equal num_kv_heads")
 
     if out is None:
         result = torch.empty(
@@ -615,8 +538,7 @@ def minimax_m3_index_score_topk(
         ):
             batch_head_count = min(
                 max_grid_y,
-                batch_heads
-                - batch_head_offset,
+                batch_heads - batch_head_offset,
             )
 
             grid = (
@@ -686,40 +608,21 @@ def _prefill_topk_reduction_enflame(
     BLOCK_SIZE_N: tl.constexpr,
     SPARSE_BLOCK: tl.constexpr,
 ):
-    query_id = (
-        tl.program_id(0)
-        + query_offset
-    )
-    head_id = (
-        tl.program_id(1)
-        + head_offset
-    )
-    request_id = (
-        tl.program_id(2)
-        + batch_offset
-    )
+    query_id = tl.program_id(0) + query_offset
+    head_id = tl.program_id(1) + head_offset
+    request_id = tl.program_id(2) + batch_offset
 
-    q_start = tl.load(
-        cu_seqlens_q + request_id
-    )
-    q_end = tl.load(
-        cu_seqlens_q + request_id + 1
-    )
+    q_start = tl.load(cu_seqlens_q + request_id)
+    q_end = tl.load(cu_seqlens_q + request_id + 1)
     q_len = q_end - q_start
 
     if query_id >= q_len:
         return
 
     global_query = q_start + query_id
-    prefix_len = tl.load(
-        prefix_lens + request_id
-    )
+    prefix_len = tl.load(prefix_lens + request_id)
 
-    valid_blocks = (
-        prefix_len
-        + query_id
-        + SPARSE_BLOCK
-    ) // SPARSE_BLOCK
+    valid_blocks = (prefix_len + query_id + SPARSE_BLOCK) // SPARSE_BLOCK
 
     valid_blocks = tl.minimum(
         tl.maximum(valid_blocks, 0),
@@ -738,10 +641,7 @@ def _prefill_topk_reduction_enflame(
     available = block_ids < valid_blocks
 
     values = tl.load(
-        score_ptr
-        + head_id * stride_sh
-        + global_query * stride_sn
-        + block_ids * stride_sk,
+        score_ptr + head_id * stride_sh + global_query * stride_sn + block_ids * stride_sk,
         mask=in_storage,
         other=float("-inf"),
     )
@@ -762,10 +662,7 @@ def _prefill_topk_reduction_enflame(
             valid_blocks - local_blocks,
             0,
         )
-        local_mask = (
-            available
-            & (block_ids >= local_start)
-        )
+        local_mask = available & (block_ids >= local_start)
         values = tl.where(
             local_mask,
             1.0e29,
@@ -773,14 +670,8 @@ def _prefill_topk_reduction_enflame(
         )
 
     if init_blocks > 0:
-        init_mask = (
-            available
-            & (block_ids < init_blocks)
-        )
-        promote_init = (
-            init_mask
-            & (values < 1.0e29)
-        )
+        init_mask = available & (block_ids < init_blocks)
+        promote_init = init_mask & (values < 1.0e29)
         values = tl.where(
             promote_init,
             1.0e30,
@@ -793,10 +684,7 @@ def _prefill_topk_reduction_enflame(
             axis=0,
         )
 
-        candidate_mask = (
-            available
-            & (values == maximum)
-        )
+        candidate_mask = available & (values == maximum)
 
         # Select the lowest block id for ties. This preserves
         # deterministic ordering for all-negative-infinity rows.
@@ -813,10 +701,7 @@ def _prefill_topk_reduction_enflame(
         slot_valid = slot < real_selected
 
         tl.store(
-            output_ptr
-            + head_id * stride_oh
-            + global_query * stride_on
-            + slot * stride_ok,
+            output_ptr + head_id * stride_oh + global_query * stride_on + slot * stride_ok,
             tl.where(
                 slot_valid,
                 selected,
@@ -824,10 +709,7 @@ def _prefill_topk_reduction_enflame(
             ),
         )
 
-        available = (
-            available
-            & (block_ids != selected)
-        )
+        available = available & (block_ids != selected)
         values = tl.where(
             available,
             values,
@@ -880,10 +762,7 @@ def _prefill_topk_streaming_enflame(
             block_ids = tile_start + offsets
             visible = block_ids < valid_blocks
             values = tl.load(
-                score_ptr
-                + head_id * stride_sh
-                + global_query * stride_sn
-                + block_ids * stride_sk,
+                score_ptr + head_id * stride_sh + global_query * stride_sn + block_ids * stride_sk,
                 mask=visible,
                 other=float("-inf"),
             )
@@ -894,10 +773,13 @@ def _prefill_topk_streaming_enflame(
             values = tl.where(is_init, 1.0e30, values)
 
             # Track validity separately so masked lanes never tie with -inf.
-            already_selected = tl.sum(
-                (block_ids[:, None] == selected_ids[None, :]).to(tl.int32),
-                axis=1,
-            ) > 0
+            already_selected = (
+                tl.sum(
+                    (block_ids[:, None] == selected_ids[None, :]).to(tl.int32),
+                    axis=1,
+                )
+                > 0
+            )
             available = visible & ~already_selected
             tile_score = tl.max(tl.where(available, values, float("-inf")), axis=0)
             tile_id = tl.min(
@@ -905,28 +787,33 @@ def _prefill_topk_streaming_enflame(
                 axis=0,
             )
             better = (tile_id < max_blocks) & (
-                (tile_score > best_score)
-                | ((tile_score == best_score) & (tile_id < best_id))
+                (tile_score > best_score) | ((tile_score == best_score) & (tile_id < best_id))
             )
             best_score = tl.where(better, tile_score, best_score)
             best_id = tl.where(better, tile_id, best_id)
         selected_ids = tl.where(slots == slot, best_id, selected_ids)
 
     tl.store(
-        output_ptr
-        + head_id * stride_oh
-        + global_query * stride_on
-        + slots * stride_ok,
+        output_ptr + head_id * stride_oh + global_query * stride_on + slots * stride_ok,
         selected_ids,
     )
 
 
 @triton.jit
 def _prefill_topk_rows_enflame(
-    score_ptr, output_ptr, cu_seqlens_q, prefix_lens,
-    init_blocks, local_blocks, max_blocks,
-    stride_sh, stride_sn, stride_sk,
-    stride_oh, stride_on, stride_ok,
+    score_ptr,
+    output_ptr,
+    cu_seqlens_q,
+    prefix_lens,
+    init_blocks,
+    local_blocks,
+    max_blocks,
+    stride_sh,
+    stride_sn,
+    stride_sk,
+    stride_oh,
+    stride_on,
+    stride_ok,
     TOPK: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     SPARSE_BLOCK: tl.constexpr,
@@ -946,9 +833,7 @@ def _prefill_topk_rows_enflame(
     block_ids = tl.arange(0, BLOCK_SIZE_N)
     available = q_valid[:, None] & (block_ids[None, :] < valid_blocks[:, None])
     values = tl.load(
-        score_ptr + head_id * stride_sh
-        + (q_start + query_ids[:, None]) * stride_sn
-        + block_ids[None, :] * stride_sk,
+        score_ptr + head_id * stride_sh + (q_start + query_ids[:, None]) * stride_sn + block_ids[None, :] * stride_sk,
         mask=available,
         other=float("-inf"),
     )
@@ -963,8 +848,7 @@ def _prefill_topk_rows_enflame(
         matching = available & (values == maximum[:, None])
         selected = -tl.max(tl.where(matching, -block_ids[None, :], -BLOCK_SIZE_N), axis=1)
         tl.store(
-            output_ptr + head_id * stride_oh
-            + (q_start + query_ids) * stride_on + slot * stride_ok,
+            output_ptr + head_id * stride_oh + (q_start + query_ids) * stride_on + slot * stride_ok,
             tl.where(slot < real_selected, selected, -1),
             mask=q_valid,
         )
@@ -985,38 +869,25 @@ def minimax_m3_index_topk(
 ) -> torch.Tensor:
     """S60 prefill TopK using reduction or streaming selection."""
     if score.ndim != 3:
-        raise ValueError(
-            "score must have shape "
-            "[num_heads, total_q, max_blocks]"
-        )
+        raise ValueError("score must have shape " "[num_heads, total_q, max_blocks]")
     if score.dtype != torch.float32:
         raise ValueError("score must use float32")
     if topk <= 0:
         raise ValueError("topk must be positive")
     if max_query_len <= 0 and score.shape[1] > 0:
-        raise ValueError(
-            "max_query_len must be positive"
-        )
+        raise ValueError("max_query_len must be positive")
     if cu_seqlens_q.dtype != torch.int32:
-        raise ValueError(
-            "cu_seqlens_q must use int32"
-        )
+        raise ValueError("cu_seqlens_q must use int32")
     if prefix_lens.dtype != torch.int32:
-        raise ValueError(
-            "prefix_lens must use int32"
-        )
+        raise ValueError("prefix_lens must use int32")
 
     num_heads, total_q, max_blocks = score.shape
     batch = cu_seqlens_q.shape[0] - 1
 
     if max_blocks <= 0:
-        raise ValueError(
-            "score must contain at least one block"
-        )
+        raise ValueError("score must contain at least one block")
     if prefix_lens.shape[0] != batch:
-        raise ValueError(
-            "prefix_lens has an incompatible shape"
-        )
+        raise ValueError("prefix_lens has an incompatible shape")
 
     if out is None:
         topk_idx = torch.empty(
@@ -1027,14 +898,8 @@ def minimax_m3_index_topk(
     else:
         if out.dtype != torch.int32:
             raise ValueError("out must use int32")
-        if (
-            out.shape[0] != num_heads
-            or out.shape[1] < total_q
-            or out.shape[2] < topk
-        ):
-            raise ValueError(
-                "out has an incompatible shape"
-            )
+        if out.shape[0] != num_heads or out.shape[1] < total_q or out.shape[2] < topk:
+            raise ValueError("out has an incompatible shape")
         topk_idx = out[
             :num_heads,
             :total_q,
@@ -1044,11 +909,7 @@ def minimax_m3_index_topk(
     if total_q == 0:
         return topk_idx
 
-    if (
-        _select_prefill_topk_path(score, topk, max_query_len) == "streaming"
-        and batch <= 255
-        and num_heads <= 255
-    ):
+    if _select_prefill_topk_path(score, topk, max_query_len) == "streaming" and batch <= 255 and num_heads <= 255:
         # Bound the live FP32 score tile to 4096 elements. Wider rows retain
         # streaming selection rather than expanding local work without limit.
         row_tile = 8 if max_blocks <= 512 and topk <= 32 else 1
@@ -1076,9 +937,7 @@ def minimax_m3_index_topk(
         )
         return topk_idx
 
-    block_size_n = triton.next_power_of_2(
-        max_blocks
-    )
+    block_size_n = triton.next_power_of_2(max_blocks)
 
     max_grid_x = 65535
     max_grid_y = 255
@@ -1179,10 +1038,7 @@ def _decode_topk_reduction_enflame(
     block_ids = tl.arange(0, BLOCK_SIZE_N)
     available = block_ids < valid_blocks
     values = tl.load(
-        score_ptr
-        + head_id * stride_sh
-        + query_id * stride_sn
-        + block_ids * stride_sk,
+        score_ptr + head_id * stride_sh + query_id * stride_sn + block_ids * stride_sk,
         mask=block_ids < max_blocks,
         other=float("-inf"),
     )
@@ -1197,10 +1053,7 @@ def _decode_topk_reduction_enflame(
             axis=0,
         )
         tl.store(
-            output_ptr
-            + head_id * stride_oh
-            + query_id * stride_on
-            + slot * stride_ok,
+            output_ptr + head_id * stride_oh + query_id * stride_on + slot * stride_ok,
             tl.where(slot < real_selected, selected, -1),
         )
         available = available & (block_ids != selected)
@@ -1244,10 +1097,7 @@ def _decode_topk_rows_enflame(
     block_ids = tl.arange(0, BLOCK_SIZE_N)
     available = query_valid[:, None] & (block_ids[None, :] < valid_blocks[:, None])
     values = tl.load(
-        score_ptr
-        + head_id * stride_sh
-        + query_id[:, None] * stride_sn
-        + block_ids[None, :] * stride_sk,
+        score_ptr + head_id * stride_sh + query_id[:, None] * stride_sn + block_ids[None, :] * stride_sk,
         mask=query_valid[:, None] & (block_ids[None, :] < max_blocks),
         other=float("-inf"),
     )
@@ -1272,8 +1122,7 @@ def _decode_topk_rows_enflame(
             )
         else:
             tl.store(
-                output_ptr + head_id * stride_oh
-                + query_id * stride_on + slot * stride_ok,
+                output_ptr + head_id * stride_oh + query_id * stride_on + slot * stride_ok,
                 tl.where(slot < real_selected, selected, -1),
                 mask=query_valid,
             )
@@ -1283,8 +1132,7 @@ def _decode_topk_rows_enflame(
     if STORE_TILE:
         # Write a regular query/slot tile once instead of tiny per-slot stores.
         tl.store(
-            output_ptr + head_id * stride_oh
-            + query_id[:, None] * stride_on + slots[None, :] * stride_ok,
+            output_ptr + head_id * stride_oh + query_id[:, None] * stride_on + slots[None, :] * stride_ok,
             selected_ids,
             mask=query_valid[:, None] & (slots[None, :] < TOPK),
         )
@@ -1314,10 +1162,7 @@ def _decode_topk_identity_enflame(
 
     slots = tl.arange(0, BLOCK_SIZE_T)
     tl.store(
-        output_ptr
-        + head_id * stride_oh
-        + query_id * stride_on
-        + slots * stride_ok,
+        output_ptr + head_id * stride_oh + query_id * stride_on + slots * stride_ok,
         tl.where(slots < valid_blocks, slots, -1),
         mask=slots < TOPK,
     )
@@ -1355,13 +1200,9 @@ def _decode_index_score_kernel_enflame(
     pid_q = tl.program_id(2)
     hq_offsets = tl.arange(0, BLOCK_SIZE_HQ)
     h_offsets = hq_offsets // BLOCK_SIZE_Q
-    q_offsets = (
-        pid_q * BLOCK_SIZE_Q
-        + hq_offsets % BLOCK_SIZE_Q
-    )
+    q_offsets = pid_q * BLOCK_SIZE_Q + hq_offsets % BLOCK_SIZE_Q
     q_mask = q_offsets < decode_query_len
     q_ids = pid_r * decode_query_len + q_offsets
-
 
     seq_len = tl.load(seq_lens + pid_r)
     query_pos = seq_len - decode_query_len + q_offsets
@@ -1387,10 +1228,7 @@ def _decode_index_score_kernel_enflame(
     # Keep queries on the M axis so the dot product writes one contiguous
     # score row per query instead of using the very small HQ dimension as N.
     q = tl.load(
-        q_ptr
-        + q_ids[:, None] * stride_q_n
-        + h_offsets[:, None] * stride_q_h
-        + off_d[None, :] * stride_q_d,
+        q_ptr + q_ids[:, None] * stride_q_n + h_offsets[:, None] * stride_q_h + off_d[None, :] * stride_q_d,
         mask=q_mask[:, None],
         other=0.0,
     )  # [HQ,D]
@@ -1402,10 +1240,7 @@ def _decode_index_score_kernel_enflame(
         # allocation is multiple of BLOCK_SIZE_K.
         # for tokens beyond seqlen, they will be masked in qk later.
         k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_d[:, None] * stride_ik_d
-            + off_k[None, :] * stride_ik_pos,
+            ik_cache_ptr + page * stride_ik_blk + off_d[:, None] * stride_ik_d + off_k[None, :] * stride_ik_pos,
         )  # [D,N]
         # fp32 accumulation is required for the fp8 (e4m3) index cache: q/k are
         # loaded in their stored dtype (bf16 or e4m3) and the MMA accumulates in
@@ -1465,9 +1300,7 @@ def minimax_m3_index_decode_score(
         max_decode_query_len,
         max_grid_z,
     )
-    block_size_q = triton.next_power_of_2(
-        max(1, min_block_size_q)
-    )
+    block_size_q = triton.next_power_of_2(max(1, min_block_size_q))
     num_query_tiles = triton.cdiv(
         max_decode_query_len,
         block_size_q,
@@ -1475,11 +1308,7 @@ def minimax_m3_index_decode_score(
 
     # Q=1 favors one page per chunk. Speculative Decode keeps two adjacent
     # pages per chunk to balance query parallelism and program launch count.
-    chunk_limit = (
-        max_block
-        if decode_query_len == 1
-        else triton.cdiv(max_block, 2)
-    )
+    chunk_limit = max_block if decode_query_len == 1 else triton.cdiv(max_block, 2)
     target = max(
         1,
         min(
@@ -1588,10 +1417,14 @@ def minimax_m3_index_decode(
         score_out=score_out,
     )
 
-    # Bound live FP32 scores to 4096 elements while batching up to 8 rows.
-    if 0 < max_block <= 4096 and 0 < topk <= 32:
+    # Bound live FP32 scores to 4096 elements with workload-aware row batching.
+    if max_block <= 4096 and topk <= 32:
         block_size_n = triton.next_power_of_2(max_block)
-        block_size_q = min(8, 4096 // block_size_n)
+        # Keep a bounded row tile while retaining query-program parallelism.
+        # Small workloads use at least two lanes for the supported tile store.
+        row_work = max(1, total_q // 16)
+        row_cap = min(16, max(2, 1 << (row_work.bit_length() - 1)))
+        block_size_q = min(row_cap, 4096 // block_size_n)
         if block_size_q == 1 and score.stride(2) != 1:
             # Avoid the backend's unsupported singleton-axis strided load.
             # The existing 1D reduction preserves the same deterministic TopK.
@@ -1645,26 +1478,14 @@ def minimax_m3_index_decode(
         device=idx_q.device,
     )
     request_ids = query_ids // decode_query_len
-    query_offsets = (
-        query_ids
-        - request_ids * decode_query_len
-    )
+    query_offsets = query_ids - request_ids * decode_query_len
     query_seq_lens = torch.index_select(
         seq_lens,
         0,
         request_ids,
     )
-    kv_lens = (
-        query_seq_lens
-        - decode_query_len
-        + query_offsets
-        + 1
-    ).clamp(min=0)
-    valid_blocks = (
-        kv_lens
-        + SPARSE_BLOCK_SIZE
-        - 1
-    ) // SPARSE_BLOCK_SIZE
+    kv_lens = (query_seq_lens - decode_query_len + query_offsets + 1).clamp(min=0)
+    valid_blocks = (kv_lens + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE
 
     block_ids = torch.arange(
         max_block,
@@ -1672,10 +1493,7 @@ def minimax_m3_index_decode(
         device=idx_q.device,
     ).view(1, 1, max_block)
 
-    valid_mask = (
-        block_ids
-        < valid_blocks.view(1, total_q, 1)
-    )
+    valid_mask = block_ids < valid_blocks.view(1, total_q, 1)
 
     negative = torch.full(
         (),
@@ -1710,10 +1528,7 @@ def minimax_m3_index_decode(
     ).view(1, 1, selected_count)
 
     selected = torch.where(
-        slot_ids
-        < valid_blocks.clamp(
-            max=selected_count
-        ).view(1, total_q, 1),
+        slot_ids < valid_blocks.clamp(max=selected_count).view(1, total_q, 1),
         selected,
         torch.full_like(selected, -1),
     )
