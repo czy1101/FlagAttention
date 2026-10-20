@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from flag_attn.FLA.index import prepare_chunk_indices
+from ._utils import supports_staged
 
 
 @triton.jit
@@ -226,9 +227,8 @@ def parallax_forward(
     if (
         cu_seqlens is None
         and window_size_left < 0
-        and time == 1024
         and dim == 64
-        and q.dtype == torch.bfloat16
+        and supports_staged(q, window_size_left)
     ):
         from .staged_forward import staged_parallax_forward
 
@@ -237,8 +237,7 @@ def parallax_forward(
     if (
         cu_seqlens is None
         and dim == 128
-        and time in (512, 1024)
-        and q.dtype == torch.bfloat16
+        and supports_staged(q, window_size_left)
     ):
         from .staged_forward import staged_parallax_forward_d128
 

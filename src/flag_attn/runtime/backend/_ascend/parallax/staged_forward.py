@@ -224,10 +224,10 @@ def _softmax_correction_d128(
     batch = bh // HQ
     hq = bh % HQ
     rows = row_block * BR + tl.arange(0, BR)
-    cols = tl.arange(0, T)
+    cols = tl.arange(0, triton.next_power_of_2(T))
     score_offsets = ((bh * T + rows[:, None]) * T + cols[None, :])
     row_valid = rows < T
-    valid = row_valid[:, None] & (cols[None, :] <= rows[:, None])
+    valid = row_valid[:, None] & (cols[None, :] < T) & (cols[None, :] <= rows[:, None])
     if WINDOW_SIZE_LEFT >= 0:
         valid = valid & (cols[None, :] >= rows[:, None] - WINDOW_SIZE_LEFT + 1)
     scores = tl.load(score_ptr + score_offsets, valid, other=-float("inf")).to(tl.float32)
@@ -318,11 +318,11 @@ def _softmax_correction(
     batch = bh // HQ
     hq = bh % HQ
     rows = row_block * BR + tl.arange(0, BR)
-    cols = tl.arange(0, T)
+    cols = tl.arange(0, triton.next_power_of_2(T))
     score_offsets = ((bh * T + rows[:, None]) * T + cols[None, :])
     row_valid = rows < T
     causal = cols[None, :] <= rows[:, None]
-    valid = row_valid[:, None] & causal
+    valid = row_valid[:, None] & (cols[None, :] < T) & causal
     scores = tl.load(score_ptr + score_offsets, valid, other=-float("inf")).to(tl.float32)
     rk = tl.load(rk_ptr + score_offsets, valid, other=0.0).to(tl.float32)
     row_max = tl.max(scores, axis=1, keep_dims=True)
@@ -443,7 +443,8 @@ def staged_parallax_forward(q, r, k, v, scale):
         num_warps=8,
         num_stages=1,
     )
-    br = 8
+    # Keep the softmax tile within the UB capacity as sequence length grows.
+    br = min(8, 8192 // triton.next_power_of_2(time))
     _softmax_correction[(triton.cdiv(time, br), batch * hq)](
         score,
         rk,
@@ -566,7 +567,8 @@ def staged_parallax_forward_d128(q, r, k, v, scale, window_size_left=-1, block_m
         num_warps=8,
         num_stages=1,
     )
-    br = 8
+    # Keep the softmax tile within the UB capacity as sequence length grows.
+    br = min(8, 8192 // triton.next_power_of_2(time))
     _softmax_correction_d128[(triton.cdiv(time, br), batch * hq)](
         score,
         rk,

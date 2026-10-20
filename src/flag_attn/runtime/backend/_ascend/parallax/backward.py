@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 import torch
 
-from ._utils import backward_streams
+from ._utils import backward_streams, supports_staged
 
 
 @triton.jit
@@ -327,12 +327,10 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
         segments = [(int(start), int(end - start), 0) for start, end in zip(offsets[:-1], offsets[1:])]
     inline_delta = segments is None and total_t <= 128
     use_staged = (
-        segments is None and (
-            (dim == 64 and window_size_left < 0 and total_t == 1024 and
-             (G == 1 or G % 8 == 0)) or
-            (dim == 128 and q.dtype == torch.bfloat16 and total_t in (512, 1024) and
-             G in (1, 4, 8, 16, 32))
-        )
+        segments is None
+        and not inline_delta
+        and supports_staged(q, window_size_left)
+        and (G <= 8 or G % 8 == 0)
     )
     if use_staged:
         from .staged_backward import staged_parallax_backward
