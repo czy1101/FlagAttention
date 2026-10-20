@@ -155,10 +155,12 @@ def _score_tiles_d128(
     COMPACT_CAUSAL: tl.constexpr,
 ):
     if COMPACT_CAUSAL:
-        triangular_pid = tl.program_id(0).to(tl.int32)
+        rows_per_key_tile: tl.constexpr = BN // BM
+        triangular_pid = tl.program_id(0).to(tl.int32) // rows_per_key_tile
         triangle_root = tl.sqrt((8 * triangular_pid + 1).to(tl.float32))
-        pid_m = ((triangle_root - 1.0) * 0.5).to(tl.int32)
-        pid_n = triangular_pid - pid_m * (pid_m + 1) // 2
+        coarse_row = ((triangle_root - 1.0) * 0.5).to(tl.int32)
+        pid_n = triangular_pid - coarse_row * (coarse_row + 1) // 2
+        pid_m = coarse_row * rows_per_key_tile + tl.program_id(0) % rows_per_key_tile
     else:
         pid_m = tl.program_id(0).to(tl.int32)
         pid_n = tl.program_id(1).to(tl.int32)
@@ -538,7 +540,8 @@ def staged_parallax_forward_d128(q, r, k, v, scale, window_size_left=-1, block_m
     bd = triton.next_power_of_2(dim)
     compact_causal = window_size_left < 0
     if compact_causal:
-        score_grid = (triton.cdiv(time, bm) * (triton.cdiv(time, bm) + 1) // 2, batch * hq)
+        key_tiles = triton.cdiv(time, bn)
+        score_grid = (key_tiles * (key_tiles + 1) // 2 * (bn // bm), batch * hq)
     else:
         query_tiles = triton.cdiv(time, bm)
         key_tiles = triton.cdiv(window_size_left + bm + bn - 2, bn)

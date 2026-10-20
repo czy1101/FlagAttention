@@ -6,6 +6,8 @@ import triton
 import triton.language as tl
 import torch
 
+from ._utils import backward_streams
+
 
 @triton.jit
 def _preprocess_kernel(o, barv, grad_o, delta_t, delta_b, T: tl.constexpr, HQ: tl.constexpr,
@@ -315,10 +317,6 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
     dqr_bs = 64
     dkv_bs = 64
     preprocess_bt = 64
-    grad_q = torch.empty_like(q)
-    grad_r = torch.empty_like(r)
-    grad_k_buf = torch.empty((bsz, total_t, hq, dim), device=q.device, dtype=q.dtype)
-    grad_v_buf = torch.empty_like(grad_k_buf)
 
     if cu_seqlens is None:
         segments = None
@@ -336,57 +334,45 @@ def parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
              G in (1, 4, 8, 16, 32))
         )
     )
+    if use_staged:
+        from .staged_backward import staged_parallax_backward
+
+        return staged_parallax_backward(
+            q, r, k, v, o, barv, d1, bart, m, grad_o, scale, window_size_left
+        )
+
+    grad_q = torch.empty_like(q)
+    grad_r = torch.empty_like(r)
+    grad_k_buf = torch.empty((bsz, total_t, hq, dim), device=q.device, dtype=q.dtype)
+    grad_v_buf = torch.empty_like(grad_k_buf)
     delta_t = None
     delta_b = None
-    if not use_staged:
+    if not inline_delta:
         delta_t = torch.empty((bsz, total_t, hq), device=q.device, dtype=torch.float32)
         delta_b = torch.empty_like(delta_t)
 
-    if not inline_delta and not use_staged:
+    if not inline_delta:
         _preprocess_kernel[(bsz * triton.cdiv(total_t, preprocess_bt), hq)](
             o, barv, grad_o, delta_t, delta_b, total_t, hq, dim, bd, preprocess_bt,
             num_warps=4,
-        )
-    if use_staged:
-        from .staged_backward import staged_parallax_backward
-        return staged_parallax_backward(
-            q, r, k, v, o, barv, d1, bart, m, grad_o, scale, window_size_left
         )
     if segments is None:
         # Keep the batch dimension in the grid so each derivative kernel launches once.
         dqr_grid = (triton.cdiv(total_t, dqr_bt), bsz * hq)
         dkv_grid = (triton.cdiv(total_t, dkv_bs), bsz * hq)
-        if total_t >= 256:
-            current_stream = torch.npu.current_stream(q.device)
-            dqr_stream = torch.npu.Stream(device=q.device)
-            dkv_stream = torch.npu.Stream(device=q.device)
-            dqr_stream.wait_stream(current_stream)
-            dkv_stream.wait_stream(current_stream)
-            with torch.npu.stream(dqr_stream):
+        with backward_streams(q.device, concurrent=total_t >= 256) as (dqr_context, dkv_context):
+            with dqr_context:
                 _dqr_kernel[dqr_grid](
                     q, r, k, v, o, barv, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
                     scale, total_t, hq, hkv, G, dim, bd, window_size_left, dqr_bt, dqr_bs, inline_delta,
                     num_warps=4,
                 )
-            with torch.npu.stream(dkv_stream):
+            with dkv_context:
                 _dkv_kernel[dkv_grid](
                     q, r, k, v, o, barv, d1, bart, m, delta_t, delta_b, grad_o, grad_k_buf, grad_v_buf,
                     scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, dkv_bs, inline_delta,
                     num_warps=4,
                 )
-            current_stream.wait_stream(dqr_stream)
-            current_stream.wait_stream(dkv_stream)
-        else:
-            _dqr_kernel[dqr_grid](
-                q, r, k, v, o, barv, d1, bart, m, delta_t, delta_b, grad_o, grad_q, grad_r,
-                scale, total_t, hq, hkv, G, dim, bd, window_size_left, dqr_bt, dqr_bs, inline_delta,
-                num_warps=4,
-            )
-            _dkv_kernel[dkv_grid](
-                q, r, k, v, o, barv, d1, bart, m, delta_t, delta_b, grad_o, grad_k_buf, grad_v_buf,
-                scale, total_t, hq, hkv, G, dim, bd, window_size_left, bt, dkv_bs, inline_delta,
-                num_warps=4,
-            )
     else:
         for bos, t, bi in segments:
             if t == 0:

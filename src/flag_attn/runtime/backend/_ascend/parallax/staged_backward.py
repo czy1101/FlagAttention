@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import torch
+
+from ._utils import backward_streams
 import triton
 import triton.language as tl
 
@@ -237,31 +239,12 @@ def staged_parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
         q, r, k, v, o, barv, grad_o, d1, bart, m, gl, gu, weights,
         scale, time, hq, h, group, dim, bd, weight_bm, weight_bn, window_size_left,
         num_warps=8, num_stages=1)
-    if torch.npu.is_current_stream_capturing():
-        _dqr_gemm[(triton.cdiv(time, bm), bsz * hq)](
-            gl, gu, k, grad_q, grad_r, time, hq, h, group, dim, bd, bm, bn, window_size_left,
-            num_warps=8, num_stages=1)
-        if group == 1:
-            _dkv_gemm[(triton.cdiv(time, bm), bsz * hq)](
-                gl, gu, weights, q, r, grad_o, grad_k_buf, grad_v_buf,
-                time, hq, h, group, dim, bd, bm, bn, window_size_left,
-                num_warps=8, num_stages=1)
-        else:
-            _dkv_grouped_gemm[(triton.cdiv(time, bm), bsz * h * parts)](
-                gl, gu, weights, q, r, grad_o, grad_k_buf, grad_v_buf,
-                time, hq, h, group, parts, heads_per_part, dim, bd, bm, bn, window_size_left,
-                num_warps=8, num_stages=1)
-    else:
-        current_stream = torch.npu.current_stream(q.device)
-        dqr_stream = torch.npu.Stream(device=q.device)
-        dkv_stream = torch.npu.Stream(device=q.device)
-        dqr_stream.wait_stream(current_stream)
-        dkv_stream.wait_stream(current_stream)
-        with torch.npu.stream(dqr_stream):
+    with backward_streams(q.device) as (dqr_context, dkv_context):
+        with dqr_context:
             _dqr_gemm[(triton.cdiv(time, bm), bsz * hq)](
                 gl, gu, k, grad_q, grad_r, time, hq, h, group, dim, bd, bm, bn, window_size_left,
                 num_warps=8, num_stages=1)
-        with torch.npu.stream(dkv_stream):
+        with dkv_context:
             if group == 1:
                 _dkv_gemm[(triton.cdiv(time, bm), bsz * hq)](
                     gl, gu, weights, q, r, grad_o, grad_k_buf, grad_v_buf,
@@ -272,8 +255,6 @@ def staged_parallax_backward(q, r, k, v, o, barv, d1, bart, m, grad_o, scale,
                     gl, gu, weights, q, r, grad_o, grad_k_buf, grad_v_buf,
                     time, hq, h, group, parts, heads_per_part, dim, bd, bm, bn, window_size_left,
                     num_warps=8, num_stages=1)
-        current_stream.wait_stream(dqr_stream)
-        current_stream.wait_stream(dkv_stream)
     if group > 1:
         from .backward import _launch_reduce_gqa
         grad_k = torch.empty_like(k)

@@ -47,7 +47,6 @@ def _score_qkrk_full(
     batch, head = bh // HQ, bh % HQ
     num_blocks = tl.cdiv(Skv, BN)
     first_block = (split * num_blocks) // NUM_SPLITS
-    last_block = ((split + 1) * num_blocks) // NUM_SPLITS
     n, d = tl.arange(0, BN), tl.arange(0, D)
 
     q_ptr = tl.make_block_ptr(
