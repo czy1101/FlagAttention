@@ -118,7 +118,7 @@ BF16_ATOL = BF16_RTOL = 2e-2
 FP8_ATOL, FP8_RTOL = 6e-2, 8e-2
 OUTPUT_CHECK_CHUNK_ELEMENTS = 1 << 20
 
-# Shapes: (batch, query_length, kv_length, num_kv_heads, num_heads).
+# Shape tuple: (batch, query, KV length, KV heads, Q heads).
 PREFILL_SHAPES = [
     (1, 128, 4096, 1, 8),
     (1, 512, 4096, 1, 8),
@@ -164,11 +164,6 @@ DECODE_SHAPES = [
     (512, 1, 3072, 1, 8),
     (1024, 1, 3072, 1, 8),
 ]
-
-# Original broad-head benchmark cases, available explicitly.
-EXISTING_PREFILL_SHAPES = [(1, 8192, 16, 96), (2, 16384, 8, 96), (1, 32768, 16, 96), (2, 8192, 8, 96), (4, 4096, 16, 384), (4, 4096, 16, 256)]
-EXISTING_DECODE_SHAPES = [(1, 4096, 16, 96), (1, 16384, 16, 96), (1, 65536, 16, 96), (4, 4096, 8, 96), (4, 16384, 8, 96), (16, 4096, 8, 96), (32, 2048, 4, 48), (64, 1024, 4, 48)]
-
 
 @dataclass
 class MSABenchmarkArgs:
@@ -813,7 +808,7 @@ def _run_dtype(
         f"pages={page_mode}, seed={args.seed}, "
         f"warmup={args.warmup}ms, rep={args.rep}ms"
     )
-    print("Timing: eager execution with CUDA events")
+    print("Timing: eager execution with backend device events")
     if run_vllm:
         print(f"vLLM KV cache layout: {vllm_layout}; outputs checked before timing")
         print("Provider order: alternates by shape")
