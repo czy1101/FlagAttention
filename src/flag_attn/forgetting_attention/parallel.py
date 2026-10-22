@@ -1,4 +1,4 @@
-"""V7.6 TLE Forgetting Attention / ACP, Hopper SM90 inference.
+"""V7.7 TLE-enabled hybrid Forgetting Attention / ACP, Hopper SM90 inference.
 
 Q is contiguous BF16/FP16 [B, M, Hq, D], K/V [B, N, Hkv, D], and
 log_fgate contiguous FP32 [B, N, Hq]. Inputs must be finite; gates and the
@@ -6,9 +6,12 @@ scalar pruning threshold must be nonpositive. Require 0 < M <= N,
 Hq % Hkv == 0 and D in {16, 32, 60, 64, 100, 128}.
 
 Use torch.inference_mode(), head_first=False and seq_start=None.
-A compatible Triton 3.6 / FlagTree TLE compiler is required. M > 1 uses
-explicit TMA + WGMMA; M = 1 uses TMA + vector reductions to preserve
-reference rounding. No backward, CUDA Graph or cached attention output.
+A compatible Triton 3.6 / FlagTree TLE compiler is required by this module.
+The public entry dispatches small workloads, decode and D=60/100 to the
+plain Triton H100 path. Large native-D workloads retain explicit TMA + WGMMA.
+entry_for() forces the original explicit TLE path for controlled comparisons;
+its M=1 kernel uses TMA + vector reductions to preserve reference rounding.
+No backward, CUDA Graph or cached attention output.
 
 The Torch 2.10 prefix specialization matches its accumulation tree.
 Other Torch versions retain torch.cumsum and require fresh validation.
@@ -30,6 +33,7 @@ from triton import knobs
 from triton.runtime import jit as runtime_jit
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.experimental.tle.language.gpu.types import BlockEncoding as BlockedLayout
+from .naive import triton_forgetting_attention
 
 # Compiled launch reuse (code and launch metadata, never caller tensors)
 
@@ -428,12 +432,39 @@ def h100_config(B,M,N,H,HK,D):
     prep=0 if (B,M,N,H,D)==(4,4096,4096,32,64) else 1
     return (64,1 if D>64 else 2,prep,True,0)
 
-def make_entry(kind,kernel,decode,Descriptor,layout_type=None,config_override=None,fast=True):
+@lru_cache(maxsize=512)
+def h100_backend(B,M,N,H,D):
+    """Shape-only routing, not a per-case table or runtime timing decision.
+
+    Keep the no-TLE specialization within its validated N limit. Routing
+    depends on Q-row work, never tensor values, dtype, seed or test IDs.
+    """
+    if N <= 8256 and (M == 1 or D in (60,100) or B*M*H < 262144):
+        return "triton_h100_v1"
+    return "tle_tma_decode" if M == 1 else "tle_tma_wgmma"
+
+
+@lru_cache(maxsize=16)
+def _hopper_device(device_index):
+    return torch.cuda.get_device_capability(device_index) == (9,0)
+
+
+def make_entry(kind,kernel,decode,Descriptor,layout_type=None,config_override=None,fast=True,
+               hybrid=False):
     main_launch=LaunchCache(kernel);decode_launch=LaunchCache(decode)
     def forgetting_attention(q,k,v,log_fgate,*,head_first=False,seq_start=None,
                              sm_scale=None,adaptive_threshold=None):
+        # Select before allocating prefix/output/descriptor resources. The plain
+        # public entry still performs its complete input validation.
+        B,M,H,realD=q.shape
+        N,HK=k.shape[1:3]
+        if hybrid and q.is_cuda:
+            if (h100_backend(B,M,N,H,realD) == "triton_h100_v1"
+                    and _hopper_device(q.device.index)):
+                return triton_forgetting_attention(
+                    q,k,v,log_fgate,head_first=head_first,seq_start=seq_start,
+                    sm_scale=sm_scale,adaptive_threshold=adaptive_threshold)
         with torch.cuda.device(q.device):
-            B,M,H,realD=q.shape;N,HK=k.shape[1:3]
             cfg=h100_config(B,M,N,H,HK,realD) if config_override is None else config_override
             BM,SLOTS,PREP,STATIC,MMA_N=cfg
             if M==1:BM=1;SLOTS=2
@@ -454,11 +485,11 @@ def make_entry(kind,kernel,decode,Descriptor,layout_type=None,config_override=No
             return out if D==realD else out[...,:realD].contiguous()
     return forgetting_attention
 
-def entry_for(config=None, fast=True):
+def entry_for(config=None, fast=True, *, hybrid=False):
     return make_entry(
         "tle", _tle_h100_kernel, _tle_decode_kernel,
-        TensorDescriptor, None, config, fast,
+        TensorDescriptor, None, config, fast, hybrid,
     )
 
 
-forgetting_attention = entry_for()
+forgetting_attention = entry_for(hybrid=True)

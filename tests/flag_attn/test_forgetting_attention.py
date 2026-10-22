@@ -7,6 +7,11 @@ The benchmark imports the same inputs and reference adapters from this file.
 import gc
 import hashlib
 import importlib
+import math
+import os
+import subprocess
+import sys
+import textwrap
 import weakref
 from functools import lru_cache
 
@@ -14,7 +19,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flag_attn.forgetting_attention import has_tle
+from flag_attn.forgetting_attention import has_tle, triton_forgetting_attention
 from flag_attn.forgetting_attention.naive import OFFICIAL_COMMIT
 
 # Inline pytest parameters: B, M, N, Hq, Hkv, D, dtype, scale, seed-0 SHA256.
@@ -156,6 +161,13 @@ def call_optimized(inputs, case, threshold=-10.0, scale=None):
                              adaptive_threshold=threshold)
 
 
+def call_triton(inputs, case, threshold=-10.0, scale=None):
+    return triton_forgetting_attention(
+        *inputs, sm_scale=case["scale"] if scale is None else scale,
+        adaptive_threshold=threshold,
+    )
+
+
 def call_official(inputs, case, threshold=-10.0, scale=None):
     q, k, v, gate = inputs
     # Explicit adapter, NOT a claim that upstream natively supports these cases.
@@ -190,10 +202,13 @@ def assert_bitwise(actual, expected):
 
 
 CUDA_SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
-pytestmark = [
-    pytest.mark.skipif(not CUDA_SM90, reason="ACP V7.6 requires Hopper SM90 CUDA"),
-    pytest.mark.skipif(not has_tle(), reason="ACP V7.6 requires compatible Triton 3.6 TLE"),
-]
+pytestmark = pytest.mark.skipif(
+    not CUDA_SM90, reason="this ACP validation profile requires Hopper SM90"
+)
+requires_tle = pytest.mark.skipif(
+    not CUDA_SM90 or not has_tle(),
+    reason="TLE-specific checks require compatible TLE and SM90",
+)
 
 
 @pytest.mark.parametrize("case", CASES, ids=case_id)
@@ -206,12 +221,13 @@ def test_forgetting_attention_matches_official(case, seed):
     warm = call_optimized(inputs, case)
     assert_bitwise(cold, expected)
     assert_bitwise(warm, expected)
-    if seed == 0 and torch.__version__.startswith("2.10."):
+    if seed == 0 and CUDA_SM90 and has_tle() and torch.__version__.startswith("2.10."):
         assert fingerprint(warm) == case["v66_frozen_sha256"], "V7.6 frozen-output regression"
 
 
 @pytest.mark.parametrize("case", [c for c in CASES if c["id"] in
                                   ("S001", "S003", "S011", "S024", "S031", "S034", "S064")], ids=case_id)
+@requires_tle
 @torch.inference_mode()
 def test_forgetting_attention_prefix_and_boundaries(case):
     from flag_attn.forgetting_attention.parallel import prepare, h100_config
@@ -236,42 +252,45 @@ def _reuse_case(dtype="bfloat16"):
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("call", [call_optimized, call_triton], ids=["auto", "triton"])
 @torch.inference_mode()
-def test_forgetting_attention_launch_reuse(dtype):
+def test_forgetting_attention_launch_reuse(dtype, call):
     case = _reuse_case(dtype)
     inputs = make_inputs(case, 37)
     for threshold, scale in [(-10.0, 1), (-5.0, 1.0), (-10.0, 0.125), (0.0, 0.125)]:
-        assert_bitwise(call_optimized(inputs, case, threshold, scale),
+        assert_bitwise(call(inputs, case, threshold, scale),
                        call_official(inputs, case, threshold, scale))
     fresh = tuple(t.clone() for t in inputs)
-    assert_bitwise(call_optimized(fresh, case), call_official(fresh, case))
+    assert_bitwise(call(fresh, case), call_official(fresh, case))
     fresh[0].mul_(0.5)
     fresh[2].neg_()
     fresh[3].mul_(1.125)
-    assert_bitwise(call_optimized(fresh, case), call_official(fresh, case))
+    assert_bitwise(call(fresh, case), call_official(fresh, case))
 
 
 @pytest.mark.parametrize("offset", [0, 1, 2, 3])
+@pytest.mark.parametrize("call", [call_optimized, call_triton], ids=["auto", "triton"])
 @torch.inference_mode()
-def test_forgetting_attention_gate_alignment(offset):
+def test_forgetting_attention_gate_alignment(offset, call):
     case = _reuse_case()
     q, k, v, gate = make_inputs(case, 5)
     storage = torch.empty(gate.numel() + offset, device="cuda", dtype=gate.dtype)
     shifted = storage[offset:].view_as(gate)
     shifted.copy_(gate)
     inputs = (q, k, v, shifted)
-    assert_bitwise(call_optimized(inputs, case), call_official(inputs, case))
+    assert_bitwise(call(inputs, case), call_official(inputs, case))
 
 
+@pytest.mark.parametrize("call", [call_optimized, call_triton], ids=["auto", "triton"])
 @torch.inference_mode()
-def test_forgetting_attention_nondefault_stream_and_lifetime():
+def test_forgetting_attention_nondefault_stream_and_lifetime(call):
     case = _reuse_case()
     for _ in range(2):
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
             inputs = make_inputs(case, 8)
             expected = call_official(inputs, case)
-            out = call_optimized(inputs, case)
+            out = call(inputs, case)
             assert_bitwise(out, expected)
         stream.synchronize()
         refs = [weakref.ref(t) for t in (*inputs, out)]
@@ -282,8 +301,9 @@ def test_forgetting_attention_nondefault_stream_and_lifetime():
 
 @pytest.mark.parametrize("problem", ["head_first", "seq_start", "threshold_none", "threshold_positive",
                                     "threshold_nan", "scale_inf", "gate_dtype", "q_dtype", "noncontiguous"])
+@pytest.mark.parametrize("entry", ["auto", "triton"])
 @torch.inference_mode()
-def test_forgetting_attention_rejects_unsupported(problem):
+def test_forgetting_attention_rejects_unsupported(problem, entry):
     case = _reuse_case()
     q, k, v, gate = make_inputs(case)
     kwargs = dict(head_first=False, seq_start=None, sm_scale=0.125, adaptive_threshold=-10.0)
@@ -306,21 +326,325 @@ def test_forgetting_attention_rejects_unsupported(problem):
     else:
         q = torch.empty((*q.shape[:-1], q.shape[-1] * 2), device="cuda", dtype=q.dtype)[..., ::2]
     with pytest.raises((NotImplementedError, ValueError)):
-        optimized_entry()(q, k, v, gate, **kwargs)
+        fn = optimized_entry() if entry == "auto" else triton_forgetting_attention
+        fn(q, k, v, gate, **kwargs)
 
 
 @pytest.mark.parametrize("id", ["S031", "S034", "S024"])
+@requires_tle
 @torch.inference_mode()
 def test_forgetting_attention_explicit_async_and_hot_launch(id):
-    from flag_attn.forgetting_attention.parallel import capture
+    # Force explicit TLE: the V7.7 public entry may deliberately choose Triton.
+    from flag_attn.forgetting_attention.parallel import capture, entry_for
     case = next(c for c in CASES if c["id"] == id)
     inputs = make_inputs(case)
-    call_optimized(inputs, case)
+    explicit = entry_for()
+    kwargs = dict(sm_scale=case["scale"], adaptive_threshold=-10.0)
+    assert_bitwise(explicit(*inputs, **kwargs), call_official(inputs, case))
     with capture() as records:
-        call_optimized(inputs, case)
+        explicit(*inputs, **kwargs)
     torch.cuda.synchronize()
     attention = [r for r in records if "cp.async.bulk.tensor" in r[1].asm["ptx"]]
     assert len(attention) == 1
     _, compiled, _, _, cache_hit = attention[0]
     assert cache_hit
     assert ("wgmma.mma_async" in compiled.asm["ptx"]) == (case["M"] > 1)
+
+
+@pytest.mark.parametrize("case", CASES, ids=case_id)
+@torch.inference_mode()
+def test_triton_fallback_matches_official(case):
+    inputs = make_inputs(case, 1)
+    expected = call_official(inputs, case)
+    actual = triton_forgetting_attention(
+        *inputs, sm_scale=case["scale"], adaptive_threshold=-10.0,
+    )
+    assert actual.is_contiguous()
+    assert_bitwise(actual, expected)
+
+
+@pytest.mark.parametrize("d", [60, 100])
+@pytest.mark.parametrize("m", [1, 65])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@torch.inference_mode()
+def test_triton_fallback_default_scale_before_padding(d, m, dtype):
+    case = dict(B=2, M=m, N=129, HQ=4, H=2, D=d, dtype=dtype,
+                scale=1 / math.sqrt(d))
+    inputs = make_inputs(case, 13)
+    actual = triton_forgetting_attention(*inputs, adaptive_threshold=-10.0)
+    assert actual.is_contiguous()
+    assert_bitwise(actual, call_official(inputs, case))
+
+
+@torch.inference_mode()
+def test_triton_fallback_does_not_swallow_kernel_failure(monkeypatch):
+    naive = importlib.import_module("flag_attn.forgetting_attention.naive")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("sentinel kernel failure")
+
+    monkeypatch.setattr(naive, "_triton_forward", fail)
+    with pytest.raises(RuntimeError, match="sentinel kernel failure"):
+        triton_forgetting_attention(*make_inputs(_reuse_case()), adaptive_threshold=-10.0)
+
+
+@pytest.mark.parametrize("scenario", ["missing_tle", "missing_block_encoding",
+                                      "missing_set_layout", "broken_import"])
+def test_optional_tle_import_in_fresh_process(scenario):
+    # Probe API availability and the public adapter without compiling kernels:
+    # some FlagTree internals themselves import TLE during compilation.
+    # Numeric fallback coverage is separate and also runs on stock Triton.
+    code = textwrap.dedent("""
+        import importlib
+        import importlib.abc
+        import math
+        import os
+        import sys
+        import types
+        import torch
+        import triton
+
+        scenario = os.environ["ACP_IMPORT_SCENARIO"]
+        for name in list(sys.modules):
+            if name == "triton.experimental.tle" or name.startswith("triton.experimental.tle."):
+                del sys.modules[name]
+
+        if scenario in ("missing_tle", "broken_import"):
+            class BlockTLE(importlib.abc.MetaPathFinder):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "triton.experimental.tle" or fullname.startswith("triton.experimental.tle."):
+                        if scenario == "broken_import":
+                            raise RuntimeError("sentinel broken TLE import")
+                        raise ModuleNotFoundError("TLE intentionally absent", name=fullname)
+            sys.meta_path.insert(0, BlockTLE())
+        else:
+            names = ("triton.experimental.tle", "triton.experimental.tle.language",
+                     "triton.experimental.tle.language.gpu",
+                     "triton.experimental.tle.language.gpu.types")
+            modules = {}
+            for name in names:
+                module = types.ModuleType(name)
+                module.__path__ = []
+                modules[name] = module
+                sys.modules[name] = module
+            gpu = modules[names[2]]
+            modules[names[1]].gpu = gpu
+            for name in ("alloc", "alloc_barrier", "alloc_barriers", "barrier_wait",
+                         "copy", "local_ptr", "set_layout", "wgmma", "wgmma_wait"):
+                setattr(gpu, name, lambda *args, **kwargs: None)
+            modules[names[3]].BlockEncoding = lambda *args, **kwargs: None
+            if scenario == "missing_block_encoding":
+                del modules[names[3]].BlockEncoding
+            else:
+                del gpu.set_layout
+
+        api = importlib.import_module("flag_attn.forgetting_attention")
+        if scenario == "broken_import":
+            try:
+                api.has_tle()
+            except RuntimeError as error:
+                assert "sentinel broken TLE import" in str(error)
+            else:
+                raise AssertionError("unexpected import error was swallowed")
+            sys.exit(0)
+
+        assert not api.has_tle()
+        assert api.forgetting_attention is api.triton_forgetting_attention
+        assert "flag_attn.forgetting_attention.parallel" not in sys.modules
+        naive = importlib.import_module("flag_attn.forgetting_attention.naive")
+        calls = []
+        def reference(q, k, v, gate, scale, threshold):
+            # The new fast dispatcher preserves the original, unpadded GQA inputs.
+            assert q.shape == (1, 1, 4, 60)
+            assert k.shape == v.shape == (1, 63, 2, 60)
+            assert scale == 1 / math.sqrt(60)
+            assert threshold == -10.0
+            calls.append(True)
+            return q.clone()
+        naive._triton_forward = reference
+        with torch.inference_mode():
+            q = torch.randn(1, 1, 4, 60, device="cuda", dtype=torch.float16)
+            k = torch.randn(1, 63, 2, 60, device="cuda", dtype=q.dtype)
+            v = torch.randn_like(k)
+            gate = torch.zeros(1, 63, 4, device="cuda", dtype=torch.float32)
+            out = api.forgetting_attention(q, k, v, gate, adaptive_threshold=-10.0)
+            assert out.is_contiguous()
+            assert torch.equal(out, q)
+        assert calls == [True]
+        assert "flag_attn.forgetting_attention.parallel" not in sys.modules
+    """)
+    env = dict(os.environ)
+    env["ACP_IMPORT_SCENARIO"] = scenario
+    env["PYTHONPATH"] = os.pathsep.join(str(p) for p in sys.path)
+    result = subprocess.run([sys.executable, "-c", code], env=env,
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@torch.inference_mode()
+def test_triton_cached_launch_batch_grid_changes(dtype):
+    # Same specialization/chunk size, different launch grid: no stale batch dimension.
+    for batch in (2, 4, 2, 1, 4):
+        case = dict(B=batch, M=129, N=129, HQ=8, H=2, D=60, dtype=dtype, scale=0.125)
+        inputs = make_inputs(case, 17 + batch)
+        actual = call_triton(inputs, case)
+        assert_bitwise(actual, call_official(inputs, case))
+        assert actual.is_contiguous()
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("threshold", [0.0, -100000.0])
+@torch.inference_mode()
+def test_triton_threshold_extremes(dtype, threshold):
+    case = dict(B=2, M=65, N=129, HQ=4, H=2, D=60, dtype=dtype, scale=0.125)
+    inputs = make_inputs(case, 71)
+    assert_bitwise(call_triton(inputs, case, threshold),
+                   call_official(inputs, case, threshold))
+
+
+@pytest.mark.parametrize("d", [60, 100])
+@pytest.mark.parametrize("m", [1, 65])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@torch.inference_mode()
+def test_triton_retains_legacy_adapter(monkeypatch, d, m, dtype):
+    naive = importlib.import_module("flag_attn.forgetting_attention.naive")
+    monkeypatch.setattr(naive, "_plain_fast_supported", lambda n: False)
+    case = dict(B=2, M=m, N=129, HQ=4, H=2, D=d, dtype=dtype, scale=1 / math.sqrt(d))
+    inputs = make_inputs(case, 13)
+    assert_bitwise(triton_forgetting_attention(*inputs, adaptive_threshold=-10.0),
+                   call_official(inputs, case))
+
+
+@torch.inference_mode()
+def test_triton_legacy_adapter_propagates_failure(monkeypatch):
+    naive = importlib.import_module("flag_attn.forgetting_attention.naive")
+    monkeypatch.setattr(naive, "_plain_fast_supported", lambda n: False)
+    def fail(*args, **kwargs):
+        raise RuntimeError("sentinel legacy failure")
+    monkeypatch.setattr(naive, "forgetting_attention", fail)
+    with pytest.raises(RuntimeError, match="sentinel legacy failure"):
+        triton_forgetting_attention(*make_inputs(_reuse_case()), adaptive_threshold=-10.0)
+
+
+@torch.inference_mode()
+def test_triton_fast_path_uses_upstream_tma_and_wgmma():
+    naive = importlib.import_module("flag_attn.forgetting_attention.naive")
+    if not naive._plain_fast_supported(4096):
+        pytest.skip("upstream Triton 3.6 Hopper specialization unavailable")
+    case = next(c for c in CASES if c["id"] == "S024")
+    naive._plain_tma_launch.plans.clear()
+    inputs = make_inputs(case, 3)
+    assert_bitwise(call_triton(inputs, case), call_official(inputs, case))
+    ptx = naive._plain_tma_launch.last_compiled.asm["ptx"]
+    assert "cp.async.bulk.tensor" in ptx
+    assert "wgmma.mma_async" in ptx
+    assert "triton.experimental.tle" not in naive._plain_tma_attention.src
+
+
+@torch.inference_mode()
+def test_triton_debug_disables_compiled_launch_reuse(monkeypatch):
+    naive = importlib.import_module("flag_attn.forgetting_attention.naive")
+    case = _reuse_case()
+    inputs = make_inputs(case, 6)
+    assert_bitwise(call_triton(inputs, case), call_official(inputs, case))
+    launch = naive._plain_attn_launch
+    previous = dict(launch.plans)
+    monkeypatch.setattr(naive._plain_knobs.runtime, "debug", True)
+    assert_bitwise(call_triton(inputs, case), call_official(inputs, case))
+    assert launch.plans == previous
+
+
+@pytest.mark.parametrize("id", ["S001", "S003", "S006", "S007", "S011", "S024", "S031", "S034"])
+@requires_tle
+@torch.inference_mode()
+def test_hybrid_dispatch_matches_reported_backend(monkeypatch, id):
+    from flag_attn.forgetting_attention import parallel
+    case = next(c for c in CASES if c["id"] == id)
+    calls = []
+    original = parallel.triton_forgetting_attention
+    def tracked(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(parallel, "triton_forgetting_attention", tracked)
+    inputs = make_inputs(case, 19)
+    with parallel.capture() as records:
+        actual = call_optimized(inputs, case)
+    assert_bitwise(actual, call_official(inputs, case))
+    backend = parallel.h100_backend(case["B"], case["M"], case["N"], case["HQ"], case["D"])
+    if backend == "triton_h100_v1":
+        assert calls == [True]
+        assert not records, "plain route must not construct or launch TLE work"
+    else:
+        assert not calls
+        assert any("wgmma.mma_async" in r[1].asm["ptx"] for r in records)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("hq", [127, 128, 129])
+@requires_tle
+@torch.inference_mode()
+def test_hybrid_dispatch_boundary_and_mqa(dtype, hq):
+    from flag_attn.forgetting_attention.parallel import h100_backend
+    case = dict(B=1, M=2048, N=2048, HQ=hq, H=1, D=64,
+                dtype=dtype, scale=0.125)
+    expected_backend = "triton_h100_v1" if hq < 128 else "tle_tma_wgmma"
+    assert h100_backend(1, 2048, 2048, hq, 64) == expected_backend
+    inputs = make_inputs(case, 23)
+    expected = call_official(inputs, case)
+    assert_bitwise(call_optimized(inputs, case), expected)
+    assert_bitwise(call_optimized(inputs, case), expected)
+
+
+@pytest.mark.parametrize("m", [1, 65])
+@pytest.mark.parametrize("n", [8256, 8257])
+@requires_tle
+@torch.inference_mode()
+def test_hybrid_respects_plain_sequence_limit(m, n):
+    from flag_attn.forgetting_attention.parallel import h100_backend
+    case = dict(B=2, M=m, N=n, HQ=4, H=2, D=64, dtype="bfloat16", scale=0.125)
+    backend = h100_backend(2, m, n, 4, 64)
+    assert (backend == "triton_h100_v1") == (n <= 8256)
+    inputs = make_inputs(case, 29)
+    assert_bitwise(call_optimized(inputs, case), call_official(inputs, case))
+
+
+@pytest.mark.parametrize("d", [60, 100])
+@pytest.mark.parametrize("m", [1, 65])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@requires_tle
+@torch.inference_mode()
+def test_hybrid_default_scale_without_padding(d, m, dtype):
+    case = dict(B=2, M=m, N=129, HQ=4, H=2, D=d, dtype=dtype,
+                scale=1 / math.sqrt(d))
+    inputs = make_inputs(case, 31)
+    actual = optimized_entry()(*inputs, adaptive_threshold=-10.0)
+    assert actual.is_contiguous()
+    assert_bitwise(actual, call_official(inputs, case))
+
+
+@requires_tle
+@torch.inference_mode()
+def test_hybrid_does_not_swallow_plain_failure(monkeypatch):
+    from flag_attn.forgetting_attention import parallel
+    def fail(*args, **kwargs):
+        raise RuntimeError("sentinel hybrid dispatch failure")
+    monkeypatch.setattr(parallel, "triton_forgetting_attention", fail)
+    with pytest.raises(RuntimeError, match="sentinel hybrid dispatch failure"):
+        call_optimized(make_inputs(_reuse_case()), _reuse_case())
+
+
+@requires_tle
+@torch.inference_mode()
+def test_hybrid_large_nondefault_stream_and_lifetime():
+    case = next(c for c in CASES if c["id"] == "S007")
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        inputs = make_inputs(case, 33)
+        out = call_optimized(inputs, case)
+        assert_bitwise(out, call_official(inputs, case))
+    stream.synchronize()
+    refs = [weakref.ref(t) for t in (*inputs, out)]
+    del inputs, out
+    gc.collect()
+    assert all(ref() is None for ref in refs), "hybrid dispatch retains caller tensors"

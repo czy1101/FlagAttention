@@ -29,16 +29,25 @@ limitations under the License.
 # This forward-only extraction retains the original forward operations and
 # launch configuration. Backward and standalone upstream tests are excluded.
 import math
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from typing import Literal, Optional, Union
 
 import torch
 import triton
 import triton.language as tl
+
+# The optimized path is optional even without TLE: older Triton releases keep
+# the reference adapter rather than failing at package import.
+try:
+    from triton import knobs as _plain_knobs
+    from triton.runtime import jit as _plain_runtime_jit
+    from triton.tools.tensor_descriptor import TensorDescriptor as _PlainTensorDescriptor
+except ImportError:
+    _plain_knobs = _plain_runtime_jit = _PlainTensorDescriptor = None
 from einops import rearrange
 
 OFFICIAL_COMMIT = "883f260c636e87971339749b0d8310004794a5cc"
-__all__ = ["forgetting_attention"]
+__all__ = ["forgetting_attention", "triton_forgetting_attention"]
 
 def maybe_contiguous(x):
     # only when the inner most dimension is contiguous can LDGSTS be used
@@ -290,6 +299,59 @@ def forgetting_attention(
     if not head_first:
         out = rearrange(out, "b h t d -> b t h d")
     return out
+
+def triton_forgetting_attention(
+    q, k, v, log_fgate, *, head_first=False, seq_start=None,
+    sm_scale=None, adaptive_threshold=None,
+):
+    """No-TLE ACP inference, with an upstream-Triton fast path on Hopper.
+
+    H100/Triton 3.6 uses fused exact prefix/boundary preparation and direct GQA.
+    Multi-query D=60/100 is masked in-kernel instead of padding whole tensors.
+    Other devices/compiler versions and longer sequences retain the original
+    explicit padding/GQA adapter. The official reference is unchanged.
+    This is not a CPU or training fallback.
+    """
+    if head_first or seq_start is not None or not torch.is_inference_mode_enabled():
+        raise NotImplementedError("general profile supports BTHD inference without seq_start")
+    if q.ndim != 4 or k.ndim != 4 or v.shape != k.shape:
+        raise ValueError("require 4D Q/K/V and matching K/V shapes")
+    b, m, h, d = q.shape
+    n, hk = k.shape[1:3]
+    if (d not in (16, 32, 60, 64, 100, 128) or k.shape != (b, n, hk, d)
+            or hk <= 0 or h % hk):
+        raise NotImplementedError("require supported D and Q heads divisible by KV heads")
+    if not (0 < m <= n and b > 0 and h > 0):
+        raise ValueError("require 0 < M <= N and positive batch/heads")
+    if not (q.dtype in (torch.bfloat16, torch.float16) and q.is_cuda
+            and all(t.dtype == q.dtype and t.device == q.device and t.is_contiguous()
+                    and t.data_ptr() % 16 == 0 for t in (q, k, v))):
+        raise NotImplementedError("require contiguous, 16-byte-aligned CUDA BF16/FP16 inputs")
+    if (log_fgate.shape != (b, n, h) or log_fgate.dtype != torch.float32
+            or log_fgate.device != q.device or not log_fgate.is_contiguous()):
+        raise NotImplementedError("gate must be contiguous FP32 BNH")
+    if (not isinstance(adaptive_threshold, (int, float))
+            or not math.isfinite(adaptive_threshold) or adaptive_threshold > 0):
+        raise NotImplementedError("require a finite nonpositive scalar ACP threshold")
+    # Compute from the original D, before padding changes the reference's input.
+    scale = 1 / math.sqrt(d) if sm_scale is None else sm_scale
+    if not isinstance(scale, (int, float)) or not math.isfinite(scale):
+        raise ValueError("scale must be a finite scalar")
+    padded = triton.next_power_of_2(d)
+    with torch.cuda.device(q.device):
+        if _plain_fast_supported(n):
+            return _triton_forward(q, k, v, log_fgate, scale, float(adaptive_threshold))
+        if padded != d:
+            q, k, v = (torch.nn.functional.pad(t, (0, padded - d)) for t in (q, k, v))
+        groups = h // hk
+        if groups != 1:
+            k, v = (t.repeat_interleave(groups, dim=2) for t in (k, v))
+        out = forgetting_attention(
+            q, k, v, log_fgate, head_first=False, seq_start=None,
+            sm_scale=scale, adaptive_threshold=adaptive_threshold,
+        )
+        return out if padded == d else out[..., :d].contiguous()
+
 
 def get_fwd_config(B, H, M, N, D, causal):
     assert causal
@@ -567,3 +629,247 @@ def _find_start_index_kernel(
         tl.store(start_index_ptr, start_index.to(START_INDEX.dtype.element_ty))
         start_index_ptr += stride_start_index_mb
         log_lambda_out_ptr += stride_log_lambda_n * BLOCK_M
+
+
+# No-TLE Hopper specialization. All original reference kernels above are intact.
+
+def _plain_fast_supported(n):
+    # The tested specialization is deliberately bounded. Unsupported targets
+    # keep the existing reference adapter; no compilation errors are swallowed.
+    return (_plain_knobs is not None
+            and triton.__version__.startswith("3.6.")
+            and torch.cuda.get_device_capability() == (9, 0)
+            and n <= 8256)
+
+
+class _PlainLaunch:
+    """Cache code/launch metadata only. Pass current pointers on every call."""
+    def __init__(self, fn, limit=256):
+        self.fn, self.limit, self.plans = fn, limit, OrderedDict()
+        self.dist_context = getattr(_plain_runtime_jit, 'DistributedRtContext', None)
+
+    def __call__(self, key, grid, args, kwargs):
+        fn = self.fn
+        key = (key, tuple(grid), tuple(sorted(kwargs.items())))
+        allowed = (not fn.pre_run_hooks and not _plain_knobs.runtime.debug
+                   and not _plain_knobs.compilation.instrumentation_mode)
+        if self.dist_context is not None and self.dist_context().is_lite_mode:
+            allowed = False
+        plan = self.plans.get(key) if allowed else None
+        if plan is None:
+            compiled = fn[grid](*args, **kwargs)
+            self.last_compiled = compiled
+            if allowed:
+                self.plans[key] = compiled[tuple(grid) + (1,) * (3 - len(grid))]
+                if len(self.plans) > self.limit:
+                    self.plans.popitem(last=False)
+        else:
+            plan(*args)
+
+
+@triton.jit
+def _plain_add(a,b):
+    return tl.inline_asm_elementwise("add.rn.f32 $0, $1, $2;",constraints="=f,f,f",
+        args=[a,b],dtype=tl.float32,is_pure=True,pack=1)
+
+@triton.jit
+def _plain_prepare(X,L,S,THR, XB:tl.constexpr,XH:tl.constexpr,XT:tl.constexpr,
+                   H:tl.constexpr,N:tl.constexpr,
+                   C:tl.constexpr,LOGC:tl.constexpr,NQ:tl.constexpr,NK:tl.constexpr,M:tl.constexpr,
+                   BN:tl.constexpr,QM:tl.constexpr):
+    h=tl.program_id(0);b=tl.program_id(1)
+    i=tl.arange(0,C);qi=tl.arange(0,NQ);ki=tl.arange(0,NK)
+    anchor=tl.full((NQ,),0,tl.float32);ends=tl.full((NK,),0,tl.float32)
+    carry=tl.full((),0,tl.float32)
+    pos_q=N-M+qi*QM
+    pos_k=tl.minimum(ki*BN+BN-1,N-1)
+    for chunk in range(tl.cdiv(N,C)):
+        t=chunk*C+i
+        x=tl.load(X+b*XB+h*XH+t*XT,t<N,other=0)
+        x=tl.where(i==0,_plain_add(x,carry),x)
+        for m in tl.static_range(LOGC):
+            src=(i//(2<<m))*(2<<m)+(1<<m)-1
+            left=tl.gather(x,src,axis=0)
+            x=tl.where((i&(1<<m))!=0,_plain_add(x,left),x)
+        tl.store(L+(b*H+h)*N+t,x,t<N)
+        carry=tl.sum(tl.where(i==C-1,x,0),0)
+        av=tl.gather(x,pos_q%C,axis=0)
+        ev=tl.gather(x,pos_k%C,axis=0)
+        anchor=tl.where(pos_q//C==chunk,av,anchor)
+        ends=tl.where(pos_k//C==chunk,ev,ends)
+    threshold=THR
+    old=(ki[None,:]<tl.cdiv(N,BN))&((anchor[:,None]-ends[None,:])<threshold)
+    starts=tl.sum(old.to(tl.int32),1)*BN
+    tl.store(S+(b*H+h)*tl.cdiv(M,QM)+qi,starts,qi<tl.cdiv(M,QM))
+
+@triton.jit
+def _plain_starts(P, T, S, M:tl.constexpr,N:tl.constexpr,H:tl.constexpr,
+                    BN:tl.constexpr,QM:tl.constexpr,NK:tl.constexpr):
+    h,b,group=tl.program_id(0),tl.program_id(1),tl.program_id(2)
+    r=group*16+tl.arange(0,16)
+    j=tl.arange(0,NK)
+    pp=P+(b*H+h)*N
+    a=tl.load(pp+N-M+r*QM,r<tl.cdiv(M,QM),other=0)
+    end=tl.minimum(j*BN+BN-1,N-1)
+    e=tl.load(pp+end,j<tl.cdiv(N,BN),other=0)
+    threshold=T
+    old=(j[None,:]<tl.cdiv(N,BN))&((a[:,None]-e[None,:])<threshold)
+    starts=tl.sum(old.to(tl.int32),1)*BN
+    tl.store(S+(b*H+h)*tl.cdiv(M,QM)+r,starts,r<tl.cdiv(M,QM))
+
+
+@triton.jit
+def _plain_attention(Q, K, V, P, S, O, sm_scale,
+                     M: tl.constexpr, N: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
+                     REAL_D: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    h, b, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    hk = h // (H // HK)
+    rm = block * BM + tl.arange(0, BM)
+    rn = tl.arange(0, BN)
+    rd = tl.arange(0, D)
+    qptr = Q + (b * M * H + rm[:, None] * H + h) * REAL_D + rd[None, :]
+    q = tl.load(qptr, (rm[:, None] < M) & (rd[None, :] < REAL_D), other=0)
+    pp = P + (b * H + h) * N
+    gq = tl.load(pp + N - M + rm, rm < M, other=0)
+    lo = tl.load(S + (b * H + h) * tl.cdiv(M, 128) + block * BM // 128)
+    hi = tl.minimum(N, N - M + (block + 1) * BM)
+    mi = tl.full((BM,), -float("inf"), tl.float32)
+    li = tl.zeros((BM,), tl.float32)
+    acc = tl.zeros((BM, D), tl.float32)
+    log2e: tl.constexpr = 1.4426950408889634
+    scale = sm_scale * log2e
+    diagonal = ((N - M + block * BM + 1) // BN) * BN
+    for start in range(lo, hi, BN):
+        kn = start + rn
+        kp = K + (b * N * HK + kn[None, :] * HK + hk) * REAL_D + rd[:, None]
+        vp = V + (b * N * HK + kn[:, None] * HK + hk) * REAL_D + rd[None, :]
+        k = tl.load(kp, (kn[None, :] < N) & (rd[:, None] < REAL_D), other=0)
+        v = tl.load(vp, (kn[:, None] < N) & (rd[None, :] < REAL_D), other=0)
+        gk = tl.load(pp + kn, kn < N, other=0)
+        score = tl.dot(q, k, input_precision="ieee") * scale
+        score = tl.fma(gq[:, None] - gk[None, :], log2e, score)
+        score = tl.where(kn[None, :] < N, score, -float("inf"))
+        if start >= diagonal:
+            score = tl.where((N - M + rm[:, None]) >= kn[None, :], score, -float("inf"))
+        mnew = tl.maximum(mi, tl.max(score, 1))
+        alpha = tl.exp2(mi - mnew)
+        prob = tl.exp2(score - mnew[:, None])
+        psum = tl.sum(prob, 1)
+        acc = acc * alpha[:, None]
+        acc = tl.dot(prob.to(Q.dtype.element_ty), v, acc, input_precision="ieee")
+        li = li * alpha + psum
+        mi = mnew
+    out = (acc * (1.0 / li[:, None])).to(Q.dtype.element_ty)
+    op = O + (b * M * H + rm[:, None] * H + h) * REAL_D + rd[None, :]
+    tl.store(op, out, (rm[:, None] < M) & (rd[None, :] < REAL_D))
+
+
+@triton.jit
+def _plain_tma_attention(Q, K, V, P, S, O, sm_scale,
+                     M: tl.constexpr, N: tl.constexpr, H: tl.constexpr, HK: tl.constexpr,
+                     REAL_D: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    h, b, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    hk = h // (H // HK)
+    rm = block * BM + tl.arange(0, BM)
+    rn = tl.arange(0, BN)
+    rd = tl.arange(0, D)
+    q = Q.load([b * M + block * BM, h * D])
+    pp = P + (b * H + h) * N
+    gq = tl.load(pp + N - M + rm, rm < M, other=0)
+    lo = tl.load(S + (b * H + h) * tl.cdiv(M, 128) + block * BM // 128)
+    hi = tl.minimum(N, N - M + (block + 1) * BM)
+    mi = tl.full((BM,), -float("inf"), tl.float32)
+    li = tl.zeros((BM,), tl.float32)
+    acc = tl.zeros((BM, D), tl.float32)
+    log2e: tl.constexpr = 1.4426950408889634
+    scale = sm_scale * log2e
+    diagonal = ((N - M + block * BM + 1) // BN) * BN
+    for start in range(lo, hi, BN):
+        kn = start + rn
+        k = K.load([b * N + start, hk * D]).T
+        v = V.load([b * N + start, hk * D])
+        gk = tl.load(pp + kn, kn < N, other=0)
+        score = tl.dot(q, k, input_precision="ieee") * scale
+        score = tl.fma(gq[:, None] - gk[None, :], log2e, score)
+        score = tl.where(kn[None, :] < N, score, -float("inf"))
+        if start >= diagonal:
+            score = tl.where((N - M + rm[:, None]) >= kn[None, :], score, -float("inf"))
+        mnew = tl.maximum(mi, tl.max(score, 1))
+        alpha = tl.exp2(mi - mnew)
+        prob = tl.exp2(score - mnew[:, None])
+        psum = tl.sum(prob, 1)
+        acc = acc * alpha[:, None]
+        acc = tl.dot(prob.to(O.dtype.element_ty), v, acc, input_precision="ieee")
+        li = li * alpha + psum
+        mi = mnew
+    out = (acc * (1.0 / li[:, None])).to(O.dtype.element_ty)
+    op = O + (b * M * H + rm[:, None] * H + h) * REAL_D + rd[None, :]
+    tl.store(op, out, (rm[:, None] < M) & (rd[None, :] < REAL_D))
+
+
+_plain_prep_launch = _PlainLaunch(_plain_prepare)
+_plain_starts_launch = _PlainLaunch(_plain_starts)
+_plain_attn_launch = _PlainLaunch(_plain_attention)
+_plain_decode_launch = _PlainLaunch(_fwd_kernel)
+_plain_tma_launch = _PlainLaunch(_plain_tma_attention)
+
+def _plain_config(b, m, h, real_d):
+    if _PlainTensorDescriptor is not None and real_d == 128 and b * m * h >= 131072:
+        return 64, 4, 1, True
+    if real_d <= 64 and m >= 1024 and b * h >= 64:
+        return 128, 4, 3, False
+    return 64, 4, 1, False
+
+
+def _triton_forward(q, k, v, gate, scale, threshold):
+    b, m, h, real_d = q.shape
+    n, hk = k.shape[1:3]
+    d = triton.next_power_of_2(real_d)
+    bn = min(128, max(16, triton.next_power_of_2(n))) if m == 1 else (64 if d <= 64 else 128)
+    qm = 1 if m == 1 else 128
+    nq, nk = triton.cdiv(m, qm), triton.cdiv(n, bn)
+    starts = torch.empty((b, h, nq), device=q.device, dtype=torch.int32)
+    if b * h > 1 and torch.__version__.startswith("2.10."):
+        prefix = torch.empty((b, h, n), device=q.device, dtype=torch.float32)
+        ln, lr = (n-1).bit_length(), (b*h-1).bit_length()
+        chunk = 2 * (1 << min(9, max(4, (9 + ln - lr) // 2)))
+        args = (gate, prefix, starts, float(threshold),
+                n*h, 1, h, h, n, chunk, chunk.bit_length()-1,
+                triton.next_power_of_2(nq), triton.next_power_of_2(nk), m, bn, qm)
+        key = (q.device.index, gate.data_ptr() % 16, args[4:])
+        _plain_prep_launch(key, (h, b), args, dict(num_warps=4))
+    else:
+        prefix = torch.cumsum(gate.transpose(1, 2), -1, dtype=torch.float32)
+        args = (prefix, float(threshold), starts, m, n, h, bn, qm, triton.next_power_of_2(nk))
+        _plain_starts_launch((q.device.index, b, args[3:]), (h, b, triton.cdiv(nq, 16)),
+                             args, dict(num_warps=4))
+    out = torch.empty_like(q)
+    key = (q.device.index, q.dtype, b, m, n, h, hk, real_d, type(scale), float(scale))
+    if m > 1:
+        bm, warps, stages, tma = _plain_config(b, m, h, real_d)
+        if tma and real_d == d:
+            qd = _PlainTensorDescriptor(q, [b*m, h*d], [h*d, 1], [bm, d])
+            kd = _PlainTensorDescriptor(k, [b*n, hk*d], [hk*d, 1], [bn, d])
+            vd = _PlainTensorDescriptor(v, [b*n, hk*d], [hk*d, 1], [bn, d])
+            args = (qd, kd, vd, prefix, starts, out, scale, m, n, h, hk, real_d, d, bm, bn)
+            launch = _plain_tma_launch
+        else:
+            args = (q, k, v, prefix, starts, out, scale, m, n, h, hk, real_d, d, bm, bn)
+            launch = _plain_attn_launch
+        launch(key, (h, b, triton.cdiv(m, bm)), args,
+               dict(num_warps=warps, num_stages=stages))
+    else:
+        if real_d != d:
+            q, k, v = (torch.nn.functional.pad(t, (0, d-real_d)) for t in (q, k, v))
+            out = torch.empty((b, m, h, d), device=q.device, dtype=q.dtype)
+        norm = torch.empty((b, h, m), device=q.device, dtype=torch.float32)
+        args = (q, k, v, prefix, starts, starts, scale, norm, out,
+                m*h*d, d, h*d, 1, n*hk*d, d, hk*d, 1, n*hk*d, d, hk*d, 1,
+                h*n, n, 1, h*nq, nq, 1, m*h*d, d, h*d, 1,
+                b, h, m, n, n-m, h//hk, 1, d, bn, True, False, False, True,
+                True, n % bn == 0)
+        _plain_decode_launch(key, (1, h, b), args, dict(num_warps=4, num_stages=1))
+        if real_d != d:
+            out = out[..., :real_d].contiguous()
+    return out
+

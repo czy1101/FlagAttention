@@ -1,4 +1,4 @@
-"""Official ACP vs V7.6 TLE. Full-call CUDA Event latency, never CUDA Graph.
+"""Official ACP vs V7.7 TLE-enabled hybrid / plain Triton fallback. Full-call CUDA Event latency, never CUDA Graph.
 
 Supports pytest discovery and direct CLI execution. Latencies are in ms.
 Run this file with --full for all 90 shapes, or --ids S011,S024 for a subset.
@@ -30,10 +30,25 @@ from test_forgetting_attention import (
 )
 
 CUDA_SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
-pytestmark = [
-    pytest.mark.skipif(not CUDA_SM90, reason="ACP benchmark requires Hopper SM90 CUDA"),
-    pytest.mark.skipif(not has_tle(), reason="ACP benchmark requires Triton 3.6 TLE"),
-]
+pytestmark = pytest.mark.skipif(
+    not CUDA_SM90, reason="this ACP benchmark profile requires Hopper SM90"
+)
+
+
+def candidate_name():
+    if has_tle():
+        return "tle_h100_v77_hybrid"
+    from flag_attn.forgetting_attention.naive import _plain_fast_supported
+    return "triton_h100_v1" if CUDA_SM90 and _plain_fast_supported(8193) else "triton_fallback"
+
+
+def candidate_backend(case):
+    """Record actual execution, not just availability of the optional compiler."""
+    if has_tle():
+        from flag_attn.forgetting_attention.parallel import h100_backend
+        return h100_backend(case["B"], case["M"], case["N"], case["HQ"], case["D"])
+    from flag_attn.forgetting_attention.naive import _plain_fast_supported
+    return "triton_h100_v1" if _plain_fast_supported(case["N"]) else "triton_fallback"
 
 
 def event_samples(fn, warmup, rep):
@@ -66,8 +81,9 @@ def benchmark_case(case, warmup=40, rep=400, rounds=3, seed=0):
     assert_bitwise(call_optimized(inputs, case), expected)
     assert_bitwise(call_optimized(inputs, case), expected)
     del expected
+    name = candidate_name()
     providers = {"official": lambda: call_official(inputs, case),
-                 "tle_v76": lambda: call_optimized(inputs, case)}
+                 name: lambda: call_optimized(inputs, case)}
     measurements = []
     for index in range(rounds):
         order = list(providers)
@@ -79,10 +95,12 @@ def benchmark_case(case, warmup=40, rep=400, rounds=3, seed=0):
             result[name] = {"median_ms": statistics.median(values), "samples_ms": values}
         measurements.append(result)
     baseline = statistics.median(r["official"]["median_ms"] for r in measurements)
-    candidate = statistics.median(r["tle_v76"]["median_ms"] for r in measurements)
+    candidate = statistics.median(r[candidate_name()]["median_ms"] for r in measurements)
     return {"case": case, "baseline": "official_acp" if case["reference_kind"] == "native" else "official_acp_adapted",
             "latency_base": baseline, "latency": candidate, "speedup": baseline / candidate,
-            "accuracy": "bitwise_pass", "rounds": measurements}
+            "accuracy": "bitwise_pass", "candidate_source": candidate_name(),
+            "candidate_backend": candidate_backend(case),
+            "rounds": measurements}
 
 
 def print_row(row):
@@ -99,7 +117,9 @@ def detail_for(row):
                                          {"scale": case["scale"], "threshold": -10.0,
                                           "baseline_kind": row["baseline"]}],
                         "latency_base": row["latency_base"], "latency": row["latency"],
-                        "speedup": row["speedup"], "accuracy": row["accuracy"]}]}
+                        "speedup": row["speedup"], "accuracy": row["accuracy"],
+                        "candidate_source": row["candidate_source"],
+                        "candidate_backend": row["candidate_backend"]}]}
 
 
 @pytest.mark.parametrize("case", DEFAULT_CASES, ids=case_id)
@@ -128,8 +148,8 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, help="optional detailed JSON, refuses overwrite")
     args = parser.parse_args(argv)
-    if not CUDA_SM90 or not has_tle():
-        parser.error("Hopper SM90 CUDA and compatible Triton 3.6 TLE are required")
+    if not CUDA_SM90:
+        parser.error("this benchmark profile requires Hopper SM90 CUDA; TLE is optional")
     if args.output and args.output.exists():
         parser.error(f"refusing overwrite: {args.output}")
     cases = CASES if args.full or args.ids else DEFAULT_CASES
@@ -143,7 +163,7 @@ def main(argv=None):
         cases = [c for c in cases if c["dtype"] == args.dtype]
     if not cases:
         parser.error("no matching cases")
-    payload = {"implementation": "V7.6 TLE", "timer": "full_operator_cuda_event",
+    payload = {"implementation": candidate_name(), "timer": "full_operator_cuda_event",
                "graph_used": False, "official_commit": OFFICIAL_COMMIT,
                "torch": torch.__version__, "triton": triton.__version__,
                "triton_path": triton.__file__, "python": sys.executable,
@@ -152,7 +172,7 @@ def main(argv=None):
                "warmup": args.warmup, "rep": args.rep, "rounds": args.rounds,
                "complete": False, "rows": []}
     print(json.dumps({k: v for k, v in payload.items() if k != "rows"}))
-    print("ID    B,M,N,Hq,Hkv,D                dtype     ref     official_ms     tle_ms  speedup")
+    print("ID    B,M,N,Hq,Hkv,D                dtype     ref     official_ms candidate_ms  speedup")
     for case in cases:
         row = benchmark_case(case, args.warmup, args.rep, args.rounds, args.seed)
         payload["rows"].append(row)
