@@ -206,13 +206,6 @@ def _require_cuda() -> None:
         raise RuntimeError("This benchmark requires an available accelerator.")
 
 
-def _supports_fp8() -> bool:
-    if FP8_DTYPE is None or not (test_backend.supports_operator("minimax_m3_sparse_attn") or test_backend.supports_operator("minimax_m3_sparse_attn_decode")):
-        return False
-    # NVIDIA FP8 Tensor Core support starts with Ada (8.9) and Hopper (9.0).
-    return not test_backend.is_nvidia() or test_backend.cuda_capability() >= (8, 9)
-
-
 def _encode_fp8(value: torch.Tensor, scale: float) -> torch.Tensor:
     if FP8_DTYPE is None:
         raise RuntimeError("This PyTorch build does not provide float8_e4m3fn.")
@@ -756,7 +749,6 @@ def _bench_steps(
     }
 
 
-
 def _parse_shape(value: str) -> tuple[int, int, int, int]:
     try:
         shape = tuple(int(item) for item in value.split(","))
@@ -776,7 +768,6 @@ def _parse_shape(value: str) -> tuple[int, int, int, int]:
 def _get_shapes(args: MSABenchmarkArgs) -> list[tuple[int, int, int, int, int]]:
     shapes = DECODE_SHAPES if args.decode else PREFILL_SHAPES
     return [(b, args.decode_qlen if args.decode else q, seq, kh, h) for b, q, seq, kh, h in shapes]
-
 
 
 def _format_columns(columns: list[tuple[str, int]]) -> str:
@@ -1008,10 +999,6 @@ def _run_dtype(
     recorder.record()
 
 
-
-
-
-
 def _selected_modes(stage: str) -> tuple[bool, ...]:
     if stage == "all": return (False, True)
     if stage == "prefill": return (False,)
@@ -1038,13 +1025,13 @@ def run_benchmark(
     modes = _selected_modes(args.stage)
     if args.dtype not in {"all", "both", "bf16", "fp8"}:
         raise ValueError("MSA supports dtype all, bf16 or fp8")
-    if args.dtype in {"fp8", "both", "all"} and not _supports_fp8():
-        print("[FP8] skipped: this GPU or PyTorch build does not support FP8")
-    if args.dtype == "fp8" and not _supports_fp8():
+    if args.dtype in {"fp8", "both", "all"} and not test_backend.supports_msa_fp8():
+        print("[FP8] skipped: this MSA backend or PyTorch build does not support FP8 inputs")
+    if args.dtype == "fp8" and not test_backend.supports_msa_fp8():
         return
     dtypes = (
         ("bf16", "fp8")
-        if args.dtype in {"all", "both"} and _supports_fp8()
+        if args.dtype in {"all", "both"} and test_backend.supports_msa_fp8()
         else ("bf16",) if args.dtype in {"all", "both"} else (args.dtype,)
     )
 

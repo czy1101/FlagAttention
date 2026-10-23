@@ -32,7 +32,7 @@ import triton
 import triton.language as tl
 from triton.errors import TritonError
 
-from ..utils import current_platform, has_triton_tle, round_up
+from flag_attn.runtime.backend._hygon.utils import current_platform, has_triton_tle, round_up
 
 if has_triton_tle(3, 6, 0):
     try:
@@ -128,7 +128,6 @@ def _index_block_score_kernel(
     stride_bt_b,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
-    BLOCKS_PER_CHUNK: tl.constexpr,
 ):
     pid_q = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -160,14 +159,7 @@ def _index_block_score_kernel(
     bt_row = block_table_ptr + pid_b * stride_bt_b
     # Causal window: only blocks up to the last query token's position.
     hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
-    lo = 0
-    if BLOCKS_PER_CHUNK > 0:
-        # Independent score columns need no reduction between programs.
-        # Split page ranges to avoid serializing a long context in a tiny
-        # query grid. Every chunk retains the original causal bound.
-        lo = tl.program_id(2) * BLOCKS_PER_CHUNK * BLOCK_SIZE_K
-        hi = tl.minimum(hi, lo + BLOCKS_PER_CHUNK * BLOCK_SIZE_K)
-    for i in tl.range(lo, hi, BLOCK_SIZE_K):
+    for i in tl.range(0, hi, BLOCK_SIZE_K):
         blk = i // BLOCK_SIZE_K
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = i + off_k
@@ -727,15 +719,7 @@ def _decode_index_score_kernel(
     num_kv_chunks,
     USE_PDL: tl.constexpr,
 ):
-    FP8_INDEX: tl.constexpr = (
-        q_ptr.dtype.element_ty.is_fp8() and ik_cache_ptr.dtype.element_ty.is_fp8()
-    )
-    # A narrow FP32 dot scalarizes on gfx936. FP8 values are exactly
-    # representable in BF16; pad the column tile to a legal MMAC width.
-    BLOCK_SIZE_HQ: tl.constexpr = (
-        max(16, triton.next_power_of_2(num_idx_heads * BLOCK_SIZE_Q))
-        if FP8_INDEX else num_idx_heads * BLOCK_SIZE_Q
-    )
+    BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
     hq_offsets = tl.arange(0, BLOCK_SIZE_HQ)
@@ -777,10 +761,7 @@ def _decode_index_score_kernel(
         mask=q_mask[None, :],
         other=0.0,
     )  # [D,HQ]
-    if FP8_INDEX:
-        q = q.to(tl.bfloat16)
-    else:
-        q = q.to(tl.float32)
+    q = q.to(tl.float32)
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
@@ -794,13 +775,8 @@ def _decode_index_score_kernel(
             + off_k[:, None] * stride_ik_pos
             + off_d * stride_ik_d,
         )  # [N,D]
-        if FP8_INDEX:
-            k = k.to(tl.bfloat16)
-        else:
-            k = k.to(tl.float32)
-        # fp32 accumulation is required for the fp8 (e4m3) index cache: q/k are
-        # loaded in their stored dtype (bf16 or e4m3) and the MMA accumulates in
-        # fp32 so the per-block max score is exact for the fp8 indexer too.
+        k = k.to(tl.float32)
+        # Preserve FP32 index-score computation and accumulation.
         kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
         kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [HQ]
@@ -1142,18 +1118,7 @@ def minimax_m3_index_score(
     )
     BLOCK_SIZE_Q = 64
     query_programs = triton.cdiv(max_query_len, BLOCK_SIZE_Q)
-    fp8_index = idx_q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    num_chunks = 1
-    blocks_per_chunk = 0
-    if fp8_index and max_block > 0:
-        # Bound extra parallelism by both available pages and the existing
-        # query grid. This is a resource heuristic, not a sequence threshold.
-        num_chunks = min(
-            max_block,
-            max(1, triton.cdiv(256, max(1, query_programs * batch * num_idx_heads))),
-        )
-        blocks_per_chunk = triton.cdiv(max_block, num_chunks)
-    grid_score = (query_programs, batch * num_idx_heads, num_chunks)
+    grid_score = (query_programs, batch * num_idx_heads)
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -1176,7 +1141,6 @@ def minimax_m3_index_score(
         block_table.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        BLOCKS_PER_CHUNK=blocks_per_chunk,
     )
     return score
 
