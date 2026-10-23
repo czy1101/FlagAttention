@@ -27,7 +27,6 @@ disabled (score-only indexer), single shared index head. The selected block ids
 feed the block-sparse attention kernels in ``sparse_attn``.
 """
 
-from functools import lru_cache
 
 import torch
 import triton
@@ -1098,7 +1097,6 @@ def _topk_index_merge_kernel(
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
-@lru_cache(maxsize=None)
 def _index_score_compute_units(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
