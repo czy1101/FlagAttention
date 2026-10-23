@@ -27,6 +27,8 @@ disabled (score-only indexer), single shared index head. The selected block ids
 feed the block-sparse attention kernels in ``sparse_attn``.
 """
 
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
@@ -128,6 +130,7 @@ def _index_block_score_kernel(
     stride_bt_b,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    NUM_KV_SPLITS: tl.constexpr = 1,
 ):
     pid_q = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -159,7 +162,10 @@ def _index_block_score_kernel(
     bt_row = block_table_ptr + pid_b * stride_bt_b
     # Causal window: only blocks up to the last query token's position.
     hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
-    for i in tl.range(0, hi, BLOCK_SIZE_K):
+    # Pages have independent outputs: partition without a reduction/merge.
+    for i in tl.range(
+        tl.program_id(2) * BLOCK_SIZE_K, hi, BLOCK_SIZE_K * NUM_KV_SPLITS
+    ):
         blk = i // BLOCK_SIZE_K
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = i + off_k
@@ -1092,6 +1098,11 @@ def _topk_index_merge_kernel(
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
+@lru_cache(maxsize=None)
+def _index_score_compute_units(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
 @torch.no_grad()
 def minimax_m3_index_score(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
@@ -1129,7 +1140,17 @@ def minimax_m3_index_score(
         device=idx_q.device,
     )
     BLOCK_SIZE_Q = 64
-    grid_score = (triton.cdiv(max_query_len, BLOCK_SIZE_Q), batch * num_idx_heads)
+    query_tiles = triton.cdiv(max_query_len, BLOCK_SIZE_Q)
+    device_index = idx_q.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    # Fill several waves on the PPU when queries alone expose little work.
+    # Bounds depend on hardware capacity and available pages, not workload IDs.
+    programs = max(1, query_tiles * batch * num_idx_heads)
+    kv_splits = min(max(1, max_block), max(
+        1, triton.cdiv(4 * _index_score_compute_units(device_index), programs)
+    ))
+    grid_score = (query_tiles, batch * num_idx_heads, kv_splits)
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -1152,6 +1173,7 @@ def minimax_m3_index_score(
         block_table.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        NUM_KV_SPLITS=kv_splits,
     )
     return score
 
