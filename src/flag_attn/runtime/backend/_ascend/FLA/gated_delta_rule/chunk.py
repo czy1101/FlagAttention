@@ -5,7 +5,7 @@
 
 Three paths:
 
-* **fused path** (bf16, ``K <= 128``, ``V <= 128``, default chunk 64): three
+* **fused path** (bf16/fp16, ``K <= 128``, ``V <= 128``, default chunk 64): three
   Triton launches -- ``cumsum(+fp32 beta)`` -> ``prep_w_u`` -> ``fwd_h_o``.
   ``fused_ascend.py`` merges the KKT/Newton inverse with ``recompute_w_u``
   (``A_inv`` never hits GM) and the state scan with the output stage (``h`` and
@@ -16,7 +16,7 @@ Three paths:
 * **staged fast path**: the same math in five Ascend kernels
   (``wy_fast_ascend.py``, ``fwd_h_ascend.py``, ``chunk_o_ascend.py``), kept for
   A/B and as a fallback.
-* **fallback path** (fp16, ``K``/``V`` > 128, or
+* **fallback path** (``K``/``V`` > 128, or
   ``FLAG_ATTN_ASCEND_GDN_FAST=0``): the previous implementation -- ``kkt.py``
   prep plus the generic ``wy_fast``/``chunk_delta_h``/``chunk_o`` kernels at
   ``BT=32``, so fp16 and K=256 keep working.
@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 
 import torch
+import triton
 
 from flag_attn.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from flag_attn.FLA.index import prepare_chunk_indices
@@ -86,11 +87,16 @@ def _use_fast_path(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
     # The fused fold kernel tiles v_beta with the K slice, so it requires
     # K == V; other widths use the staged fast path.
     return (
-        q.dtype == torch.bfloat16
+        q.dtype in (torch.bfloat16, torch.float16)
         and k.shape[-1] <= 128
         and v.shape[-1] <= 128
         and k.shape[-1] == v.shape[-1]
     )
+
+
+def _ascend_wu_tile(dim: int) -> int:
+    """Return a dot-compatible power-of-two tile, capped at 128."""
+    return min(128, max(16, 1 << (dim - 1).bit_length()))
 
 
 def _fwd_legacy(q, k, v, g, beta, scale, initial_state, output_final_state,
@@ -105,16 +111,42 @@ def _fwd_legacy(q, k, v, g, beta, scale, initial_state, output_final_state,
     )
     block_v = 128 if v.shape[-1] == 128 else 64
     pipe_stages = 5 if v.shape[-1] >= 256 else (3 if v.shape[-1] == 128 else 2)
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g_cum,
-        cu_seqlens=cu_seqlens,
-        block_v=block_v,
-        pipe_stages=pipe_stages,
+    wu_ascend = (
+        q.dtype in (torch.bfloat16, torch.float16)
+        and max(k.shape[-1], v.shape[-1]) > 128
+        and k.shape[-1] in (64, 128, 256)
+        and 0 < v.shape[-1] <= 256
     )
+    if wu_ascend:
+        # This only replaces legacy W/U with an API key width accepted by the
+        # full-K prep dot and dimensions <=256. The kernel supports fixed and
+        # packed-varlen W/U (including chunk-index
+        # lookup) and independent K/V tails; round each tile up to a valid
+        # power of two (capped at 128) so e.g. V=192 uses masked 128-wide
+        # tiles.  The <=128 bf16 fused path never reaches here.
+        w, u = recompute_w_u_fwd_ascend(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g_cumsum=g_cum,
+            cu_seqlens=cu_seqlens,
+            bk=_ascend_wu_tile(k.shape[-1]),
+            bv=_ascend_wu_tile(v.shape[-1]),
+            num_warps=4,
+            num_stages=2,
+        )
+    else:
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g_cumsum=g_cum,
+            cu_seqlens=cu_seqlens,
+            block_v=block_v,
+            pipe_stages=pipe_stages,
+        )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -125,16 +157,50 @@ def _fwd_legacy(q, k, v, g, beta, scale, initial_state, output_final_state,
         chunk_size=bt,
         cu_seqlens=cu_seqlens,
     )
-    o = chunk_fwd_o(
-        q=q,
-        k=k,
-        v=v_new,
-        h=h,
-        g=g_cum,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=bt,
+    output_bv = min(128, max(16, triton.next_power_of_2(v.shape[-1])))
+    fixed_output_supported = (
+        q.dtype in (torch.bfloat16, torch.float16)
+        and k.shape[-1] in (64, 128, 256)
+        and 0 < v.shape[-1] <= 256
+        and cu_seqlens is None
     )
+    # Use the measured one-warp output kernel for fixed-length FP16 shapes in
+    # this supported width range.  Besides staying within ACL's coreDim limit
+    # on large grids, this avoids the generic autotuner's much slower output
+    # configs (the B8/T1024/H8/K=V=64 FP16 output stage is ~19% faster here).
+    # Keep the established K=V=256 bf16 route as well.
+    needs_fixed_output = q.dtype == torch.float16 or (
+        k.shape[-1] == 256 and v.shape[-1] == 256
+    )
+    if fixed_output_supported and needs_fixed_output:
+        # The fixed-config output kernel bounds each launch to the ACL budget;
+        # oversized supported grids are covered by multiple offset flat-PID
+        # launches.  A single full-K dot avoids the generic loop-carried fp32
+        # dot accumulator, while V is split into 128-wide tiles.  All
+        # preceding legacy stages remain unchanged.
+        o = chunk_fwd_o_ascend(
+            q=q,
+            k=k,
+            v=v_new,
+            h=h,
+            g=g_cum,
+            scale=scale,
+            cu_seqlens=None,
+            chunk_size=bt,
+            bv=output_bv,
+            num_warps=1,
+        )
+    else:
+        o = chunk_fwd_o(
+            q=q,
+            k=k,
+            v=v_new,
+            h=h,
+            g=g_cum,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=bt,
+        )
     return g_cum, o, A, final_state
 
 
@@ -147,7 +213,9 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
         # 3 launches: vector folds -> cube-only prep (KKT/Newton+w/u+A) ->
         # state scan + output.
         g_cum, qe, ke, kr, vb = fold_ascend(g, q, k, v, beta, cu_seqlens, bt)
-        w, u, a_masked = prep_w_u_ascend(qe, ke, kr, vb, cu_seqlens, bt)
+        w, u, a_masked = prep_w_u_ascend(
+            qe, ke, kr, vb, cu_seqlens, bt, output_dtype=q.dtype
+        )
         # Optional exact two-pass state scan (pass1 chunk-parallel affine
         # precompute, pass2 with two dots per chunk; see _affine_kernel in
         # fused_ascend.py).  Measured: fwd_h_o device 0.256 -> 0.170 ms at

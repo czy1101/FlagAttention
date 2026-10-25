@@ -6,8 +6,9 @@
 The pipeline is three Triton launches:
 
 1. ``fold`` (grid ``(chunks, B*H)``) -- a **vector-only** kernel: chunk-local
-   cumsum (fp32), then all per-token decay/beta folds written out as bf16
-   tensors: ``q_e = q*exp(g)``, ``k_e = k*beta*exp(g)``, ``k_r = k*exp(-g)``,
+   cumsum (fp32), then all per-token decay/beta folds written out in the
+   input dtype (FP32 for FP16 inputs): ``q_e = q*exp(g)``,
+   ``k_e = k*beta*exp(g)``, ``k_r = k*exp(-g)``,
    ``v_beta = v*beta``, ``k_s = k*exp(G-g)`` (``G`` = chunk-total log decay, so
    the state recurrence becomes ``h <- exp(G) h + k_s @ v_new`` with no
    per-token decay in the sequential loop).  No ``tl.dot`` in this kernel.
@@ -413,8 +414,7 @@ def _fold_gather_kernel(
                 (1, 0),
             ),
             boundary_check=(0, 1),
-        )
-        * b_e,
+        ) * b_e,
         boundary_check=(0, 1),
     )
     # The fast path requires K == V, so this K slice is the same V slice.
@@ -437,8 +437,7 @@ def _fold_gather_kernel(
                 (1, 0),
             ),
             boundary_check=(0, 1),
-        )
-        * b_beta,
+        ) * b_beta,
         boundary_check=(0, 1),
     )
 
@@ -726,10 +725,15 @@ def _affine_kernel(
     b_kr = tl.load(p_kr, boundary_check=(0, 1))
     cbase_v = ((i_b * NT + i_t) * H + i_h) * K * V
     p_cu = tl.make_block_ptr(cu + cbase_v, (K, V), (V, 1), (0, 0), (K, V), (1, 0))
-    tl.store(p_cu, tl.dot(b_kr, b_u).to(p_cu.dtype.element_ty))
+    # Decay factors can be kept in fp32 for FP16 inputs to avoid overflow and
+    # underflow in the folded operands. Match the dot operand types here; for
+    # BF16 inputs this cast is a no-op.
+    b_u_state = b_u.to(b_kr.dtype)
+    b_w_state = b_w.to(b_kr.dtype)
+    tl.store(p_cu, tl.dot(b_kr, b_u_state).to(p_cu.dtype.element_ty))
     cbase_m = ((i_b * NT + i_t) * H + i_h) * K * K
     p_mw = tl.make_block_ptr(mw + cbase_m, (K, K), (K, 1), (0, 0), (K, K), (1, 0))
-    tl.store(p_mw, tl.dot(b_kr, b_w).to(p_mw.dtype.element_ty))
+    tl.store(p_mw, tl.dot(b_kr, b_w_state).to(p_mw.dtype.element_ty))
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -872,16 +876,17 @@ def _fast_scratch(B, T, H, K, V, BT, dtype, device) -> dict:
         torch.npu.synchronize()
         _scratch.popitem(last=False)
     fp = torch.float32
+    fold_dtype = torch.float32 if dtype == torch.float16 else dtype
     ent = {
         "g_cum": torch.empty(B, T, H, dtype=fp, device=device),
         "e1": torch.empty(B, T, H, dtype=fp, device=device),
         "r1": torch.empty(B, T, H, dtype=fp, device=device),
         "b1": torch.empty(B, T, H, dtype=fp, device=device),
         "be1": torch.empty(B, T, H, dtype=fp, device=device),
-        "qe": torch.empty(B, T, H, K, dtype=dtype, device=device),
-        "ke": torch.empty(B, T, H, K, dtype=dtype, device=device),
-        "vb": torch.empty(B, T, H, V, dtype=dtype, device=device),
-        "kr": torch.empty(B, T, H, K, dtype=dtype, device=device),
+        "qe": torch.empty(B, T, H, K, dtype=fold_dtype, device=device),
+        "ke": torch.empty(B, T, H, K, dtype=fold_dtype, device=device),
+        "vb": torch.empty(B, T, H, V, dtype=fold_dtype, device=device),
+        "kr": torch.empty(B, T, H, K, dtype=fold_dtype, device=device),
         "w": torch.empty(B, T, H, K, dtype=dtype, device=device),
         "u": torch.empty(B, T, H, V, dtype=dtype, device=device),
         "a": torch.empty(B, T, H, BT, dtype=dtype, device=device),
@@ -921,7 +926,7 @@ def fold_ascend(
     chunk_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor]:
-    """Return ``(g_cum, q_e, k_e, k_r, v_beta)`` (all bf16 but g_cum).
+    """Return ``(g_cum, q_e, k_e, k_r, v_beta)``.
 
     Fixed-length inputs take the torch/CANN elementwise fold; varlen inputs use
     the two Triton vector kernels (``_factor_kernel`` + ``_fold_kernel``).
@@ -939,12 +944,17 @@ def fold_ascend(
         qe, ke, kr, vb = buf["qe"], buf["ke"], buf["kr"], buf["vb"]
     else:
         g_cum = torch.empty(B, T, H, dtype=torch.float32, device=g.device)
-        qe = q.new_empty(B, T, H, K)
-        ke = q.new_empty(B, T, H, K)
-        kr = q.new_empty(B, T, H, K)
-        vb = v.new_empty(B, T, H, V)
+        fold_dtype = torch.float32 if q.dtype == torch.float16 else q.dtype
+        qe = torch.empty(B, T, H, K, dtype=fold_dtype, device=q.device)
+        ke = torch.empty(B, T, H, K, dtype=fold_dtype, device=q.device)
+        kr = torch.empty(B, T, H, K, dtype=fold_dtype, device=q.device)
+        vb = torch.empty(B, T, H, V, dtype=fold_dtype, device=v.device)
     warps, stages = _fold_config()
-    if k.shape[-1] == v.shape[-1] and NC * H <= _SMALL_FOLD_PROGRAMS:
+    if (
+        q.dtype != torch.float16
+        and k.shape[-1] == v.shape[-1]
+        and NC * H <= _SMALL_FOLD_PROGRAMS
+    ):
         # Small workload: one launch (serialized 2D gathers are cheap when the
         # grid is small, and host time dominates here).
         BK = 64 if K % 64 == 0 else K
@@ -982,22 +992,24 @@ def prep_w_u_ascend(
     vb: torch.Tensor,
     cu_seqlens: torch.LongTensor | None,
     chunk_size: int,
+    output_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(w, u, A)``: KKT/Newton inverse applied to the folded operands."""
     B, T, H, K = ke.shape
     V = vb.shape[-1]
     BT = int(chunk_size)
+    output_dtype = output_dtype or ke.dtype
     BV = min(V, 128)  # single V tile in the kernel (V <= 128 on the fast path)
     is_varlen = cu_seqlens is not None
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if is_varlen else None
     NC = triton.cdiv(T, BT) if not is_varlen else len(chunk_indices)
     if _scratch_enabled():
-        buf = _fast_scratch(B, T, H, K, V, BT, ke.dtype, ke.device)
+        buf = _fast_scratch(B, T, H, K, V, BT, output_dtype, ke.device)
         w, u, a_masked = buf["w"], buf["u"], buf["a"]
     else:
-        w = ke.new_empty(B, T, H, K)
-        u = vb.new_empty(B, T, H, V)
-        a_masked = ke.new_empty(B, T, H, BT)
+        w = torch.empty(B, T, H, K, dtype=output_dtype, device=ke.device)
+        u = torch.empty(B, T, H, V, dtype=output_dtype, device=vb.device)
+        a_masked = torch.empty(B, T, H, BT, dtype=output_dtype, device=ke.device)
     warps, stages = _prep_wu_config()
     _prep_wu_kernel[(NC, H if is_varlen else B * H)](
         qe, ke, kr, vb, w, u, a_masked,

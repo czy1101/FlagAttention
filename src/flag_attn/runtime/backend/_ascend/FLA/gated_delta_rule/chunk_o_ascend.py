@@ -69,8 +69,18 @@ def _chunk_fwd_o_kernel(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    NV: tl.constexpr,
+    NT: tl.constexpr,
+    FLAT_GRID: tl.constexpr,
+    PID_OFFSET,
 ):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if FLAT_GRID:
+        pid = tl.program_id(0) + PID_OFFSET
+        i_v = pid % NV
+        i_t = (pid // NV) % NT
+        i_bh = pid // (NV * NT)
+    else:
+        i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
@@ -121,10 +131,30 @@ def _chunk_fwd_o_kernel(
             mask=m_t[None, :],
             other=0.0,
         ).to(tl.float32)
-        b_qe = b_q * tl.exp(b_g2).to(b_q.dtype)
         b_kt = tl.load(p_k, boundary_check=(0, 1))
-        b_kr = b_kt * tl.exp(tl.minimum(-b_gr, 80.0)).to(b_kt.dtype)
-        b_A = tl.dot(b_qe, b_kr)
+        if b_q.dtype == tl.float16:
+            # exp(-g) can exceed fp16's range after 16+ tokens even though
+            # the kept causal factor exp(g_i - g_j) is bounded by 1.  Keep
+            # the unscaled KKT dot in fp16 inputs, then apply the decay matrix
+            # to its fp32 result; this avoids casting exp(-g) to fp16.
+            o_j = tl.arange(0, BT)
+            b_g_rows = tl.load(
+                gb + o_t[:, None] * H + 0 * o_j[None, :],
+                mask=m_t[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            b_g_cols = tl.load(
+                gb + o_t[None, :] * H + 0 * o_j[:, None],
+                mask=m_t[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            b_qe = b_q * tl.exp(b_g2).to(b_q.dtype)
+            b_A = tl.dot(b_q, b_kt).to(tl.float32)
+            b_A = b_A * tl.exp(b_g_rows - b_g_cols)
+        else:
+            b_qe = b_q * tl.exp(b_g2).to(b_q.dtype)
+            b_kr = b_kt * tl.exp(tl.minimum(-b_gr, 80.0)).to(b_kt.dtype)
+            b_A = tl.dot(b_qe, b_kr)
     else:
         o_t = i_t * BT + tl.arange(0, BT)
         b_qe = b_q
@@ -144,7 +174,8 @@ def _chunk_fwd_o_kernel(
 def _default_bv(V: int) -> int:
     # BV=128 measured best at BT=64 (0.247 ms vs 0.479 ms at BV=64 on
     # T=1024/H=8/K=V=128): fewer, larger programs beat more, smaller ones.
-    return int(os.environ.get("FLAG_ATTN_ASCEND_GDN_O_BV", "0")) or min(V, 128)
+    configured = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_O_BV", "0"))
+    return configured or min(128, max(16, triton.next_power_of_2(V)))
 
 
 def _default_warps() -> int:
@@ -167,6 +198,7 @@ def chunk_fwd_o_ascend(
     bv: int | None = None,
     num_warps: int | None = None,
     num_stages: int | None = None,
+    program_cap: int = 65535,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -177,35 +209,58 @@ def chunk_fwd_o_ascend(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = K**-0.5
-    BV = min(V, int(bv)) if bv else _default_bv(V)
+    # Keep BV a valid dot tile even when V is not a power of two; boundary
+    # checks mask the padded columns of the final tile.
+    BV = int(bv) if bv else _default_bv(V)
     o = torch.empty_like(v)
-    grid = (
-        triton.cdiv(V, BV),
-        NT,
-        H if cu_seqlens is not None else B * H,
-    )
-    _chunk_fwd_o_kernel[grid](
-        q,
-        k,
-        v,
-        h,
-        g,
-        o,
-        cu_seqlens,
-        chunk_indices,
-        scale,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        BV=BV,
-        USE_G=g is not None,
-        IS_VARLEN=cu_seqlens is not None,
-        num_warps=num_warps or _default_warps(),
-        num_stages=num_stages or _default_stages(),
-    )
+    num_warps = num_warps or _default_warps()
+    if program_cap <= 0:
+        raise ValueError(f"program_cap must be positive, got {program_cap}")
+    # ACL coreDim is grid program count times warp count.  Bound each launch
+    # independently; oversized logical grids are traversed in flat PID ranges.
+    acl_program_cap = 65535 // num_warps
+    launch_cap = min(int(program_cap), acl_program_cap)
+    NV = triton.cdiv(V, BV)
+    grid_bh = H if cu_seqlens is not None else B * H
+    total_programs = NV * NT * grid_bh
+
+    def launch(grid, *, flat_grid: bool, pid_offset: int) -> None:
+        _chunk_fwd_o_kernel[grid](
+            q,
+            k,
+            v,
+            h,
+            g,
+            o,
+            cu_seqlens,
+            chunk_indices,
+            scale,
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            BV=BV,
+            USE_G=g is not None,
+            IS_VARLEN=cu_seqlens is not None,
+            NV=NV,
+            NT=NT,
+            FLAT_GRID=flat_grid,
+            PID_OFFSET=pid_offset,
+            num_warps=num_warps,
+            num_stages=num_stages or _default_stages(),
+        )
+
+    if total_programs <= launch_cap:
+        launch((NV, NT, grid_bh), flat_grid=False, pid_offset=0)
+    else:
+        # Avoid a single near-limit launch holding the AICore watchdog for too
+        # long on very large grids.  Smaller grids retain the original launch.
+        batch_cap = min(launch_cap, 8192) if total_programs > acl_program_cap else launch_cap
+        for pid_offset in range(0, total_programs, batch_cap):
+            grid_size = min(batch_cap, total_programs - pid_offset)
+            launch((grid_size,), flat_grid=True, pid_offset=pid_offset)
     return o
 
 
