@@ -46,10 +46,10 @@ from flag_attn.FLA.gated_delta_rule.wy_fast import recompute_w_u_fwd
 
 from .chunk_o_ascend import chunk_fwd_o_ascend
 from .fused_ascend import (
-    affine_precompute_ascend,
     fold_ascend,
     fwd_h_o_2pass_ascend,
     fwd_h_o_ascend,
+    prep_affine_ascend,
     prep_w_u_ascend,
 )
 from .fwd_h_ascend import chunk_gated_delta_rule_fwd_h_ascend
@@ -63,6 +63,8 @@ from .wy_fast_ascend import (
 _BT_ENV = "FLAG_ATTN_ASCEND_GDN_BT"
 _FAST_ENV = "FLAG_ATTN_ASCEND_GDN_FAST"
 _FUSE_ENV = "FLAG_ATTN_ASCEND_GDN_FUSE"
+_RAW_INVERSE_ENV = "FLAG_ATTN_ASCEND_GDN_RAW_INVERSE"
+_RAW_INVERSE_MIN_JOBS = 2048
 
 _OFF = {"0", "false", "off", "no"}
 
@@ -210,12 +212,11 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
     # ``beta``; the fp32 copy matters because 2D gathers of bf16 data are ~10x
     # slower than fp32 gathers on this part (see wy_fast_ascend.py).
     if _use_fused():
-        # 3 launches: vector folds -> cube-only prep (KKT/Newton+w/u+A) ->
-        # state scan + output.
+        # The normal path uses vector folds -> prep (KKT/Newton+w/u+A) ->
+        # state scan + output. Long fixed sequences fuse prep with the affine
+        # precompute below, removing the W/U GM round trip, the A reload, and
+        # one launch. A is still written because this function returns it.
         g_cum, qe, ke, kr, vb = fold_ascend(g, q, k, v, beta, cu_seqlens, bt)
-        w, u, a_masked = prep_w_u_ascend(
-            qe, ke, kr, vb, cu_seqlens, bt, output_dtype=q.dtype
-        )
         # Optional exact two-pass state scan (pass1 chunk-parallel affine
         # precompute, pass2 with two dots per chunk; see _affine_kernel in
         # fused_ascend.py).  Measured: fwd_h_o device 0.256 -> 0.170 ms at
@@ -230,14 +231,37 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
             nt = len(prepare_chunk_indices(cu_seqlens, bt)) if cu_seqlens is not None else -(-g.shape[1] // bt)
             two_pass = cu_seqlens is None and nt >= _TWOPASS_MIN_CHUNKS
         if two_pass and cu_seqlens is None:
-            qe2, au, cu, mw = affine_precompute_ascend(
-                qe, a_masked, kr, w, u, bt
+            raw_inverse = (
+                os.environ.get(_RAW_INVERSE_ENV, "0").lower() not in _OFF
+                and bt == 64
+                and q.shape[0] * triton.cdiv(q.shape[1], bt) * beta.shape[2]
+                >= _RAW_INVERSE_MIN_JOBS
+                and k.shape[-1] == v.shape[-1]
+                and 0 < k.shape[-1] <= 128
+                and q.dtype in (torch.bfloat16, torch.float16)
             )
+            if raw_inverse:
+                # Experimental opt-in. Keep it to at least 2048 independent
+                # chunk/head jobs: smaller grids lose to the established fused
+                # prep because this route adds inverse materialization launches.
+                # One-pass and varlen remain on the established fused prep.
+                from .raw_inverse_prep import raw_inverse_prep_affine_ascend
+
+                qe2, au, cu, mw, a_masked = raw_inverse_prep_affine_ascend(
+                    qe, ke, kr, vb, bt, output_dtype=q.dtype
+                )
+            else:
+                qe2, au, cu, mw, a_masked = prep_affine_ascend(
+                    qe, ke, kr, vb, bt, output_dtype=q.dtype
+                )
             o, final_state = fwd_h_o_2pass_ascend(
                 qe2, au, cu, mw, g_cum, scale, initial_state,
                 output_final_state, bt,
             )
             return g_cum, o, a_masked, final_state
+        w, u, a_masked = prep_w_u_ascend(
+            qe, ke, kr, vb, cu_seqlens, bt, output_dtype=q.dtype
+        )
         o, final_state = fwd_h_o_ascend(
             qe, a_masked, kr, w, u, g_cum, scale, initial_state,
             output_final_state, cu_seqlens, bt,

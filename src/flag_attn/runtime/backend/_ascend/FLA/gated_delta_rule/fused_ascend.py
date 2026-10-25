@@ -467,6 +467,12 @@ def _prep_wu_kernel(
     BV: tl.constexpr,
     N_NEWTON: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    PRECOMPUTE_AFFINE: tl.constexpr,
+    qe2,
+    au,
+    cu,
+    mw,
+    NT: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -521,13 +527,16 @@ def _prep_wu_kernel(
     p_A = tl.make_block_ptr(
         a_out + base * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
     )
-    tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+    b_A = b_A.to(p_A.dtype.element_ty)
+    tl.store(p_A, b_A, boundary_check=(0, 1))
 
     p_w = tl.make_block_ptr(
         w + base * K, (T, K), (H * K, 1), (i_t * BT, 0), (BT, K), (1, 0)
     )
     b_w = tl.dot(b_Ai.to(b_ke.dtype), b_ke)
-    tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
+    b_w = b_w.to(p_w.dtype.element_ty)
+    if not PRECOMPUTE_AFFINE:
+        tl.store(p_w, b_w, boundary_check=(0, 1))
 
     p_vb = tl.make_block_ptr(
         vb + base * V, (T, V), (H * V, 1), (i_t * BT, 0), (BT, BV), (1, 0)
@@ -537,7 +546,45 @@ def _prep_wu_kernel(
     )
     b_vb = tl.load(p_vb, boundary_check=(0, 1))
     b_u = tl.dot(b_Ai.to(b_vb.dtype), b_vb)
-    tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
+    b_u = b_u.to(p_u.dtype.element_ty)
+    if not PRECOMPUTE_AFFINE:
+        tl.store(p_u, b_u, boundary_check=(0, 1))
+
+    if PRECOMPUTE_AFFINE:
+        # Reproduce the original GM round trips: A/W/U were stored in the
+        # input dtype before affine_precompute reloaded them.
+        b_qw = tl.dot(b_A, b_w.to(b_A.dtype))
+        p_qe2 = tl.make_block_ptr(
+            qe2 + base * K, (T, K), (H * K, 1), (i_t * BT, 0), (BT, K), (1, 0)
+        )
+        tl.store(
+            p_qe2,
+            (b_qe.to(tl.float32) - b_qw).to(p_qe2.dtype.element_ty),
+            boundary_check=(0, 1),
+        )
+        p_au = tl.make_block_ptr(
+            au + base * V, (T, V), (H * V, 1), (i_t * BT, 0), (BT, BV), (1, 0)
+        )
+        tl.store(
+            p_au,
+            tl.dot(b_A, b_u).to(p_au.dtype.element_ty),
+            boundary_check=(0, 1),
+        )
+        b_kr = tl.load(p_kr, boundary_check=(0, 1))
+        cbase_v = ((i_b * NT + i_t) * H + i_h) * K * V
+        p_cu = tl.make_block_ptr(
+            cu + cbase_v, (K, V), (V, 1), (0, 0), (K, BV), (1, 0)
+        )
+        tl.store(
+            p_cu, tl.dot(b_kr, b_u.to(b_kr.dtype)).to(p_cu.dtype.element_ty)
+        )
+        cbase_m = ((i_b * NT + i_t) * H + i_h) * K * K
+        p_mw = tl.make_block_ptr(
+            mw + cbase_m, (K, K), (K, 1), (0, 0), (K, K), (1, 0)
+        )
+        tl.store(
+            p_mw, tl.dot(b_kr, b_w.to(b_kr.dtype)).to(p_mw.dtype.element_ty)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1014,10 +1061,46 @@ def prep_w_u_ascend(
     _prep_wu_kernel[(NC, H if is_varlen else B * H)](
         qe, ke, kr, vb, w, u, a_masked,
         cu_seqlens, chunk_indices, T, H, H, K, V, BT, BV,
-        max(1, BT.bit_length() - 2), is_varlen,
+        max(1, BT.bit_length() - 2), is_varlen, False,
+        w, u, w, u, NC,
         num_warps=warps, num_stages=stages,
     )
     return w, u, a_masked
+
+
+def prep_affine_ascend(
+    qe: torch.Tensor,
+    ke: torch.Tensor,
+    kr: torch.Tensor,
+    vb: torch.Tensor,
+    chunk_size: int,
+    output_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare A and two-pass affine operands without materializing W/U."""
+    B, T, H, K = ke.shape
+    V = vb.shape[-1]
+    BT = int(chunk_size)
+    NT = triton.cdiv(T, BT)
+    output_dtype = output_dtype or ke.dtype
+    if _scratch_enabled():
+        buf = _fast_scratch(B, T, H, K, V, BT, output_dtype, ke.device)
+        w, u, a_masked = buf["w"], buf["u"], buf["a"]
+    else:
+        w = torch.empty(B, T, H, K, dtype=output_dtype, device=ke.device)
+        u = torch.empty(B, T, H, V, dtype=output_dtype, device=vb.device)
+        a_masked = torch.empty(B, T, H, BT, dtype=output_dtype, device=ke.device)
+    qe2 = qe.new_empty(B, T, H, K)
+    au = torch.empty(B, T, H, V, dtype=output_dtype, device=vb.device)
+    cu = qe.new_empty(B, NT, H, K, V)
+    mw = qe.new_empty(B, NT, H, K, K)
+    BV = min(V, 128)
+    _prep_wu_kernel[(NT, B * H)](
+        qe, ke, kr, vb, w, u, a_masked, None, None,
+        T, H, H, K, V, BT, BV, max(1, BT.bit_length() - 2), False,
+        True, qe2, au, cu, mw, NT,
+        num_warps=_PREP_WARPS, num_stages=_PREP_STAGES,
+    )
+    return qe2, au, cu, mw, a_masked
 
 
 def fwd_h_o_ascend(
@@ -1128,6 +1211,7 @@ def fwd_h_o_2pass_ascend(
 __all__ = [
     "fold_ascend",
     "prep_w_u_ascend",
+    "prep_affine_ascend",
     "fwd_h_o_ascend",
     "affine_precompute_ascend",
     "fwd_h_o_2pass_ascend",
