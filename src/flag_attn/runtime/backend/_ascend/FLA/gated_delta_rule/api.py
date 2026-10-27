@@ -26,7 +26,13 @@ import torch_npu  # noqa: F401
 
 from flag_attn.FLA.gated_delta_rule.api import _l2_normalize_last_dim
 
-from .chunk import ascend_chunk_size, chunk_gated_delta_rule_fwd
+from .chunk import (
+    _use_fast_path,
+    _use_fused,
+    ascend_chunk_size,
+    chunk_gated_delta_rule_fwd,
+)
+from .fused_ascend import strided_fold_supported
 
 _ALLOWED_BT = (16, 32, 64)
 
@@ -146,27 +152,54 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = K**-0.5
 
-    # The chunk kernels index sequence-first tensors with contiguous strides,
-    # so a head_first=True input (a transpose view) must be materialised here.
-    # Contiguous inputs skip the helper call entirely.
-    if not q_seq.is_contiguous():
-        q_seq = q_seq.contiguous()
-    if not k_seq.is_contiguous():
-        k_seq = k_seq.contiguous()
-    if not v_seq.is_contiguous():
-        v_seq = v_seq.contiguous()
-    if not beta_seq.is_contiguous():
-        beta_seq = beta_seq.contiguous()
-    if not g_seq.is_contiguous():
-        g_seq = g_seq.contiguous()
+    # The stride-aware fold is restricted to the reviewed fixed-length fast
+    # path. Head-first inputs may be noncontiguous after the layout transpose;
+    # sequence-first inputs use it only when all five public tensors are
+    # already contiguous. The workload-dependent decision lives in
+    # ``fused_ascend.strided_fold_supported`` so this wrapper and
+    # ``fold_ascend`` cannot disagree on which shapes take which kernel.
+    # Other calls keep the original materialization and its public
+    # validation/norm behavior.
+    chunk_size = ascend_chunk_size() if BT == 64 else BT
+    strided_candidate = strided_fold_supported(
+        B, T, H, Hg, K, V, q_seq.dtype, cu_seqlens, chunk_size
+    )
+    sequence_first_contiguous = False
+    if strided_candidate and not head_first:
+        # Only pay for the contiguity probes when the strided path is actually
+        # a candidate; small shapes keep the materialised path with no extra
+        # per-call host work (the fast path is host-bound).
+        sequence_first_contiguous = (
+            q_seq.is_contiguous()
+            and k_seq.is_contiguous()
+            and v_seq.is_contiguous()
+            and beta_seq.is_contiguous()
+            and g_seq.is_contiguous()
+        )
+    head_first_strided = (
+        strided_candidate
+        and (head_first or sequence_first_contiguous)
+        and not use_qk_l2norm_in_kernel
+        and _use_fast_path(q_seq, k_seq, v_seq)
+        and _use_fused()
+    )
+    if not head_first_strided:
+        # Most chunk kernels index sequence-first tensors with contiguous
+        # strides, so unsupported inputs retain the established materialize.
+        if not q_seq.is_contiguous():
+            q_seq = q_seq.contiguous()
+        if not k_seq.is_contiguous():
+            k_seq = k_seq.contiguous()
+        if not v_seq.is_contiguous():
+            v_seq = v_seq.contiguous()
+        if not beta_seq.is_contiguous():
+            beta_seq = beta_seq.contiguous()
+        if not g_seq.is_contiguous():
+            g_seq = g_seq.contiguous()
 
     if use_qk_l2norm_in_kernel:
         q_seq = _l2_normalize_last_dim(q_seq)
         k_seq = _l2_normalize_last_dim(k_seq)
-
-    # BT=64 is the upstream default; the internal Ascend chunk size comes from
-    # the environment (default 64), smaller explicit BT values are honoured.
-    chunk_size = ascend_chunk_size() if BT == 64 else BT
 
     _, o, _, final_state, _, _, _ = chunk_gated_delta_rule_fwd(
         q_seq,
@@ -179,6 +212,7 @@ def chunk_gated_delta_rule(
         output_final_state,
         cu_seqlens,
         chunk_size,
+        head_first_strided,
     )
     if head_first:
         o = o.transpose(1, 2)

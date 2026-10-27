@@ -207,7 +207,7 @@ def _fwd_legacy(q, k, v, g, beta, scale, initial_state, output_final_state,
 
 
 def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
-              cu_seqlens, bt):
+              cu_seqlens, bt, head_first_strided=False):
     # One vector-only pass produces the chunk-local cumsum and an fp32 copy of
     # ``beta``; the fp32 copy matters because 2D gathers of bf16 data are ~10x
     # slower than fp32 gathers on this part (see wy_fast_ascend.py).
@@ -216,7 +216,10 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
         # state scan + output. Long fixed sequences fuse prep with the affine
         # precompute below, removing the W/U GM round trip, the A reload, and
         # one launch. A is still written because this function returns it.
-        g_cum, qe, ke, kr, vb = fold_ascend(g, q, k, v, beta, cu_seqlens, bt)
+        g_cum, qe, ke, kr, vb = fold_ascend(
+            g, q, k, v, beta, cu_seqlens, bt,
+            head_first_strided=head_first_strided,
+        )
         # Optional exact two-pass state scan (pass1 chunk-parallel affine
         # precompute, pass2 with two dots per chunk; see _affine_kernel in
         # fused_ascend.py).  Measured: fwd_h_o device 0.256 -> 0.170 ms at
@@ -232,7 +235,7 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
             two_pass = cu_seqlens is None and nt >= _TWOPASS_MIN_CHUNKS
         if two_pass and cu_seqlens is None:
             raw_inverse = (
-                os.environ.get(_RAW_INVERSE_ENV, "0").lower() not in _OFF
+                os.environ.get(_RAW_INVERSE_ENV, "1").lower() not in _OFF
                 and bt == 64
                 and q.shape[0] * triton.cdiv(q.shape[1], bt) * beta.shape[2]
                 >= _RAW_INVERSE_MIN_JOBS
@@ -241,9 +244,9 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
                 and q.dtype in (torch.bfloat16, torch.float16)
             )
             if raw_inverse:
-                # Experimental opt-in. Keep it to at least 2048 independent
-                # chunk/head jobs: smaller grids lose to the established fused
-                # prep because this route adds inverse materialization launches.
+                # This experimental route defaults on only for workloads with
+                # at least 2048 independent chunk/head jobs. Smaller grids lose
+                # to fused prep because Raw adds inverse materialization work.
                 # One-pass and varlen remain on the established fused prep.
                 from .raw_inverse_prep import raw_inverse_prep_affine_ascend
 
@@ -321,13 +324,14 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int | None = None,
+    head_first_strided: bool = False,
 ) -> tuple:
     """Forward pass; returns the generic ``(g, o, A, final_state, w, h, v_new)``."""
     chunk_size = int(chunk_size or ascend_chunk_size())
     if _use_fast_path(q, k, v):
         g_cum, o, A, final_state = _fwd_fast(
             q, k, v, g, beta, scale, initial_state, output_final_state,
-            cu_seqlens, chunk_size,
+            cu_seqlens, chunk_size, head_first_strided,
         )
     else:
         # fp16 / wide head dims: the generic path is only UB-safe at BT<=32.

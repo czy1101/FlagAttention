@@ -167,6 +167,93 @@ def _factor_kernel(
 
 
 @triton.jit(do_not_specialize=["T"])
+def _factor_head_tile_kernel(
+    g,
+    beta,
+    g_cum,
+    e1,
+    r1,
+    b1,
+    be1,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    BH: tl.constexpr,
+):
+    """Factor adjacent heads together to coalesce token/head memory access."""
+    i_c = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    n_h_tiles: tl.constexpr = tl.cdiv(H, BH)
+    i_b = i_bh // n_h_tiles
+    i_h0 = (i_bh % n_h_tiles) * BH
+    p_g = tl.make_block_ptr(
+        g + i_b * T * H, (T, H), (H, 1), (i_c * BT, i_h0), (BT, BH), (1, 0)
+    )
+    p_beta = tl.make_block_ptr(
+        beta + i_b * T * H, (T, H), (H, 1), (i_c * BT, i_h0), (BT, BH), (1, 0)
+    )
+    p_gc = tl.make_block_ptr(
+        g_cum + i_b * T * H, (T, H), (H, 1), (i_c * BT, i_h0), (BT, BH), (1, 0)
+    )
+    p_e = tl.make_block_ptr(
+        e1 + i_b * T * H, (T, H), (H, 1), (i_c * BT, i_h0), (BT, BH), (1, 0)
+    )
+    p_r = tl.make_block_ptr(
+        r1 + i_b * T * H, (T, H), (H, 1), (i_c * BT, i_h0), (BT, BH), (1, 0)
+    )
+    p_b = tl.make_block_ptr(
+        b1 + i_b * T * H, (T, H), (H, 1), (i_c * BT, i_h0), (BT, BH), (1, 0)
+    )
+    p_be = tl.make_block_ptr(
+        be1 + i_b * T * H, (T, H), (H, 1), (i_c * BT, i_h0), (BT, BH), (1, 0)
+    )
+    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+    b_gc = tl.cumsum(b_g, axis=0)
+    b_e = tl.exp(b_gc)
+    b_beta = tl.load(p_beta, boundary_check=(0, 1)).to(tl.float32)
+    tl.store(p_gc, b_gc, boundary_check=(0, 1))
+    tl.store(p_e, b_e, boundary_check=(0, 1))
+    tl.store(p_r, tl.exp(tl.minimum(-b_gc, 80.0)), boundary_check=(0, 1))
+    tl.store(p_b, b_beta, boundary_check=(0, 1))
+    tl.store(p_be, b_beta * b_e, boundary_check=(0, 1))
+
+
+def launch_factor_head_tile(
+    g,
+    beta,
+    g_cum,
+    e1,
+    r1,
+    b1,
+    be1,
+    *,
+    chunk_size: int,
+    heads_per_program: int = 16,
+    num_warps: int = 4,
+    num_stages: int = 2,
+):
+    """Launch fixed-length coalesced factor tiles (all math/output fp32)."""
+    b, t, h = g.shape
+    _factor_head_tile_kernel[
+        (triton.cdiv(t, chunk_size), b * triton.cdiv(h, heads_per_program))
+    ](
+        g,
+        beta,
+        g_cum,
+        e1,
+        r1,
+        b1,
+        be1,
+        t,
+        h,
+        chunk_size,
+        heads_per_program,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+
+@triton.jit(do_not_specialize=["T"])
 def _fold_kernel(
     q,
     k,
@@ -289,6 +376,229 @@ def _fold_kernel(
             ).to(vb.dtype.element_ty),
             boundary_check=(0, 1),
         )
+
+
+@triton.jit(do_not_specialize=["T"])
+def _fold_group_kloop_kernel(
+    q, k, v, e1, r1, b1, be1, qe, ke, kr, vb,
+    T,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BH: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Fold one GQA group per CTA and reuse its Q/K rows across the group."""
+    i_c, i_group = tl.program_id(0), tl.program_id(1)
+    n_groups: tl.constexpr = tl.cdiv(H, BH)
+    i_b = i_group // n_groups
+    h0 = (i_group % n_groups) * BH
+    rep: tl.constexpr = H // Hg
+    rt = i_c * BT + tl.arange(0, BT)
+    rh = h0 + tl.arange(0, BH)
+    mt = rt < T
+    mh = rh < H
+
+    p_e = tl.make_block_ptr(e1 + i_b * T * H, (T, H), (H, 1),
+                            (i_c * BT, h0), (BT, BH), (1, 0))
+    p_r = tl.make_block_ptr(r1 + i_b * T * H, (T, H), (H, 1),
+                            (i_c * BT, h0), (BT, BH), (1, 0))
+    p_b = tl.make_block_ptr(b1 + i_b * T * H, (T, H), (H, 1),
+                            (i_c * BT, h0), (BT, BH), (1, 0))
+    p_be = tl.make_block_ptr(be1 + i_b * T * H, (T, H), (H, 1),
+                             (i_c * BT, h0), (BT, BH), (1, 0))
+    e = tl.load(p_e, boundary_check=(0, 1)).to(tl.float32)
+    r = tl.load(p_r, boundary_check=(0, 1)).to(tl.float32)
+    beta = tl.load(p_b, boundary_check=(0, 1)).to(tl.float32)
+    be = tl.load(p_be, boundary_check=(0, 1)).to(tl.float32)
+
+    q_head = h0 // rep
+    base_q = (i_b * T + rt[:, None]) * Hg + q_head
+    base_v = (i_b * T + rt[:, None, None]) * H * V + rh[None, :, None] * V
+    for ik in tl.static_range(0, K // BK):
+        rk = ik * BK + tl.arange(0, BK)
+        base_qk = base_q * K + rk[None, :]
+        qv = tl.load(q + base_qk, mask=mt[:, None] & (rk[None, :] < K), other=0)
+        kv = tl.load(k + base_qk, mask=mt[:, None] & (rk[None, :] < K), other=0)
+        vv = tl.load(v + base_v + rk[None, :],
+                     mask=mt[:, None, None] & mh[None, :, None] & (rk[None, None, :] < V),
+                     other=0)
+        qe_tile = qv.to(tl.float32)[:, None, :] * e[:, :, None]
+        ke_tile = kv.to(tl.float32)[:, None, :] * be[:, :, None]
+        kr_tile = kv.to(tl.float32)[:, None, :] * r[:, :, None]
+        vb_tile = vv.to(tl.float32) * beta[:, :, None]
+        q_offset = (i_b * T + rt[:, None, None]) * H * K + rh[None, :, None] * K + rk[None, None, :]
+        v_offset = base_v + rk[None, None, :]
+        mask3 = mt[:, None, None] & mh[None, :, None] & (rk[None, None, :] < K)
+        tl.store(qe + q_offset, qe_tile.to(qe.dtype.element_ty), mask=mask3)
+        tl.store(ke + q_offset, ke_tile.to(ke.dtype.element_ty), mask=mask3)
+        tl.store(kr + q_offset, kr_tile.to(kr.dtype.element_ty), mask=mask3)
+        tl.store(vb + v_offset, vb_tile.to(vb.dtype.element_ty),
+                 mask=mt[:, None, None] & mh[None, :, None] & (rk[None, None, :] < V))
+
+
+def launch_fold_group_kloop(
+    q, k, v, e1, r1, b1, be1, qe, ke, kr, vb, *,
+    chunk_size: int = 64, heads_per_program: int = 4, key_tile: int = 32,
+    num_warps: int = 4, num_stages: int = 2,
+):
+    """Launch the long fixed-length fold that reuses Q/K across a GQA group."""
+    B, T, Hg, K = k.shape
+    H, V = e1.shape[-1], v.shape[-1]
+    rep = H // Hg
+    if H % Hg or heads_per_program != rep:
+        raise ValueError("fold group tile must equal an aligned GQA group")
+    if K != V or K % key_tile:
+        raise ValueError("fold group kernel requires equal, tile-aligned K and V")
+    grid = (triton.cdiv(T, chunk_size), B * triton.cdiv(H, heads_per_program))
+    _fold_group_kloop_kernel[grid](
+        q, k, v, e1, r1, b1, be1, qe, ke, kr, vb, T, H, Hg, K, V,
+        chunk_size, heads_per_program, key_tile,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+
+@triton.jit(do_not_specialize=["T"])
+def _factor_headfirst_stride_kernel(
+    g, beta, g_cum, e1, r1, b1, be1, T,
+    H: tl.constexpr, BT: tl.constexpr, BH: tl.constexpr,
+    FACTOR_T: tl.constexpr,
+    SGB: tl.constexpr, SGT: tl.constexpr, SGH: tl.constexpr,
+    SBB: tl.constexpr, SBT: tl.constexpr, SBH: tl.constexpr,
+):
+    i_c, i_bht = tl.program_id(0), tl.program_id(1)
+    n_h_tiles: tl.constexpr = tl.cdiv(H, BH)
+    i_b = i_bht // n_h_tiles
+    i_h0 = (i_bht % n_h_tiles) * BH
+    rt = i_c * BT + tl.arange(0, BT)
+    rh = i_h0 + tl.arange(0, BH)
+    mask = (rt[None, :] < T) & (rh[:, None] < H)
+    g_offset = i_b * SGB + rh[:, None] * SGH + rt[None, :] * SGT
+    beta_offset = i_b * SBB + rh[:, None] * SBH + rt[None, :] * SBT
+    b_g = tl.load(g + g_offset, mask=mask, other=0.0).to(tl.float32)
+    b_gc = tl.cumsum(b_g, axis=1)
+    b_e = tl.exp(b_gc)
+    b_r = tl.exp(tl.minimum(-b_gc, 80.0))
+    b_beta = tl.load(beta + beta_offset, mask=mask, other=0.0).to(tl.float32)
+    # Factor scratch uses [B,H,T] physical order only for this immediate
+    # head-first fold. g_cum stays in the standard [B,T,H] output layout.
+    factor_dst = i_b * H * FACTOR_T + rh[:, None] * FACTOR_T + rt[None, :]
+    # Store g_cum in the same head-major orientation as ``b_gc`` instead of
+    # ``tl.trans(b_gc)``/``tl.trans(mask)``.  On 910B the transposed store was
+    # observed to drop/garble a random subset of token rows for some shapes
+    # (nondeterministic, ~1-15% of rows, first invocations worst), while the
+    # non-transposed stores of this kernel were always exact.  This offset
+    # expression writes element (b, t, h) at b*T*H + t*H + h, the same layout
+    # as before.  See test_script/probe_strided_fold_fix.py.
+    gc_dst = i_b * T * H + rt[None, :] * H + rh[:, None]
+    tl.store(g_cum + gc_dst, b_gc, mask=mask)
+    tl.store(e1 + factor_dst, b_e, mask=mask)
+    tl.store(r1 + factor_dst, b_r, mask=mask)
+    tl.store(b1 + factor_dst, b_beta, mask=mask)
+    tl.store(be1 + factor_dst, b_beta * b_e, mask=mask)
+
+
+@triton.jit(do_not_specialize=["T"])
+def _fold_headfirst_stride_kernel(
+    q, k, v, e1, r1, b1, be1, qe, ke, kr, vb, T,
+    H: tl.constexpr, Hg: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, FACTOR_T: tl.constexpr,
+    SQB: tl.constexpr, SQT: tl.constexpr, SQH: tl.constexpr, SQK: tl.constexpr,
+    SKB: tl.constexpr, SKT: tl.constexpr, SKH: tl.constexpr, SKK: tl.constexpr,
+    SVB: tl.constexpr, SVT: tl.constexpr, SVH: tl.constexpr, SVV: tl.constexpr,
+):
+    i_c, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    rep = H // Hg
+    i_hg = i_h // rep
+    rt = i_c * BT + tl.arange(0, BT)
+    rk = tl.arange(0, K)
+    mask_t = rt < T
+    factor_offset = i_b * H * FACTOR_T + i_h * FACTOR_T + rt
+    b_e = tl.load(e1 + factor_offset, mask=mask_t, other=0.0).to(tl.float32)
+    b_r = tl.load(r1 + factor_offset, mask=mask_t, other=0.0).to(tl.float32)
+    b_beta = tl.load(b1 + factor_offset, mask=mask_t, other=0.0).to(tl.float32)
+    b_be = tl.load(be1 + factor_offset, mask=mask_t, other=0.0).to(tl.float32)
+    q_offset = (i_b * SQB + rt[:, None] * SQT + i_hg * SQH
+                + rk[None, :] * SQK)
+    k_offset = (i_b * SKB + rt[:, None] * SKT + i_hg * SKH
+                + rk[None, :] * SKK)
+    v_offset = (i_b * SVB + rt[:, None] * SVT + i_h * SVH
+                + rk[None, :] * SVV)
+    mask = mask_t[:, None] & (rk[None, :] < K)
+    b_q = tl.load(q + q_offset, mask=mask, other=0.0)
+    b_k = tl.load(k + k_offset, mask=mask, other=0.0)
+    b_v = tl.load(v + v_offset,
+                  mask=mask_t[:, None] & (rk[None, :] < V), other=0.0)
+    base = i_b * T * H + i_h
+    out_offset = base * K + rt[:, None] * (H * K) + rk[None, :]
+    tl.store(qe + out_offset,
+             (b_q.to(tl.float32) * b_e[:, None]).to(qe.dtype.element_ty),
+             mask=mask)
+    tl.store(ke + out_offset,
+             (b_k.to(tl.float32) * b_be[:, None]).to(ke.dtype.element_ty),
+             mask=mask)
+    tl.store(kr + out_offset,
+             (b_k.to(tl.float32) * b_r[:, None]).to(kr.dtype.element_ty),
+             mask=mask)
+    out_v_offset = base * V + rt[:, None] * (H * V) + rk[None, :]
+    tl.store(vb + out_v_offset,
+             (b_v.to(tl.float32) * b_beta[:, None]).to(vb.dtype.element_ty),
+             mask=mask_t[:, None] & (rk[None, :] < V))
+
+
+def _fold_headfirst_strided(g, q, k, v, beta, chunk_size):
+    B, T, Hg, K = q.shape
+    H, V = beta.shape[-1], v.shape[-1]
+    BT = int(chunk_size)
+    NC = triton.cdiv(T, BT)
+    BH = 16
+    factor_t = triton.cdiv(T, 32) * 32
+    if _scratch_enabled():
+        buf = _fast_scratch(B, T, H, K, V, BT, q.dtype, q.device)
+        g_cum = buf["g_cum"]
+        qe, ke, kr, vb = buf["qe"], buf["ke"], buf["kr"], buf["vb"]
+        factor_shape = (B, H, factor_t)
+        if "headfirst_e1" not in buf:
+            buf["headfirst_e1"] = torch.empty(
+                factor_shape, dtype=torch.float32, device=g.device,
+            )
+            buf["headfirst_r1"] = torch.empty_like(buf["headfirst_e1"])
+            buf["headfirst_b1"] = torch.empty_like(buf["headfirst_e1"])
+            buf["headfirst_be1"] = torch.empty_like(buf["headfirst_e1"])
+        e1 = buf["headfirst_e1"]
+        r1 = buf["headfirst_r1"]
+        b1 = buf["headfirst_b1"]
+        be1 = buf["headfirst_be1"]
+    else:
+        g_cum = torch.empty(B, T, H, dtype=torch.float32, device=g.device)
+        fold_dtype = torch.float32 if q.dtype == torch.float16 else q.dtype
+        qe = torch.empty(B, T, H, K, dtype=fold_dtype, device=q.device)
+        ke = torch.empty(B, T, H, K, dtype=fold_dtype, device=q.device)
+        kr = torch.empty(B, T, H, K, dtype=fold_dtype, device=q.device)
+        vb = torch.empty(B, T, H, V, dtype=fold_dtype, device=v.device)
+        # Pad each head row so factor stores from adjacent CTAs never share a
+        # partially aligned tail cache line when T is not a multiple of 32.
+        factor_shape = (B, H, factor_t)
+        e1 = torch.empty(factor_shape, dtype=torch.float32, device=g.device)
+        r1 = torch.empty_like(e1)
+        b1 = torch.empty_like(e1)
+        be1 = torch.empty_like(e1)
+    warps, stages = _fold_config()
+    _factor_headfirst_stride_kernel[(NC, B * triton.cdiv(H, BH))](
+        g, beta, g_cum, e1, r1, b1, be1, T,
+        H, BT, BH, factor_t, *g.stride(), *beta.stride(),
+        num_warps=warps, num_stages=stages,
+    )
+    _fold_headfirst_stride_kernel[(NC, B * H)](
+        q, k, v, e1, r1, b1, be1, qe, ke, kr, vb, T,
+        H, Hg, K, V, BT, factor_t,
+        *q.stride(), *k.stride(), *v.stride(),
+        num_warps=warps, num_stages=stages,
+    )
+    return g_cum, qe, ke, kr, vb
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -866,10 +1176,63 @@ def _fwd_h_o_2pass_kernel(
 # Workload size below which the single-kernel (gather) fold wins on host time.
 _SMALL_FOLD_PROGRAMS = 64
 
+# --- stride-aware fold dispatch -------------------------------------------
+# Single source of truth shared by ``api.py`` (which decides the input layout)
+# and ``fold_ascend`` (which picks the kernel).  Measured on 910B with
+# ``test_script/probe_dispatch_ab.py``: the materialised fold has two variants
+# and the stride-aware pair only wins once the grid is big enough, but *which*
+# crossover applies depends on the variant it would replace:
+#
+# * one-launch gather branch (``NC*H <= _SMALL_FOLD_PROGRAMS``): the gather
+#   kernel costs ~0.45 ms on tiny grids but 0.9-2.9 ms once batch/head/K grow,
+#   while the strided pair is shape-flat at ~0.55-0.60 ms.  It therefore loses
+#   from ~64 chunk/head jobs upward.
+# * two-kernel factor+fold branch: already efficient, the strided pair only
+#   wins on large grids (>=512 jobs) or the long-sequence rule below.
+_STRIDED_MIN_JOBS = 64
+_STRIDED_LARGE_JOBS = 512
+
+
+def strided_fold_supported(
+    B: int,
+    T: int,
+    H: int,
+    Hg: int,
+    K: int,
+    V: int,
+    dtype,
+    cu_seqlens,
+    chunk_size: int,
+) -> bool:
+    """Return True when the stride-aware fold is the measured-fastest choice."""
+    if cu_seqlens is not None or int(chunk_size) != 64:
+        return False
+    if dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if T < 64 or K != V or not (0 < K <= 128) or H % Hg != 0:
+        return False
+    nc = (T + 63) // 64
+    jobs = B * nc * H
+    if jobs < _STRIDED_MIN_JOBS:
+        return False
+    if T >= 2048 and jobs > _SMALL_FOLD_PROGRAMS:
+        return True
+    if nc * H <= _SMALL_FOLD_PROGRAMS:
+        return True
+    return jobs >= _STRIDED_LARGE_JOBS
+
 # Chunk-batched fold/factor kernels (vector-only loops, no dots): each program
 # handles NCHUNK consecutive chunks.  FLAG_ATTN_ASCEND_GDN_NCHUNK overrides the
 # automatic choice; 1 disables batching.
 _NCHUNK_ENV = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_NCHUNK", "0"))
+# The coalesced fixed-length factor kernel is default-on; set this to 0 to use
+# the original pure-Triton one-head factor kernel for A/B or fallback.
+_FACTOR_HEAD_TILE_ENABLED = os.environ.get(
+    "FLAG_ATTN_ASCEND_GDN_FACTOR_HEAD_TILE", "1"
+).lower() not in {"0", "false", "off", "no"}
+_FOLD_GROUP_KLOOP_ENABLED = os.environ.get(
+    "FLAG_ATTN_ASCEND_GDN_FOLD_GROUP_KLOOP", "1"
+).lower() not in {"0", "false", "off", "no"}
 # Automatic batching: measured net effect of NCHUNK>1 is at most -6% (T2048) and
 # is neutral/negative elsewhere, so it is OFF unless requested explicitly.
 _NCHUNK_AUTO = 1
@@ -971,6 +1334,7 @@ def fold_ascend(
     beta: torch.Tensor,
     cu_seqlens: torch.LongTensor | None,
     chunk_size: int,
+    head_first_strided: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor]:
     """Return ``(g_cum, q_e, k_e, k_r, v_beta)``.
@@ -985,6 +1349,14 @@ def fold_ascend(
     is_varlen = cu_seqlens is not None
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if is_varlen else None
     NC = triton.cdiv(T, BT) if not is_varlen else len(chunk_indices)
+    if (
+        head_first_strided
+        and not is_varlen
+        and strided_fold_supported(
+            B, T, H, Hg, K, V, q.dtype, cu_seqlens, BT
+        )
+    ):
+        return _fold_headfirst_strided(g, q, k, v, beta, BT)
     if _scratch_enabled():
         buf = _fast_scratch(B, T, H, K, V, BT, k.dtype, k.device)
         g_cum = buf["g_cum"]
@@ -1019,16 +1391,63 @@ def fold_ascend(
         b1 = torch.empty(B, T, H, dtype=torch.float32, device=g.device)
         be1 = torch.empty(B, T, H, dtype=torch.float32, device=g.device)
     nchunk = _fold_nchunk(NC, is_varlen)
-    _factor_kernel[(NC // nchunk, H if is_varlen else B * H)](
-        g, beta, g_cum, e1, r1, b1, be1,
-        cu_seqlens, chunk_indices, T, H, BT, is_varlen, nchunk,
-        num_warps=warps, num_stages=stages,
+    use_head_tiled_factor = (
+        _FACTOR_HEAD_TILE_ENABLED
+        and not is_varlen
+        and BT == 64
+        and H >= 8
+        and NC * H > _SMALL_FOLD_PROGRAMS
+        and nchunk == 1
+        and q.dtype in (torch.bfloat16, torch.float16)
     )
-    _fold_kernel[(NC // nchunk, H if is_varlen else B * H)](
-        q, k, v, e1, r1, b1, be1, qe, ke, kr, vb,
-        cu_seqlens, chunk_indices, T, H, Hg, K, V, BT, is_varlen, nchunk,
-        num_warps=warps, num_stages=stages,
+    if use_head_tiled_factor:
+        launch_factor_head_tile(
+            g,
+            beta,
+            g_cum,
+            e1,
+            r1,
+            b1,
+            be1,
+            chunk_size=BT,
+            heads_per_program=16,
+            num_warps=warps,
+            num_stages=stages,
+        )
+    else:
+        _factor_kernel[(NC // nchunk, H if is_varlen else B * H)](
+            g, beta, g_cum, e1, r1, b1, be1,
+            cu_seqlens, chunk_indices, T, H, BT, is_varlen, nchunk,
+            num_warps=warps, num_stages=stages,
+        )
+    rep = H // Hg
+    use_group_kloop = (
+        _FOLD_GROUP_KLOOP_ENABLED
+        and use_head_tiled_factor
+        and not is_varlen
+        and BT == 64
+        and T >= 2048
+        and q.dtype == torch.bfloat16
+        and K == V == 128
+        and H % Hg == 0
+        and rep in (2, 4)
+        and nchunk == 1
     )
+    if use_group_kloop:
+        launch_fold_group_kloop(
+            q, k, v, e1, r1, b1, be1, qe, ke, kr, vb,
+            chunk_size=BT,
+            heads_per_program=rep,
+            key_tile=32,
+            num_warps=warps,
+            num_stages=stages,
+        )
+    else:
+        _fold_kernel[(NC // nchunk, H if is_varlen else B * H)](
+            q, k, v, e1, r1, b1, be1, qe, ke, kr, vb,
+            cu_seqlens, chunk_indices, T, H, Hg, K, V, BT, is_varlen, nchunk,
+            num_warps=warps, num_stages=stages,
+        )
     return g_cum, qe, ke, kr, vb
 
 
@@ -1190,7 +1609,13 @@ def fwd_h_o_2pass_ascend(
     K = qe2.shape[-1]
     BT = int(chunk_size)
     NT = triton.cdiv(T, BT)
-    BV = min(V, int(bv) if bv else _fwd_h_o_bv(V))
+    if bv:
+        BV = min(V, int(bv))
+    elif au.dtype == torch.bfloat16 and K == V == 128:
+        # Full-width BF16 tile removes the duplicated per-chunk Mw/Qe2 reads.
+        BV = 128
+    else:
+        BV = min(V, _fwd_h_o_bv(V))
     o = torch.empty_like(au)
     final_state = (
         au.new_empty(B, H, K, V, dtype=torch.float32)
