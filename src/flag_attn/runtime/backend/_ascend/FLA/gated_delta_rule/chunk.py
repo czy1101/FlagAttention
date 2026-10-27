@@ -67,6 +67,7 @@ _BT_ENV = "FLAG_ATTN_ASCEND_GDN_BT"
 _FAST_ENV = "FLAG_ATTN_ASCEND_GDN_FAST"
 _FUSE_ENV = "FLAG_ATTN_ASCEND_GDN_FUSE"
 _RAW_INVERSE_ENV = "FLAG_ATTN_ASCEND_GDN_RAW_INVERSE"
+_ONEPASS_SMALL_ENV = "FLAG_ATTN_ASCEND_GDN_ONEPASS_SMALL"
 # Measured on 2026-10-27 (CANN 9.1 / 910B): once the chunk/head grid reaches
 # 1024 jobs the exact two-pass scan plus the Raw inverse wins even for short
 # sequences (T=256..1024, NT=2..16): -18% at gqa-B2-T2048 (jobs 1024),
@@ -293,6 +294,23 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
                 nt >= _TWOPASS_MIN_CHUNKS
                 or (nt >= 2 and jobs >= _TWOPASS_MIN_JOBS)
             )
+            # The one-pass scan now unrolls two chunks per iteration and wins
+            # on tiny head grids where the two-pass pass1 cannot pay for
+            # itself: T2048-h8 (B*H=8, NT=32) one-pass 0.522 vs two-pass
+            # 0.552 ms, both within 0.45% of the FP32 recurrence.  Keep
+            # two-pass for B*H >= 16 (gqa-B2-T2048 is 0.55 vs 0.52 x faster).
+            if (
+                two_pass
+                and os.environ.get(_ONEPASS_SMALL_ENV, "1").lower() not in _OFF
+                and bt == 64
+                and q.dtype == torch.bfloat16
+                and k.shape[-1] == v.shape[-1]
+                and 0 < k.shape[-1] <= 128
+                and nt >= 8
+                and nt % 2 == 0
+                and q.shape[0] * beta.shape[2] == 8
+            ):
+                two_pass = False
         if two_pass and cu_seqlens is None:
             jobs = q.shape[0] * triton.cdiv(q.shape[1], bt) * beta.shape[2]
             raw_inverse = (

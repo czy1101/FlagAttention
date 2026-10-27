@@ -1135,6 +1135,96 @@ def _affine_kernel(
 
 
 @triton.jit(do_not_specialize=["T"])
+def _fwd_h_o_unroll2_kernel(
+    qe, kr, a_in, w, u, g, o, h0, ht, scale, cu_seqlens,
+    T,
+    H: tl.constexpr, Hg: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, BV: tl.constexpr,
+    USE_G: tl.constexpr, USE_INITIAL_STATE: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+    NT: tl.constexpr,
+):
+    """One-pass state scan with two chunks per iteration.
+
+    Both chunks' tiles are loaded before chunk 0's dots, which lets the
+    independent work of the two chunks overlap (measured 1.31x on T1024-h8,
+    bit-identical).  Fixed-length only; NT must be even.
+    """
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_h = i_nh // H, i_nh % H
+    bos = i_n * T
+    NPAIR: tl.constexpr = NT // 2
+    b_h = tl.zeros([K, BV], dtype=tl.float32)
+    base_h = (bos * H + i_h) * K
+    base_a = (bos * H + i_h) * BT
+    base_v = (bos * H + i_h) * V
+    gb = g + bos * H + i_h
+    if USE_INITIAL_STATE:
+        h0 += i_nh * K * V
+    if STORE_FINAL_STATE:
+        ht += i_nh * K * V
+    if USE_INITIAL_STATE:
+        p_h0 = tl.make_block_ptr(
+            h0, (K, V), (V, 1), (0, i_v * BV), (K, BV), (1, 0)
+        )
+        b_h += tl.load(p_h0, boundary_check=(0, 1)).to(tl.float32)
+
+    for i_p in range(NPAIR):
+        ia = i_p * 2
+        ib = ia + 1
+        b_qe0 = tl.load(tl.make_block_ptr(qe + base_h, (T, K), (H * K, 1),
+                       (ia * BT, 0), (BT, K), (1, 0)), boundary_check=(0, 1))
+        b_A0 = tl.load(tl.make_block_ptr(a_in + base_a, (T, BT), (H * BT, 1),
+                      (ia * BT, 0), (BT, BT), (1, 0)), boundary_check=(0, 1))
+        b_kr0 = tl.load(tl.make_block_ptr(kr + base_h, (K, T), (1, H * K),
+                       (0, ia * BT), (K, BT), (0, 1)), boundary_check=(0, 1))
+        b_w0 = tl.load(tl.make_block_ptr(w + base_h, (T, K), (H * K, 1),
+                      (ia * BT, 0), (BT, K), (1, 0)), boundary_check=(0, 1))
+        b_v0 = tl.load(tl.make_block_ptr(u + base_v, (T, V), (H * V, 1),
+                      (ia * BT, i_v * BV), (BT, BV), (1, 0)),
+                      boundary_check=(0, 1)).to(tl.float32)
+        b_qe1 = tl.load(tl.make_block_ptr(qe + base_h, (T, K), (H * K, 1),
+                       (ib * BT, 0), (BT, K), (1, 0)), boundary_check=(0, 1))
+        b_A1 = tl.load(tl.make_block_ptr(a_in + base_a, (T, BT), (H * BT, 1),
+                      (ib * BT, 0), (BT, BT), (1, 0)), boundary_check=(0, 1))
+        b_kr1 = tl.load(tl.make_block_ptr(kr + base_h, (K, T), (1, H * K),
+                       (0, ib * BT), (K, BT), (0, 1)), boundary_check=(0, 1))
+        b_w1 = tl.load(tl.make_block_ptr(w + base_h, (T, K), (H * K, 1),
+                      (ib * BT, 0), (BT, K), (1, 0)), boundary_check=(0, 1))
+        b_v1 = tl.load(tl.make_block_ptr(u + base_v, (T, V), (H * V, 1),
+                      (ib * BT, i_v * BV), (BT, BV), (1, 0)),
+                      boundary_check=(0, 1)).to(tl.float32)
+
+        b_v0 = b_v0 - tl.dot(b_w0, b_h.to(b_w0.dtype))
+        b_o = tl.dot(b_qe0, b_h.to(b_qe0.dtype)) + tl.dot(
+            b_A0, b_v0.to(b_qe0.dtype))
+        tl.store(tl.make_block_ptr(o + base_v, (T, V), (H * V, 1),
+                 (ia * BT, i_v * BV), (BT, BV), (1, 0)),
+                 (b_o * scale).to(o.dtype.element_ty), boundary_check=(0, 1))
+        b_h = b_h + tl.dot(b_kr0, b_v0.to(b_kr0.dtype))
+        if USE_G:
+            last0 = (ia + 1) * BT - 1
+            b_h = b_h * tl.exp(tl.load(gb + last0 * H).to(tl.float32))
+
+        b_v1 = b_v1 - tl.dot(b_w1, b_h.to(b_w1.dtype))
+        b_o1 = tl.dot(b_qe1, b_h.to(b_qe1.dtype)) + tl.dot(
+            b_A1, b_v1.to(b_qe1.dtype))
+        tl.store(tl.make_block_ptr(o + base_v, (T, V), (H * V, 1),
+                 (ib * BT, i_v * BV), (BT, BV), (1, 0)),
+                 (b_o1 * scale).to(o.dtype.element_ty), boundary_check=(0, 1))
+        b_h = b_h + tl.dot(b_kr1, b_v1.to(b_kr1.dtype))
+        if USE_G:
+            last1 = (ib + 1) * BT - 1
+            b_h = b_h * tl.exp(tl.load(gb + last1 * H).to(tl.float32))
+
+    if STORE_FINAL_STATE:
+        p_ht = tl.make_block_ptr(
+            ht, (K, V), (V, 1), (0, i_v * BV), (K, BV), (1, 0)
+        )
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.jit(do_not_specialize=["T"])
 def _fwd_h_o_2pass_kernel(
     qe2,
     au,
@@ -1301,6 +1391,16 @@ _PREP_STAGES = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_P_STAGES", "2"))
 _HO_WARPS = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_HO_WARPS", "4"))
 _HO_STAGES = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_HO_STAGES", "2"))
 _HO_BV = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_HO_BV", "0"))
+# One-pass state scan with two chunks per iteration: measured 1.31x kernel
+# speedup on T1024-h8 (128 -> 104 us, bit-identical).  Only for fixed-length
+# BF16 grids where the two-chunk working set still fits UB.
+_FWD_UNROLL2_ENV = "FLAG_ATTN_ASCEND_GDN_FWD_UNROLL2"
+
+
+def fwd_unroll2_enabled() -> bool:
+    forced = os.environ.get(_FWD_UNROLL2_ENV, "").lower()
+    return forced not in _OFF_VALUES if forced else True
+
 
 # The fast path is host-bound, so its per-call intermediate tensors are cached
 # (keyed by shape/dtype/device) instead of being allocated and freed every
@@ -1692,6 +1792,32 @@ def fwd_h_o_ascend(
     warps, stages = _fwd_h_o_config()
     buf = (_fast_scratch(B, T, H, K, V, BT, u.dtype, u.device)
            if _scratch_enabled() else None)
+    NT = triton.cdiv(T, BT)
+    unroll2 = (
+        fwd_unroll2_enabled()
+        and cu_seqlens is None
+        and u.dtype == torch.bfloat16
+        and BT == 64
+        and NT >= 8
+        and NT % 2 == 0
+        and 8 <= B * H <= 32
+        and K <= 128
+        and V <= 128
+    )
+    if unroll2:
+        _lk(buf, ("fwd_h_o_u2", T, H, Hg, K, V, BT, BV, NT,
+                  g is not None, initial_state is not None,
+                  final_state is not None),
+            _fwd_h_o_unroll2_kernel, (triton.cdiv(V, BV), N * H),
+            num_warps or warps, num_stages or stages)(
+            qe, kr, a_in, w, u, g, o, initial_state, final_state, scale,
+            cu_seqlens, T, H, Hg, K, V, BT, BV,
+            g is not None,
+            initial_state is not None,
+            final_state is not None,
+            NT,
+        )
+        return o, final_state
     _lk(buf, ("fwd_h_o", T, H, Hg, K, V, BT, BV,
               g is not None, initial_state is not None,
               final_state is not None, cu_seqlens is not None),
@@ -1755,11 +1881,18 @@ def fwd_h_o_2pass_ascend(
     K = qe2.shape[-1]
     BT = int(chunk_size)
     NT = triton.cdiv(T, BT)
+    forced_bv = os.environ.get("FLAG_ATTN_ASCEND_GDN_2PASS_BV", "")
     if bv:
         BV = min(V, int(bv))
+    elif forced_bv and int(forced_bv) > 0:
+        BV = min(V, int(forced_bv))
     elif au.dtype == torch.bfloat16 and K == V == 128:
-        # Full-width BF16 tile removes the duplicated per-chunk Mw/Qe2 reads.
-        BV = 128
+        # Full-width BF16 tile removes the duplicated per-chunk Mw/Qe2 reads,
+        # but it also caps the grid at B*H programs.  For tiny grids
+        # (B*H <= 8) halving the tile doubles the grid and is 1.6-2.6x faster
+        # (T2048-h8 state 0.278 -> 0.169 ms, bit-identical; B*H=16 already
+        # regresses, so the crossover is 8).
+        BV = 64 if B * H <= 8 else 128
     else:
         BV = min(V, _fwd_h_o_bv(V))
     o = torch.empty_like(au)
