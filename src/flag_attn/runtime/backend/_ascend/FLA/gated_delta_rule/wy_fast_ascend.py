@@ -48,6 +48,8 @@ import os
 
 import torch
 import triton
+
+from .fast_launch import fast_launch
 import triton.language as tl
 
 from flag_attn.FLA.index import prepare_chunk_indices
@@ -396,7 +398,7 @@ def chunk_gated_delta_rule_prep_ascend(
     # never consumed), and this avoids a memset launch on the staged path.
     A_inv = torch.empty(B, T, H, BT, device=g.device, dtype=output_dtype)
     warps, stages = _prep_params()
-    _prep_kernel[(NC, H if cu_seqlens is not None else B * H)](
+    fast_launch(_prep_kernel, (NC, H if cu_seqlens is not None else B * H), num_warps or warps, num_stages or stages)(
         g_cum,
         k,
         beta,
@@ -410,8 +412,7 @@ def chunk_gated_delta_rule_prep_ascend(
         BT=BT,
         N_NEWTON=n_newton,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=num_warps or warps,
-        num_stages=num_stages or stages,
+
     )
     return g_cum, A_inv
 
@@ -452,7 +453,7 @@ def recompute_w_u_fwd_ascend(
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     warps, stages = _wu_params()
-    _recompute_w_u_kernel[(NC, H if cu_seqlens is not None else B * H)](
+    fast_launch(_recompute_w_u_kernel, (NC, H if cu_seqlens is not None else B * H), num_warps or warps, num_stages or stages)(
         k=k,
         v=v,
         beta=beta,
@@ -471,8 +472,7 @@ def recompute_w_u_fwd_ascend(
         BK=BK,
         BV=BV,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=num_warps or warps,
-        num_stages=num_stages or stages,
+
     )
     return w, u
 

@@ -44,6 +44,8 @@ import os
 
 import torch
 import triton
+
+from .fast_launch import fast_launch
 import triton.language as tl
 
 from flag_attn.FLA.index import prepare_chunk_indices
@@ -225,7 +227,7 @@ def chunk_fwd_o_ascend(
     total_programs = NV * NT * grid_bh
 
     def launch(grid, *, flat_grid: bool, pid_offset: int) -> None:
-        _chunk_fwd_o_kernel[grid](
+        fast_launch(_chunk_fwd_o_kernel, grid, num_warps, num_stages or _default_stages())(
             q,
             k,
             v,
@@ -248,8 +250,7 @@ def chunk_fwd_o_ascend(
             NT=NT,
             FLAT_GRID=flat_grid,
             PID_OFFSET=pid_offset,
-            num_warps=num_warps,
-            num_stages=num_stages or _default_stages(),
+
         )
 
     if total_programs <= launch_cap:

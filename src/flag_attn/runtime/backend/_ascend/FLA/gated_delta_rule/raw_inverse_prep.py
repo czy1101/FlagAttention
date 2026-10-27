@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import torch
 import triton
+
+from .fast_launch import fast_launch
 import triton.language as tl
 
 from .raw_inverse_ascend import (
@@ -98,9 +100,8 @@ def launch_kkt_blocks_batched(ke: torch.Tensor, kr: torch.Tensor,
         raise ValueError("KKT batch_size must be in [1, 16]")
     batch = ke.shape[0]
     jobs = batch * NT * H
-    _kkt_blocks_batched_kernel[(triton.cdiv(jobs, batch_size),)](
+    fast_launch(_kkt_blocks_batched_kernel, (triton.cdiv(jobs, batch_size),), 4, 2)(
         ke, kr, L_full, T, H, K, NT, BT, batch, jobs, batch_size,
-        num_warps=4, num_stages=2,
     )
 
 
@@ -154,8 +155,8 @@ def launch_stitch_inverse_batched(L_full: torch.Tensor,
     if batch_size < 1 or batch_size > 4:
         raise ValueError("stitch batch_size must be in [1, 4]")
     jobs = L_full.shape[0]
-    _stitch_inverse_batched_kernel[(triton.cdiv(jobs, batch_size),)](
-        L_full, diag, inverse, jobs, batch_size, num_warps=4, num_stages=1,
+    fast_launch(_stitch_inverse_batched_kernel, (triton.cdiv(jobs, batch_size),), 4, 1)(
+        L_full, diag, inverse, jobs, batch_size,
     )
 
 
@@ -276,16 +277,14 @@ def _launch_prep_affine_from_inverse(
     B = qe.shape[0]
     batch = _AFFINE_BATCH if NT % _AFFINE_BATCH == 0 else 1
     if batch > 1:
-        _prep_affine_from_inverse_batched_kernel[(NT // batch, B * H)](
+        fast_launch(_prep_affine_from_inverse_batched_kernel, (NT // batch, B * H), 4, 2)(
             qe, ke, kr, vb, inverse, qe2, au, cu, mw, a_out,
             T, H, K, V, NT, BT, batch,
-            num_warps=4, num_stages=2,
         )
     else:
-        _prep_affine_from_inverse_kernel[(NT, B * H)](
+        fast_launch(_prep_affine_from_inverse_kernel, (NT, B * H), 4, 2)(
             qe, ke, kr, vb, inverse, qe2, au, cu, mw, a_out,
             T, H, K, V, NT, BT,
-            num_warps=4, num_stages=2,
         )
 
 
@@ -475,13 +474,12 @@ def raw_inverse_prep_affine_trim_ascend(
     launch_inverse64_rawdiag_outer(L_flat, diag_flat)
     launch_stitch_inverse_dispatch(L_flat, diag_flat, inverse, H, NT, jobs)
     batch = 4 if NT % 4 == 0 else 1
-    _prep_affine_from_inverse_trim_kernel[(NT // batch, B * H)](
+    fast_launch(_prep_affine_from_inverse_trim_kernel, (NT // batch, B * H), 4, 2)(
         q, v, e1, b1, ke, kr, inverse,
         qe2, au, cu, mw, a_out,
         T, H, K, V, NT, BT, rep, factor_t,
         *q.stride(), *v.stride(),
         batch,
-        num_warps=4, num_stages=2,
     )
     return qe2, au, cu, mw, a_out
 

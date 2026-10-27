@@ -30,6 +30,8 @@ import os
 
 import torch
 import triton
+
+from .fast_launch import fast_launch
 import triton.language as tl
 
 from flag_attn.FLA.index import prepare_chunk_indices, prepare_chunk_offsets
@@ -210,7 +212,7 @@ def chunk_gated_delta_rule_fwd_h_ascend(
     v_new = torch.empty_like(u) if save_new_value else None
     BV = min(V, int(bv) if bv else _default_bv(V))
 
-    _fwd_h_kernel[(triton.cdiv(V, BV), N * H)](
+    fast_launch(_fwd_h_kernel, (triton.cdiv(V, BV), N * H), num_warps or _default_warps(), num_stages or _default_stages())(
         k=k,
         v=u,
         w=w,
@@ -233,8 +235,7 @@ def chunk_gated_delta_rule_fwd_h_ascend(
         STORE_FINAL_STATE=final_state is not None,
         SAVE_NEW_VALUE=save_new_value,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=num_warps or _default_warps(),
-        num_stages=num_stages or _default_stages(),
+
     )
     return h, v_new, final_state
 

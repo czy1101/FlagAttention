@@ -5,6 +5,8 @@ from pathlib import Path
 
 import torch
 import triton
+
+from .fast_launch import fast_launch
 import triton.language as tl
 import triton.experimental.tle as tle
 import triton.experimental.tle.language.raw as tle_raw
@@ -241,20 +243,19 @@ def _inverse32_stitch_kernel(L, DIAG, OUT, JOBS: tl.constexpr,
 
 def launch_inverse32_diag(L: torch.Tensor, out: torch.Tensor, block: int):
     jobs, bt, _ = L.shape
-    _inverse32_diag_kernel[(jobs,)](L, out, jobs, bt, block,
-                                    num_warps=4, num_stages=1)
+    fast_launch(_inverse32_diag_kernel, (jobs,), 4, 1)(L, out, jobs, bt, block)
 
 
 def launch_inverse64_rawdiag(L: torch.Tensor, diag: torch.Tensor):
     jobs, bt, _ = L.shape
-    _inverse32_diag_pair_kernel[(jobs, 2)](
-        L, diag, jobs, bt, num_warps=4, num_stages=1)
+    fast_launch(_inverse32_diag_pair_kernel, (jobs, 2), 4, 1)(
+        L, diag, jobs, bt)
 
 
 def launch_inverse64_rawdiag_outer(L: torch.Tensor, diag: torch.Tensor):
     jobs, bt, _ = L.shape
-    _inverse32_diag_pair_outer_kernel[(jobs, 2)](
-        L, diag, jobs, bt, num_warps=4, num_stages=1)
+    fast_launch(_inverse32_diag_pair_outer_kernel, (jobs, 2), 4, 1)(
+        L, diag, jobs, bt)
 
 
 def launch_inverse64_rawdiag_outer_batch2(L: torch.Tensor, diag: torch.Tensor):
@@ -264,24 +265,23 @@ def launch_inverse64_rawdiag_outer_batch2(L: torch.Tensor, diag: torch.Tensor):
         raise ValueError("batched Raw inverse requires [jobs,64,64] input")
     if diag.shape != (jobs, 2, 33, 32):
         raise ValueError("batched Raw inverse output must be [jobs,2,33,32]")
-    _inverse64_rawdiag_batch2_kernel[(jobs,)](
-        L, diag, jobs, bt, num_warps=4, num_stages=1,
+    fast_launch(_inverse64_rawdiag_batch2_kernel, (jobs,), 4, 1)(
+        L, diag, jobs, bt,
     )
 
 
 def launch_inverse64_rawdiag_outer_packed(L: torch.Tensor, diag: torch.Tensor):
     """Invert the two diagonal 32x32 blocks in packed `[tile,3,32,32]` L."""
     jobs = L.shape[0] * L.shape[1] * L.shape[2]
-    _inverse32_diag_pair_packed_kernel[(jobs, 2)](
-        L, diag, jobs, 64, num_warps=4, num_stages=1)
+    fast_launch(_inverse32_diag_pair_packed_kernel, (jobs, 2), 4, 1)(
+        L, diag, jobs, 64)
 
 
 def launch_inverse64_stitch(L: torch.Tensor, diag: torch.Tensor,
                             out: torch.Tensor, *, cube_bf16: bool = False):
     jobs, bt, _ = L.shape
-    _inverse32_stitch_kernel[(jobs,)](
-        L, diag, out, jobs, bt, out.dtype == torch.bfloat16, cube_bf16,
-        num_warps=4, num_stages=1)
+    fast_launch(_inverse32_stitch_kernel, (jobs,), 4, 1)(
+        L, diag, out, jobs, bt, out.dtype == torch.bfloat16, cube_bf16)
 
 
 __all__ = ["launch_inverse32_diag", "launch_inverse64_rawdiag",
