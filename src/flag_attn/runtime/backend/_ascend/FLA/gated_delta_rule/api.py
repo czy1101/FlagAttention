@@ -32,7 +32,13 @@ from .chunk import (
     ascend_chunk_size,
     chunk_gated_delta_rule_fwd,
 )
+from .fast_launch import install as _install_fast_launch
 from .fused_ascend import strided_fold_supported
+
+# The fast path is host-bound on small shapes; accelerate this backend's
+# Triton launches (only kernels under _ascend are affected).  Opt out with
+# FLAG_ATTN_ASCEND_GDN_FASTLAUNCH=0.
+_install_fast_launch()
 
 _ALLOWED_BT = (16, 32, 64)
 

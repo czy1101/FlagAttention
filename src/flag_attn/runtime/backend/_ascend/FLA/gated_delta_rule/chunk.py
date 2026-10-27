@@ -52,6 +52,7 @@ from .fused_ascend import (
     prep_affine_ascend,
     prep_w_u_ascend,
 )
+from .fast_launch import begin_forward, end_forward
 from .fwd_h_ascend import chunk_gated_delta_rule_fwd_h_ascend
 from .kkt import chunk_gated_delta_rule_prep
 from .wy_fast_ascend import (
@@ -64,13 +65,22 @@ _BT_ENV = "FLAG_ATTN_ASCEND_GDN_BT"
 _FAST_ENV = "FLAG_ATTN_ASCEND_GDN_FAST"
 _FUSE_ENV = "FLAG_ATTN_ASCEND_GDN_FUSE"
 _RAW_INVERSE_ENV = "FLAG_ATTN_ASCEND_GDN_RAW_INVERSE"
-_RAW_INVERSE_MIN_JOBS = 2048
+# Measured on 2026-10-27 (CANN 9.1 / 910B): once the chunk/head grid reaches
+# 1024 jobs the exact two-pass scan plus the Raw inverse wins even for short
+# sequences (T=256..1024, NT=2..16): -18% at gqa-B2-T2048 (jobs 1024),
+# -24% at B8-T1024-d64, -28..-32% at B8-T512/B4-T512/B8-T256 jobs-1024 shapes
+# and B4-T1024-H64. Below 1024 jobs (e.g. T2048-h8, jobs 256) Raw is slower.
+_RAW_INVERSE_MIN_JOBS = 1024
 
 _OFF = {"0", "false", "off", "no"}
 
 # Chunk count from which the exact two-pass state scan beats the fused
 # sequential one (measured crossover; see fused_ascend._affine_kernel).
+# For NT < 32 the two-pass scan still pays off on large grids, so the jobs
+# threshold above is OR-ed in (validated down to NT=2; NT=1 is neutral, so it
+# keeps the one-pass path).
 _TWOPASS_MIN_CHUNKS = 32
+_TWOPASS_MIN_JOBS = 1024
 
 def _use_fused() -> bool:
     """Fused (fold+prep_w_u+fwd_h_o) is the default; the staged 5-launch path
@@ -224,30 +234,37 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
         # precompute, pass2 with two dots per chunk; see _affine_kernel in
         # fused_ascend.py).  Measured: fwd_h_o device 0.256 -> 0.170 ms at
         # T2048/H8, while the extra pass costs 0.109 ms of device + ~0.10 ms of
-        # host; it only pays off once the sequential chain is long, so it is
-        # enabled for NT >= 32 (T2048/H8) and kept off below that.  Override
-        # with FLAG_ATTN_ASCEND_GDN_TWOPASS=1/0.
+        # host; it pays off once the sequential chain is long (NT >= 32) or the
+        # chunk/head grid is large enough (jobs >= 1024, NT >= 2), where the
+        # pass-1 parallelism dominates the extra pass.  Override with
+        # FLAG_ATTN_ASCEND_GDN_TWOPASS=1/0.
         two_pass_env = os.environ.get("FLAG_ATTN_ASCEND_GDN_TWOPASS", "")
         if two_pass_env:
             two_pass = two_pass_env.lower() not in _OFF
         else:
-            nt = len(prepare_chunk_indices(cu_seqlens, bt)) if cu_seqlens is not None else -(-g.shape[1] // bt)
-            two_pass = cu_seqlens is None and nt >= _TWOPASS_MIN_CHUNKS
+            nt = -(-g.shape[1] // bt)
+            jobs = q.shape[0] * nt * beta.shape[2]
+            two_pass = cu_seqlens is None and (
+                nt >= _TWOPASS_MIN_CHUNKS
+                or (nt >= 2 and jobs >= _TWOPASS_MIN_JOBS)
+            )
         if two_pass and cu_seqlens is None:
+            jobs = q.shape[0] * triton.cdiv(q.shape[1], bt) * beta.shape[2]
             raw_inverse = (
                 os.environ.get(_RAW_INVERSE_ENV, "1").lower() not in _OFF
                 and bt == 64
-                and q.shape[0] * triton.cdiv(q.shape[1], bt) * beta.shape[2]
-                >= _RAW_INVERSE_MIN_JOBS
+                and jobs >= _RAW_INVERSE_MIN_JOBS
                 and k.shape[-1] == v.shape[-1]
                 and 0 < k.shape[-1] <= 128
                 and q.dtype in (torch.bfloat16, torch.float16)
             )
             if raw_inverse:
-                # This experimental route defaults on only for workloads with
-                # at least 2048 independent chunk/head jobs. Smaller grids lose
-                # to fused prep because Raw adds inverse materialization work.
-                # One-pass and varlen remain on the established fused prep.
+                # This route defaults on for workloads with at least 1024
+                # independent chunk/head jobs (was 2048 before the 2026-10-27
+                # measurement round: with the current Raw prep, jobs-1024 grids
+                # win by 18-32% once the two-pass scan is also enabled).
+                # Below that the fused prep wins because Raw adds inverse
+                # materialization work; one-pass and varlen keep fused prep.
                 from .raw_inverse_prep import raw_inverse_prep_affine_ascend
 
                 qe2, au, cu, mw, a_masked = raw_inverse_prep_affine_ascend(
@@ -329,10 +346,16 @@ def chunk_gated_delta_rule_fwd(
     """Forward pass; returns the generic ``(g, o, A, final_state, w, h, v_new)``."""
     chunk_size = int(chunk_size or ascend_chunk_size())
     if _use_fast_path(q, k, v):
-        g_cum, o, A, final_state = _fwd_fast(
-            q, k, v, g, beta, scale, initial_state, output_final_state,
-            cu_seqlens, chunk_size, head_first_strided,
-        )
+        # One device + stream lookup per forward; every fast-path launch is on
+        # this stream (see fast_launch.begin_forward).
+        begin_forward()
+        try:
+            g_cum, o, A, final_state = _fwd_fast(
+                q, k, v, g, beta, scale, initial_state, output_final_state,
+                cu_seqlens, chunk_size, head_first_strided,
+            )
+        finally:
+            end_forward()
     else:
         # fp16 / wide head dims: the generic path is only UB-safe at BT<=32.
         g_cum, o, A, final_state = _fwd_legacy(

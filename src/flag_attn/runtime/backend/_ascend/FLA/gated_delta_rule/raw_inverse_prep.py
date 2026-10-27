@@ -166,20 +166,14 @@ def launch_stitch_inverse_batch4(L_full: torch.Tensor,
     launch_stitch_inverse_batched(L_full, diag, inverse, batch_size=4)
 
 
-@triton.jit(do_not_specialize=["T"])
-def _prep_affine_from_inverse_kernel(
+@triton.jit
+def _affine_from_inverse_body(
     qe, ke, kr, vb, INVERSE,
     qe2, au, cu, mw, a_out,
-    T,
+    i_t, tile, base_k, base_v, base_bt, T,
     H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     NT: tl.constexpr, BT: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    i_b, i_h = i_bh // H, i_bh % H
-    base = i_b * T * H + i_h
-    base_k = base * K
-    base_v = base * V
-    tile = (i_b * NT + i_t) * H + i_h
     r = tl.arange(0, BT)
     p_ai = tl.make_block_ptr(INVERSE + tile * BT * BT,
                              (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0))
@@ -205,7 +199,7 @@ def _prep_affine_from_inverse_kernel(
     b_a = tl.dot(b_qe, b_kr)
     b_a = tl.where(o_t[:, None] >= o_t[None, :], b_a, 0.0)
     b_a = b_a.to(a_out.dtype.element_ty)
-    tl.store(tl.make_block_ptr(a_out + base * BT, (T, BT), (H * BT, 1),
+    tl.store(tl.make_block_ptr(a_out + base_bt, (T, BT), (H * BT, 1),
                               (i_t * BT, 0), (BT, BT), (1, 0)),
              b_a, boundary_check=(0, 1))
 
@@ -218,14 +212,84 @@ def _prep_affine_from_inverse_kernel(
                               (i_t * BT, 0), (BT, V), (1, 0)),
              tl.dot(b_a, b_u).to(au.dtype.element_ty), boundary_check=(0, 1))
 
-    cbase_v = ((i_b * NT + i_t) * H + i_h) * K * V
+    cbase_v = tile * K * V
     p_cu = tl.make_block_ptr(cu + cbase_v, (K, V), (V, 1),
                              (0, 0), (K, V), (1, 0))
     tl.store(p_cu, tl.dot(b_kr, b_u.to(b_kr.dtype)).to(p_cu.dtype.element_ty))
-    cbase_m = ((i_b * NT + i_t) * H + i_h) * K * K
+    cbase_m = tile * K * K
     p_mw = tl.make_block_ptr(mw + cbase_m, (K, K), (K, 1),
                              (0, 0), (K, K), (1, 0))
     tl.store(p_mw, tl.dot(b_kr, b_w.to(b_kr.dtype)).to(p_mw.dtype.element_ty))
+
+
+@triton.jit
+def _prep_affine_from_inverse_kernel(
+    qe, ke, kr, vb, INVERSE,
+    qe2, au, cu, mw, a_out,
+    T,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    NT: tl.constexpr, BT: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    base = i_b * T * H + i_h
+    tile = (i_b * NT + i_t) * H + i_h
+    _affine_from_inverse_body(
+        qe, ke, kr, vb, INVERSE, qe2, au, cu, mw, a_out,
+        i_t, tile, base * K, base * V, base * BT, T, H, K, V, NT, BT,
+    )
+
+
+@triton.jit
+def _prep_affine_from_inverse_batched_kernel(
+    qe, ke, kr, vb, INVERSE,
+    qe2, au, cu, mw, a_out,
+    T,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    NT: tl.constexpr, BT: tl.constexpr,
+    BATCH: tl.constexpr,
+):
+    i_g, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    base = i_b * T * H + i_h
+    for k in tl.static_range(0, BATCH):
+        i_t = i_g * BATCH + k
+        tile = (i_b * NT + i_t) * H + i_h
+        _affine_from_inverse_body(
+            qe, ke, kr, vb, INVERSE, qe2, au, cu, mw, a_out,
+            i_t, tile, base * K, base * V, base * BT, T, H, K, V, NT, BT,
+        )
+
+
+# The affine kernel is limited by per-program scalar/scheduling overhead, not
+# by MACs or HBM (measured 2026-10-27: B4/T4096 462 GB/s, MAC ~12%).  Folding
+# four consecutive chunks into one program amortises that overhead: 6.68 ->
+# 5.74 ms on B4/T4096 (grid 16384 -> 4096 programs) and 0.824 -> 0.693 ms on
+# B4/T2048, with bit-identical outputs.  BATCH=8 was slightly worse.
+_AFFINE_BATCH = 4
+
+
+def _launch_prep_affine_from_inverse(
+    qe, ke, kr, vb, inverse, qe2, au, cu, mw, a_out,
+    T, H, K, V, NT, BT,
+):
+    B = qe.shape[0]
+    batch = _AFFINE_BATCH if NT % _AFFINE_BATCH == 0 else 1
+    if batch > 1:
+        _prep_affine_from_inverse_batched_kernel[(NT // batch, B * H)](
+            qe, ke, kr, vb, inverse, qe2, au, cu, mw, a_out,
+            T, H, K, V, NT, BT, batch,
+            num_warps=4, num_stages=2,
+        )
+    else:
+        _prep_affine_from_inverse_kernel[(NT, B * H)](
+            qe, ke, kr, vb, inverse, qe2, au, cu, mw, a_out,
+            T, H, K, V, NT, BT,
+            num_warps=4, num_stages=2,
+        )
+
+
+
 
 
 def raw_inverse_prep_affine_ascend(qe, ke, kr, vb, chunk_size, output_dtype=None):
@@ -254,10 +318,9 @@ def raw_inverse_prep_affine_ascend(qe, ke, kr, vb, chunk_size, output_dtype=None
     diag_flat = diag.view(-1, 2, 33, 32)
     launch_inverse64_rawdiag_outer(L_flat, diag_flat)
     launch_stitch_inverse_batch4(L_flat, diag_flat, inverse)
-    _prep_affine_from_inverse_kernel[(NT, B * H)](
+    _launch_prep_affine_from_inverse(
         qe, ke, kr, vb, inverse, qe2, au, cu, mw, a_out,
         T, H, K, V, NT, BT,
-        num_warps=4, num_stages=2,
     )
     return qe2, au, cu, mw, a_out
 
