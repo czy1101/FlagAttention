@@ -553,6 +553,43 @@ def _fold_headfirst_stride_kernel(
              mask=mask_t[:, None] & (rk[None, :] < V))
 
 
+@triton.jit(do_not_specialize=["T"])
+def _fold_headfirst_stride_trim_kernel(
+    k, r1, be1, ke, kr, T,
+    H: tl.constexpr, Hg: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, FACTOR_T: tl.constexpr,
+    SKB: tl.constexpr, SKT: tl.constexpr, SKH: tl.constexpr, SKK: tl.constexpr,
+):
+    """Strided fold that materialises only k_e/k_r (v1 fold trim).
+
+    qe = q*e1 and vb = v*beta are recomputed inside the affine kernel from the
+    source q/v tensors and the small fp32 factor buffers, which removes
+    qe/vb GM round trips (B4/T4096 fold traffic 1.88 GB -> 0.81 GB).
+    """
+    i_c, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    rep = H // Hg
+    i_hg = i_h // rep
+    rt = i_c * BT + tl.arange(0, BT)
+    rk = tl.arange(0, K)
+    mask_t = rt < T
+    factor_offset = i_b * H * FACTOR_T + i_h * FACTOR_T + rt
+    b_r = tl.load(r1 + factor_offset, mask=mask_t, other=0.0).to(tl.float32)
+    b_be = tl.load(be1 + factor_offset, mask=mask_t, other=0.0).to(tl.float32)
+    k_offset = (i_b * SKB + rt[:, None] * SKT + i_hg * SKH
+                + rk[None, :] * SKK)
+    mask = mask_t[:, None] & (rk[None, :] < K)
+    b_k = tl.load(k + k_offset, mask=mask, other=0.0)
+    base = i_b * T * H + i_h
+    out_offset = base * K + rt[:, None] * (H * K) + rk[None, :]
+    tl.store(ke + out_offset,
+             (b_k.to(tl.float32) * b_be[:, None]).to(ke.dtype.element_ty),
+             mask=mask)
+    tl.store(kr + out_offset,
+             (b_k.to(tl.float32) * b_r[:, None]).to(kr.dtype.element_ty),
+             mask=mask)
+
+
 def _fold_headfirst_strided(g, q, k, v, beta, chunk_size):
     B, T, Hg, K = q.shape
     H, V = beta.shape[-1], v.shape[-1]
@@ -1275,6 +1312,18 @@ _scratch: "OrderedDict[tuple, dict]" = OrderedDict()
 
 
 _OFF_VALUES = {"0", "false", "off", "no"}
+# v1 fold trim: only materialise k_e/k_r in the strided fold and recompute
+# qe/vb inside the affine kernel.  Measured 2026-10-27 on B4/T4096/H64 BF16:
+# fold 2.467 -> 1.252 ms, E2E -0.97 ms (-4.3%), bit-identical; B2/T16384
+# -0.37 ms.  Only for BF16 fixed-length Raw-prep grids (jobs >= 2048); the
+# FP16 path still uses the full 4-output fold.
+_FOLD_TRIM_ENV = "FLAG_ATTN_ASCEND_GDN_FOLD_TRIM"
+
+
+def fold_trim_enabled() -> bool:
+    forced = os.environ.get(_FOLD_TRIM_ENV, "").lower()
+    return forced not in _OFF_VALUES if forced else True
+
 _SCRATCH_ENABLED = (
     os.environ.get("FLAG_ATTN_ASCEND_GDN_SCRATCH", "1") not in _OFF_VALUES
 )
@@ -1354,6 +1403,58 @@ def _lk(buf, key, fn, grid, warps, stages):
     return site_launcher(_scratch_launchers(buf), key + (warps, stages),
                          fn, grid, num_warps=warps, num_stages=stages)
 
+
+
+def fold_headfirst_strided_trim(g, q, k, v, beta, chunk_size):
+    """v1 fold trim: write only k_e/k_r plus the fp32 factor buffers.
+
+    Returns ``(g_cum, ke, kr, ctx)`` where ``ctx = (q, v, e1, b1, factor_t,
+    rep)`` is handed to ``raw_inverse_prep_affine_trim_ascend``, which
+    recomputes qe/vb while it already reads those sources.
+    """
+    B, T, Hg, K = q.shape
+    H, V = beta.shape[-1], v.shape[-1]
+    BT = int(chunk_size)
+    NC = triton.cdiv(T, BT)
+    BH = 16
+    factor_t = triton.cdiv(T, 32) * 32
+    factor_shape = (B, H, factor_t)
+    if _scratch_enabled():
+        buf = _fast_scratch(B, T, H, K, V, BT, q.dtype, q.device)
+        g_cum = buf["g_cum"]
+        ke, kr = buf["ke"], buf["kr"]
+        if "headfirst_e1" not in buf:
+            buf["headfirst_e1"] = torch.empty(
+                factor_shape, dtype=torch.float32, device=g.device,
+            )
+            buf["headfirst_r1"] = torch.empty_like(buf["headfirst_e1"])
+            buf["headfirst_b1"] = torch.empty_like(buf["headfirst_e1"])
+            buf["headfirst_be1"] = torch.empty_like(buf["headfirst_e1"])
+        e1 = buf["headfirst_e1"]
+        r1 = buf["headfirst_r1"]
+        b1 = buf["headfirst_b1"]
+        be1 = buf["headfirst_be1"]
+    else:
+        g_cum = torch.empty(B, T, H, dtype=torch.float32, device=g.device)
+        ke = torch.empty(B, T, H, K, dtype=q.dtype, device=q.device)
+        kr = torch.empty_like(ke)
+        e1 = torch.empty(factor_shape, dtype=torch.float32, device=g.device)
+        r1 = torch.empty_like(e1)
+        b1 = torch.empty_like(e1)
+        be1 = torch.empty_like(e1)
+    warps, stages = _fold_config()
+    _factor_headfirst_stride_kernel[(NC, B * triton.cdiv(H, BH))](
+        g, beta, g_cum, e1, r1, b1, be1, T,
+        H, BT, BH, factor_t, *g.stride(), *beta.stride(),
+        num_warps=warps, num_stages=stages,
+    )
+    _fold_headfirst_stride_trim_kernel[(NC, B * H)](
+        k, r1, be1, ke, kr, T,
+        H, Hg, K, V, BT, factor_t, *k.stride(),
+        num_warps=warps, num_stages=stages,
+    )
+    ctx = (q, v, e1, b1, factor_t, H // Hg)
+    return g_cum, ke, kr, ctx
 
 
 def fold_ascend(

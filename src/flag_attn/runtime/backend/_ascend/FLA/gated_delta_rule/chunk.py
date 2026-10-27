@@ -47,6 +47,8 @@ from flag_attn.FLA.gated_delta_rule.wy_fast import recompute_w_u_fwd
 from .chunk_o_ascend import chunk_fwd_o_ascend
 from .fused_ascend import (
     fold_ascend,
+    fold_headfirst_strided_trim,
+    fold_trim_enabled,
     fwd_h_o_2pass_ascend,
     fwd_h_o_ascend,
     prep_affine_ascend,
@@ -71,6 +73,9 @@ _RAW_INVERSE_ENV = "FLAG_ATTN_ASCEND_GDN_RAW_INVERSE"
 # -24% at B8-T1024-d64, -28..-32% at B8-T512/B4-T512/B8-T256 jobs-1024 shapes
 # and B4-T1024-H64. Below 1024 jobs (e.g. T2048-h8, jobs 256) Raw is slower.
 _RAW_INVERSE_MIN_JOBS = 1024
+# v1 fold trim (only materialise k_e/k_r) needs the Raw prep path and a grid
+# where the extra qe/vb recompute in the affine kernel is amortised.
+_FOLD_TRIM_MIN_JOBS = 2048
 
 _OFF = {"0", "false", "off", "no"}
 
@@ -226,10 +231,50 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
         # state scan + output. Long fixed sequences fuse prep with the affine
         # precompute below, removing the W/U GM round trip, the A reload, and
         # one launch. A is still written because this function returns it.
-        g_cum, qe, ke, kr, vb = fold_ascend(
-            g, q, k, v, beta, cu_seqlens, bt,
-            head_first_strided=head_first_strided,
+        #
+        # v1 fold trim: on BF16 fixed-length Raw-prep grids (jobs >= 2048) the
+        # strided fold only materialises k_e/k_r; qe/vb are recomputed inside
+        # the Raw affine kernel from q/v and the small fp32 factor buffers.
+        # That removes ~1 GB of GM traffic at B4/T4096 (fold 2.47 -> 1.25 ms,
+        # E2E -0.97 ms, bit-identical).  FP16 keeps the full fold.
+        nt = -(-g.shape[1] // bt)
+        jobs = q.shape[0] * nt * beta.shape[2]
+        two_pass_env = os.environ.get("FLAG_ATTN_ASCEND_GDN_TWOPASS", "")
+        if two_pass_env:
+            expect_two_pass = two_pass_env.lower() not in _OFF
+        else:
+            expect_two_pass = cu_seqlens is None and (
+                nt >= _TWOPASS_MIN_CHUNKS
+                or (nt >= 2 and jobs >= _TWOPASS_MIN_JOBS)
+            )
+        expect_raw = (
+            expect_two_pass
+            and cu_seqlens is None
+            and os.environ.get(_RAW_INVERSE_ENV, "1").lower() not in _OFF
+            and bt == 64
+            and jobs >= _RAW_INVERSE_MIN_JOBS
+            and k.shape[-1] == v.shape[-1]
+            and 0 < k.shape[-1] <= 128
+            and q.dtype in (torch.bfloat16, torch.float16)
         )
+        trim = (
+            expect_raw
+            and head_first_strided
+            and fold_trim_enabled()
+            and q.dtype == torch.bfloat16
+            and jobs >= _FOLD_TRIM_MIN_JOBS
+        )
+        trim_ctx = None
+        if trim:
+            g_cum, ke, kr, trim_ctx = fold_headfirst_strided_trim(
+                g, q, k, v, beta, bt,
+            )
+            qe = vb = None
+        else:
+            g_cum, qe, ke, kr, vb = fold_ascend(
+                g, q, k, v, beta, cu_seqlens, bt,
+                head_first_strided=head_first_strided,
+            )
         # Optional exact two-pass state scan (pass1 chunk-parallel affine
         # precompute, pass2 with two dots per chunk; see _affine_kernel in
         # fused_ascend.py).  Measured: fwd_h_o device 0.256 -> 0.170 ms at
@@ -265,11 +310,24 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
                 # win by 18-32% once the two-pass scan is also enabled).
                 # Below that the fused prep wins because Raw adds inverse
                 # materialization work; one-pass and varlen keep fused prep.
-                from .raw_inverse_prep import raw_inverse_prep_affine_ascend
+                if trim_ctx is not None:
+                    from .raw_inverse_prep import (
+                        raw_inverse_prep_affine_trim_ascend,
+                    )
 
-                qe2, au, cu, mw, a_masked = raw_inverse_prep_affine_ascend(
-                    qe, ke, kr, vb, bt, output_dtype=q.dtype
-                )
+                    qe2, au, cu, mw, a_masked = (
+                        raw_inverse_prep_affine_trim_ascend(
+                            *trim_ctx, ke, kr, bt, output_dtype=q.dtype
+                        )
+                    )
+                else:
+                    from .raw_inverse_prep import (
+                        raw_inverse_prep_affine_ascend,
+                    )
+
+                    qe2, au, cu, mw, a_masked = raw_inverse_prep_affine_ascend(
+                        qe, ke, kr, vb, bt, output_dtype=q.dtype
+                    )
             else:
                 qe2, au, cu, mw, a_masked = prep_affine_ascend(
                     qe, ke, kr, vb, bt, output_dtype=q.dtype

@@ -107,12 +107,14 @@ def _hooks_active() -> bool:
     return False
 
 
-def _cache_key(fn, args, grid, kwargs, skip, dev):
+def _cache_key(fn, vals, grid, opts, skip, dev):
     # The cached entry holds a device-specific function handle and stream, so
-    # the device is part of the key (multi-card safety).
-    key = [id(fn), dev, tuple(grid), tuple(kwargs.items())]
+    # the device is part of the key (multi-card safety).  ``vals`` is the
+    # canonical positional argument list (kwargs already folded in); tensors are
+    # represented by dtype + 16-byte alignment, never by object identity.
+    key = [id(fn), dev, len(vals), tuple(grid), tuple(opts.items())]
     is_tensor = torch.Tensor
-    for i, a in enumerate(args):
+    for i, a in enumerate(vals):
         if i in skip:
             continue
         if type(a) is is_tensor:
@@ -120,6 +122,34 @@ def _cache_key(fn, args, grid, kwargs, skip, dev):
         else:
             key.append(a)
     return tuple(key)
+
+
+def _canonicalize(self, args, kwargs):
+    """Fold keyword kernel arguments into the canonical positional list.
+
+    The cached low-level launcher always takes every kernel argument
+    positionally, so call sites that pass some parameters by keyword (e.g.
+    ``chunk_o_ascend``) must be canonicalized first; otherwise the launcher
+    receives too few arguments.  Launch options (``num_warps`` ...) stay in a
+    separate dict.
+    """
+    names = getattr(self, "arg_names", None)
+    if not names:
+        return None
+    n = len(names)
+    if len(args) > n:
+        return None
+    vals = list(args)
+    for j in range(len(vals), n):
+        name = names[j]
+        if name in kwargs:
+            vals.append(kwargs[name])
+        else:
+            # Missing trailing parameters would need Triton's own default
+            # handling: let the regular path deal with those rare calls.
+            return None
+    opts = {k: v for k, v in kwargs.items() if k not in names}
+    return vals, opts
 
 
 def _fast_run(self, *args, grid, warmup, **kwargs):
@@ -134,9 +164,13 @@ def _fast_run(self, *args, grid, warmup, **kwargs):
         return _ORIG_RUN(self, *args, grid=grid, warmup=warmup, **kwargs)
     if _hooks_active():
         return _ORIG_RUN(self, *args, grid=grid, warmup=warmup, **kwargs)
+    canon = _canonicalize(self, args, kwargs)
+    if canon is None:
+        return _ORIG_RUN(self, *args, grid=grid, warmup=warmup, **kwargs)
+    vals, opts = canon
     dev = _device()
     try:
-        key = _cache_key(self, args, grid, kwargs, _skip_indices(self), dev)
+        key = _cache_key(self, vals, grid, opts, _skip_indices(self), dev)
     except TypeError:
         return _ORIG_RUN(self, *args, grid=grid, warmup=warmup, **kwargs)
     ent = _CACHE.get(key)
@@ -161,7 +195,7 @@ def _fast_run(self, *args, grid, warmup, **kwargs):
     # No launch hooks can be registered here (checked above before the key
     # lookup), so pass None for the metadata/hook slots like the compiled
     # launcher does when nothing is profiling.
-    launch(g0, g1, g2, _stream(dev), function, packed, None, None, None, *args)
+    launch(g0, g1, g2, _stream(dev), function, packed, None, None, None, *vals)
     return None
 
 

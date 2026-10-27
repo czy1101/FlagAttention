@@ -94,8 +94,8 @@ def launch_kkt_blocks_batched(ke: torch.Tensor, kr: torch.Tensor,
                               L_full: torch.Tensor, T: int, H: int, K: int,
                               NT: int, BT: int, batch_size: int = 4) -> None:
     """Produce dense KKT tiles with 2 or 4 independent jobs per CTA."""
-    if batch_size not in (2, 4):
-        raise ValueError("KKT batch_size must be 2 or 4")
+    if batch_size < 1 or batch_size > 16:
+        raise ValueError("KKT batch_size must be in [1, 16]")
     batch = ke.shape[0]
     jobs = batch * NT * H
     _kkt_blocks_batched_kernel[(triton.cdiv(jobs, batch_size),)](
@@ -312,12 +312,19 @@ def raw_inverse_prep_affine_ascend(qe, ke, kr, vb, chunk_size, output_dtype=None
     cu = qe.new_empty((B, NT, H, K, V))
     mw = qe.new_empty((B, NT, H, K, K))
     a_out = torch.empty((B, T, H, BT), dtype=output_dtype, device=ke.device)
-    launch_kkt_blocks_batched(ke, kr, L_full, T, H, K, NT, BT,
-                              batch_size=4)
+    # Batching crossovers for the chunk-parallel KKT/stitch kernels; the Raw
+    # diagonal inverse stays as is (it is bound inside the CCEC inverse).
+    from .raw_inverse_batch import (
+        launch_kkt_blocks_dispatch,
+        launch_stitch_inverse_dispatch,
+    )
+
+    jobs = B * NT * H
+    launch_kkt_blocks_dispatch(ke, kr, L_full, T, H, K, NT, BT, jobs)
     L_flat = L_full.view(-1, BT, BT)
     diag_flat = diag.view(-1, 2, 33, 32)
     launch_inverse64_rawdiag_outer(L_flat, diag_flat)
-    launch_stitch_inverse_batch4(L_flat, diag_flat, inverse)
+    launch_stitch_inverse_dispatch(L_flat, diag_flat, inverse, H, NT, jobs)
     _launch_prep_affine_from_inverse(
         qe, ke, kr, vb, inverse, qe2, au, cu, mw, a_out,
         T, H, K, V, NT, BT,
@@ -325,4 +332,159 @@ def raw_inverse_prep_affine_ascend(qe, ke, kr, vb, chunk_size, output_dtype=None
     return qe2, au, cu, mw, a_out
 
 
-__all__ = ["raw_inverse_prep_affine_ascend"]
+@triton.jit
+def _affine_body_trim(
+    q, v, E1, B1, ke, kr, INVERSE,
+    qe2, au, cu, mw, a_out,
+    i_t, tile, base_k, base_v, base_bt, T,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    NT: tl.constexpr, BT: tl.constexpr, REP: tl.constexpr,
+    FACTOR_T: tl.constexpr,
+    SQB: tl.constexpr, SQT: tl.constexpr, SQH: tl.constexpr, SQK: tl.constexpr,
+    SVB: tl.constexpr, SVT: tl.constexpr, SVH: tl.constexpr, SVV: tl.constexpr,
+):
+    """Affine body for the v1 fold trim: qe/vb recomputed from q/v/factors.
+
+    The dot sequence, dtypes and store layout are identical to
+    ``_affine_from_inverse_body``; only the qe/vb loads are replaced by the
+    elementwise products q*exp(g_cum) and v*beta, which the fold would
+    otherwise have materialised into GM.
+    """
+    r = tl.arange(0, BT)
+    p_ai = tl.make_block_ptr(INVERSE + tile * BT * BT,
+                             (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0))
+    b_ai = tl.load(p_ai)
+
+    p_ke = tl.make_block_ptr(ke + base_k, (T, K), (H * K, 1),
+                             (i_t * BT, 0), (BT, K), (1, 0))
+    p_kr = tl.make_block_ptr(kr + base_k, (K, T), (1, H * K),
+                             (0, i_t * BT), (K, BT), (0, 1))
+    b_ke = tl.load(p_ke, boundary_check=(0, 1))
+    b_kr = tl.load(p_kr, boundary_check=(0, 1))
+
+    i_b = base_k // (T * H * K)
+    i_h = (base_k // K) % H
+    fr = i_b * H * FACTOR_T + i_h * FACTOR_T + i_t * BT + r
+    b_e = tl.load(E1 + fr).to(tl.float32)
+    b_beta = tl.load(B1 + fr).to(tl.float32)
+
+    i_hg = i_h // REP
+    p_q = tl.make_block_ptr(q + i_b * SQB + i_hg * SQH, (T, K), (SQT, SQK),
+                            (i_t * BT, 0), (BT, K), (1, 0))
+    b_qe = (tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
+            * b_e[:, None]).to(ke.dtype.element_ty)
+    p_v = tl.make_block_ptr(v + i_b * SVB + i_h * SVH, (T, V), (SVT, SVV),
+                            (i_t * BT, 0), (BT, V), (1, 0))
+    b_vb = (tl.load(p_v, boundary_check=(0, 1)).to(tl.float32)
+            * b_beta[:, None]).to(ke.dtype.element_ty)
+
+    b_w = tl.dot(b_ai.to(b_ke.dtype), b_ke)
+    b_u = tl.dot(b_ai.to(b_ke.dtype), b_vb)
+    b_w = b_w.to(a_out.dtype.element_ty)
+    b_u = b_u.to(a_out.dtype.element_ty)
+
+    o_t = i_t * BT + r
+    b_a = tl.dot(b_qe, b_kr)
+    b_a = tl.where(o_t[:, None] >= o_t[None, :], b_a, 0.0)
+    b_a = b_a.to(a_out.dtype.element_ty)
+    tl.store(tl.make_block_ptr(a_out + base_bt, (T, BT), (H * BT, 1),
+                              (i_t * BT, 0), (BT, BT), (1, 0)),
+             b_a, boundary_check=(0, 1))
+
+    b_qw = tl.dot(b_a, b_w.to(b_a.dtype))
+    tl.store(tl.make_block_ptr(qe2 + base_k, (T, K), (H * K, 1),
+                              (i_t * BT, 0), (BT, K), (1, 0)),
+             (b_qe.to(tl.float32) - b_qw).to(qe2.dtype.element_ty),
+             boundary_check=(0, 1))
+    tl.store(tl.make_block_ptr(au + base_v, (T, V), (H * V, 1),
+                              (i_t * BT, 0), (BT, V), (1, 0)),
+             tl.dot(b_a, b_u).to(au.dtype.element_ty), boundary_check=(0, 1))
+
+    cbase_v = tile * K * V
+    p_cu = tl.make_block_ptr(cu + cbase_v, (K, V), (V, 1),
+                             (0, 0), (K, V), (1, 0))
+    tl.store(p_cu, tl.dot(b_kr, b_u.to(b_kr.dtype)).to(p_cu.dtype.element_ty))
+    cbase_m = tile * K * K
+    p_mw = tl.make_block_ptr(mw + cbase_m, (K, K), (K, 1),
+                             (0, 0), (K, K), (1, 0))
+    tl.store(p_mw, tl.dot(b_kr, b_w.to(b_kr.dtype)).to(p_mw.dtype.element_ty))
+
+
+@triton.jit
+def _prep_affine_from_inverse_trim_kernel(
+    q, v, E1, B1, ke, kr, INVERSE,
+    qe2, au, cu, mw, a_out,
+    T,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    NT: tl.constexpr, BT: tl.constexpr, REP: tl.constexpr,
+    FACTOR_T: tl.constexpr,
+    SQB: tl.constexpr, SQT: tl.constexpr, SQH: tl.constexpr, SQK: tl.constexpr,
+    SVB: tl.constexpr, SVT: tl.constexpr, SVH: tl.constexpr, SVV: tl.constexpr,
+    BATCH: tl.constexpr,
+):
+    i_g, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    base = i_b * T * H + i_h
+    for j in tl.static_range(0, BATCH):
+        i_t = i_g * BATCH + j
+        tile = (i_b * NT + i_t) * H + i_h
+        _affine_body_trim(
+            q, v, E1, B1, ke, kr, INVERSE, qe2, au, cu, mw, a_out,
+            i_t, tile, base * K, base * V, base * BT, T,
+            H, K, V, NT, BT, REP, FACTOR_T,
+            SQB, SQT, SQH, SQK, SVB, SVT, SVH, SVV,
+        )
+
+
+def raw_inverse_prep_affine_trim_ascend(
+    q, v, e1, b1, factor_t, rep, ke, kr, chunk_size, output_dtype=None,
+):
+    """Raw inverse prep for the v1 fold trim (no qe/vb in GM).
+
+    ``q``/``v`` are the caller's (possibly head-first strided) source tensors
+    and ``e1``/``b1`` the fp32 exp(g_cum)/beta factor buffers produced by the
+    fold's factor pass.
+    """
+    B, T, H, K = ke.shape
+    V = kr.shape[-1]
+    BT = int(chunk_size)
+    if BT != 64 or V != K or K > 128:
+        raise ValueError("Raw prep supports only fixed BT=64 and K=V<=128")
+    NT = triton.cdiv(T, BT)
+    output_dtype = output_dtype or ke.dtype
+    L_full = torch.empty((B, NT, H, BT, BT),
+                         dtype=torch.float32, device=ke.device)
+    diag = torch.empty((B, NT, H, 2, 33, 32),
+                       dtype=torch.float32, device=ke.device)
+    inverse = torch.empty((B, NT, H, BT, BT),
+                          dtype=torch.float32, device=ke.device)
+    qe2 = q.new_empty((B, T, H, K))
+    au = torch.empty((B, T, H, V), dtype=output_dtype, device=ke.device)
+    cu = q.new_empty((B, NT, H, K, V))
+    mw = q.new_empty((B, NT, H, K, K))
+    a_out = torch.empty((B, T, H, BT), dtype=output_dtype, device=ke.device)
+    from .raw_inverse_batch import (
+        launch_kkt_blocks_dispatch,
+        launch_stitch_inverse_dispatch,
+    )
+
+    jobs = B * NT * H
+    launch_kkt_blocks_dispatch(ke, kr, L_full, T, H, K, NT, BT, jobs)
+    L_flat = L_full.view(-1, BT, BT)
+    diag_flat = diag.view(-1, 2, 33, 32)
+    launch_inverse64_rawdiag_outer(L_flat, diag_flat)
+    launch_stitch_inverse_dispatch(L_flat, diag_flat, inverse, H, NT, jobs)
+    batch = 4 if NT % 4 == 0 else 1
+    _prep_affine_from_inverse_trim_kernel[(NT // batch, B * H)](
+        q, v, e1, b1, ke, kr, inverse,
+        qe2, au, cu, mw, a_out,
+        T, H, K, V, NT, BT, rep, factor_t,
+        *q.stride(), *v.stride(),
+        batch,
+        num_warps=4, num_stages=2,
+    )
+    return qe2, au, cu, mw, a_out
+
+
+__all__ = ["raw_inverse_prep_affine_ascend",
+           "raw_inverse_prep_affine_trim_ascend"]
