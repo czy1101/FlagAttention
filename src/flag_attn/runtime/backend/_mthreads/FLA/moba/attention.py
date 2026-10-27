@@ -51,6 +51,29 @@ def _musa_exp2(x):
 
 
 @triton.jit
+def _store_bf16_pairs(
+    out_ptr,
+    row_offsets,
+    values,
+    row_mask,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # Output rows are contiguous and even-width. Preserve BF16 rounding while
+    # avoiding a private-memory round trip in the MP31 vector-store lowering.
+    bits = values.to(tl.bfloat16).to(tl.uint16, bitcast=True)
+    low, high = tl.split(tl.reshape(bits, (BLOCK_M, BLOCK_D // 2, 2)))
+    packed = low.to(tl.uint32) | (high.to(tl.uint32) << 16)
+    pairs = tl.arange(0, BLOCK_D // 2)
+    tl.store(
+        out_ptr.to(tl.pointer_type(tl.uint32)) + row_offsets[:, None] // 2 + pairs[None, :],
+        packed,
+        mask=row_mask[:, None] & (pairs[None, :] < HEAD_DIM // 2),
+    )
+
+
+@triton.jit
 def _varlen_attn_fwd_kernel(
     q_ptr,
     k_ptr,
@@ -147,11 +170,15 @@ def _varlen_attn_fwd_kernel(
         row_max = new_max
 
     acc /= row_sum[:, None]
-    tl.store(
-        out_ptr + (q_start + offs_m[:, None]) * stride_o_t + head * stride_o_h + offs_d[None, :] * stride_o_d,
-        acc,
-        mask=mask_m[:, None] & mask_d[None, :],
-    )
+    if out_ptr.dtype.element_ty == tl.bfloat16 and HEAD_DIM % 2 == 0:
+        _store_bf16_pairs(out_ptr, (q_start + offs_m) * stride_o_t + head * stride_o_h,
+                          acc, mask_m, HEAD_DIM, BLOCK_M, BLOCK_D)
+    else:
+        tl.store(
+            out_ptr + (q_start + offs_m[:, None]) * stride_o_t + head * stride_o_h + offs_d[None, :] * stride_o_d,
+            acc,
+            mask=mask_m[:, None] & mask_d[None, :],
+        )
     lse = (row_max + libdevice.log2(row_sum)) / _LOG2E
     tl.store(
         lse_ptr + head * stride_lse_h + (q_start + offs_m) * stride_lse_t,
@@ -698,11 +725,15 @@ def _routed_gqa_attn_fwd_kernel(
         row_max = new_max
 
     acc /= row_sum[:, None]
-    tl.store(
-        out_ptr + route_positions[:, None] * stride_out_t + offs_d[None, :] * stride_out_d,
-        acc,
-        mask=mask_m[:, None] & mask_d[None, :],
-    )
+    if out_ptr.dtype.element_ty == tl.bfloat16 and HEAD_DIM % 2 == 0:
+        _store_bf16_pairs(out_ptr, route_positions * stride_out_t,
+                          acc, mask_m, HEAD_DIM, BLOCK_M, BLOCK_D)
+    else:
+        tl.store(
+            out_ptr + route_positions[:, None] * stride_out_t + offs_d[None, :] * stride_out_d,
+            acc,
+            mask=mask_m[:, None] & mask_d[None, :],
+        )
     lse = (row_max + libdevice.log2(row_sum)) / _LOG2E
     tl.store(lse_ptr + route_positions, lse, mask=mask_m)
 

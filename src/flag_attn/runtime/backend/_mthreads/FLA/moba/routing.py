@@ -1090,6 +1090,22 @@ def _chunk_topk_batched_streaming_kernel(
     sequence_start = tl.load(cu_seqlens_ptr + batch)
     sequence_end = tl.load(cu_seqlens_ptr + batch + 1)
 
+    # No query in this tile can see a block ending after its last valid token.
+    # Dense metadata stores a zero end for sequences with no historical block.
+    if sequence_start + pid_tok * BLOCK_TOK >= sequence_end:
+        return
+    chunk_base = batch * MAX_CHUNKS_PER_SEQUENCE
+    first_chunk_end = tl.load(chunk_end_ptr + chunk_base)
+    if first_chunk_end <= sequence_start:
+        return
+    chunk_size = first_chunk_end - sequence_start
+    last_local_token = tl.minimum(
+        (pid_tok + 1) * BLOCK_TOK, sequence_end - sequence_start
+    ) - 1
+    visible_chunks = tl.minimum(
+        last_local_token // chunk_size, MAX_CHUNKS_PER_SEQUENCE
+    )
+
     local_tokens = pid_tok * BLOCK_TOK + tl.arange(0, BLOCK_TOK)
     offs_token = sequence_start + local_tokens
     token_mask = offs_token < sequence_end
@@ -1106,11 +1122,9 @@ def _chunk_topk_batched_streaming_kernel(
 
     best_packed = tl.zeros([BLOCK_TOK, BLOCK_TOPK], dtype=tl.uint64)
     max_index_key = tl.full([BLOCK_CHUNK], 0xFFFFFFFF, dtype=tl.uint32)
-    chunk_base = batch * MAX_CHUNKS_PER_SEQUENCE
-
     for local_start in range(
         0,
-        MAX_CHUNKS_PER_SEQUENCE,
+        visible_chunks,
         BLOCK_CHUNK,
     ):
         local_chunks = local_start + chunk_rows
