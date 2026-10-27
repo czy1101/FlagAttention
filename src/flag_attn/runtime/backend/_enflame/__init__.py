@@ -24,13 +24,10 @@ _OPERATOR_EXPORTS = {
     "minimax_m3_sparse_attn": (".msa", "minimax_m3_sparse_attn"),
     "minimax_m3_sparse_attn_decode": (".msa", "minimax_m3_sparse_attn_decode"),
     "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
-    "parallel_nsa_compression": (
-        ".FLA.nsa.parallel_nsa_compression",
-        "parallel_nsa_compression",
-    ),
+    "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
     "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),
     "sage_attention_forward": (".sage_attention.attn_qk_int8_per_block", "forward"),
-    "sage_attention_per_block_int8": (".sage_attention.quant_per_block","per_block_int8"),
+    "sage_attention_per_block_int8": (".sage_attention.quant_per_block", "per_block_int8"),
 }
 
 
@@ -43,9 +40,7 @@ def __getattr__(name: str):
     try:
         module_name, symbol = _OPERATOR_EXPORTS[name]
     except KeyError as exc:
-        raise AttributeError(
-            f"module {__name__!r} has no attribute {name!r}"
-        ) from exc
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
 
     value = getattr(importlib.import_module(module_name, __name__), symbol)
     globals()[name] = value
