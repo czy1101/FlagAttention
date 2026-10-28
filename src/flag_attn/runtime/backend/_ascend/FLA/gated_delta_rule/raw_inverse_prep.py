@@ -16,9 +16,17 @@ import triton
 from .fast_launch import fast_launch
 import triton.language as tl
 
-from .raw_inverse_ascend import (
-    launch_inverse64_rawdiag_outer_batch2 as launch_inverse64_rawdiag_outer,
-)
+try:
+    # Dual-diagonal Raw inverse (a single CTA inverts both 32x32 diagonal
+    # blocks of the 64x64 tile).  It needs triton.experimental.tle; fall back
+    # to the batch2 kernel where the TLE extension is not available.
+    from .raw_inverse_dual import (
+        launch_inverse64_rawdiag_dual as launch_inverse64_rawdiag_outer,
+    )
+except ImportError:  # pragma: no cover - depends on the Triton build
+    from .raw_inverse_ascend import (
+        launch_inverse64_rawdiag_outer_batch2 as launch_inverse64_rawdiag_outer,
+    )
 
 
 @triton.jit(do_not_specialize=["T"])
