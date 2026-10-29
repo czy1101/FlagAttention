@@ -28,6 +28,19 @@ _OPERATOR_EXPORTS = {
         ".FLA.gated_delta_rule",
         "fused_recurrent_gated_delta_rule_packed_decode",
     ),
+    "SPARSE_BLOCK_SIZE": (".minimax_sparse_attention.index_topk", "SPARSE_BLOCK_SIZE"),
+    "minimax_m3_index_decode": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode"),
+    "minimax_m3_index_decode_score": (
+        ".minimax_sparse_attention.index_topk",
+        "minimax_m3_index_decode_score",
+    ),
+    "minimax_m3_index_score": (".minimax_sparse_attention.index_topk", "minimax_m3_index_score"),
+    "minimax_m3_index_topk": (".minimax_sparse_attention.index_topk", "minimax_m3_index_topk"),
+    "minimax_m3_sparse_attn": (".minimax_sparse_attention.sparse_attn", "minimax_m3_sparse_attn"),
+    "minimax_m3_sparse_attn_decode": (
+        ".minimax_sparse_attention.sparse_attn",
+        "minimax_m3_sparse_attn_decode",
+    ),
 }
 
 
