@@ -14,7 +14,7 @@ from flag_attn import runtime
 from flag_attn.testing import backend as test_backend
 
 
-pytestmark = pytest.mark.fused_recurrent_gated_delta_rule_packed_decode
+pytestmark = pytest.mark.chunk_gated_delta_rule
 
 
 @pytest.fixture(scope="module")

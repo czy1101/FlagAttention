@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from flag_attn import runtime
 from flag_attn.testing import backend as test_backend
 
-pytestmark = pytest.mark.fused_recurrent_gated_delta_rule_fwd
+pytestmark = pytest.mark.chunk_gated_delta_rule
 
 ASSERT_RATIO = 0.01
 K = V = 128
