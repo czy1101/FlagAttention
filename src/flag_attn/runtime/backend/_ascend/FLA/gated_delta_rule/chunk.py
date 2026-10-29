@@ -40,7 +40,6 @@ import torch
 import triton
 
 from flag_attn.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from flag_attn.FLA.index import prepare_chunk_indices
 from flag_attn.FLA.chunk_o import chunk_fwd_o
 from flag_attn.FLA.gated_delta_rule.wy_fast import recompute_w_u_fwd
 

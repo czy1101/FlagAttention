@@ -1,3 +1,6 @@
+// Copyright 2026 FlagOS Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 #include "Utils.h"
 
 #define INTRINSIC(NAME, ...) NAME(__VA_ARGS__)

@@ -1,3 +1,6 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Isolated TLE-Raw experiments for GDN block inverse."""
 from __future__ import annotations
 

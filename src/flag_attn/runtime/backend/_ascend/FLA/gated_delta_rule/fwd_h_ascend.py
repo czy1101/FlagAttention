@@ -212,7 +212,11 @@ def chunk_gated_delta_rule_fwd_h_ascend(
     v_new = torch.empty_like(u) if save_new_value else None
     BV = min(V, int(bv) if bv else _default_bv(V))
 
-    fast_launch(_fwd_h_kernel, (triton.cdiv(V, BV), N * H), num_warps or _default_warps(), num_stages or _default_stages())(
+    grid = (triton.cdiv(V, BV), N * H)
+    fast_launch(
+        _fwd_h_kernel, grid, num_warps or _default_warps(),
+        num_stages or _default_stages(),
+    )(
         k=k,
         v=u,
         w=w,

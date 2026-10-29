@@ -1,3 +1,6 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Fixed-length TLE-Raw inverse preparation for eligible GDN workloads.
 
 This module is deliberately separate from the existing prep implementation.

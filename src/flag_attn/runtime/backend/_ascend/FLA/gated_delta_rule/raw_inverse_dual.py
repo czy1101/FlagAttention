@@ -1,3 +1,6 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """Dual-diagonal Raw inverse launcher for fixed 64x64 inverse tiles."""
 from __future__ import annotations
 

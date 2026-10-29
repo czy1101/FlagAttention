@@ -453,7 +453,10 @@ def recompute_w_u_fwd_ascend(
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     warps, stages = _wu_params()
-    fast_launch(_recompute_w_u_kernel, (NC, H if cu_seqlens is not None else B * H), num_warps or warps, num_stages or stages)(
+    grid = (NC, H if cu_seqlens is not None else B * H)
+    fast_launch(
+        _recompute_w_u_kernel, grid, num_warps or warps, num_stages or stages,
+    )(
         k=k,
         v=v,
         beta=beta,

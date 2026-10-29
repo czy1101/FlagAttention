@@ -39,9 +39,8 @@ became cube-only: **prep device 0.386 -> 0.150 ms**.
 That vector fold kernel then became the bottleneck (1.287 ms device at
 T=1024/H=8), because on triton-ascend 3.5.1 several vector patterns *serialize*
 across the grid (~5 us/program) instead of running in parallel.  The minimal
-repro in ``test_script/probe_fold_parallel.py`` (see ``FOLD_PARALLELISM.md``)
-identifies them: a bf16 2D gather, two or more 2D gathers, and -- the one that
-bit the broadcast form -- **arithmetic on a 1D vector (e.g. ``exp``) whose
+repro identifies them: a bf16 2D gather, two or more 2D gathers, and -- the one
+that bit the broadcast form -- **arithmetic on a 1D vector (e.g. ``exp``) whose
 result is then broadcast into a 2D tile**.  Block-ptr 2D loads/stores, 2D
 ``cumsum``, multiple stores and plain 1D-load + ``[:, None]`` broadcast
 multiplies all parallelise fine.
@@ -114,7 +113,7 @@ def _factor_kernel(
     IS_VARLEN: tl.constexpr,
     NCHUNK: tl.constexpr,
 ):
-    """1D-only per-token factors (all parallel-safe, see FOLD_PARALLELISM.md).
+    """1D-only per-token factors (all parallel-safe).
 
     Writes the chunk-local cumsum ``g_cum`` plus ``exp(g_cum)``,
     ``exp(-g_cum)`` and the fp32 copy of ``beta`` as 1D fp32 buffers.  Doing the
@@ -241,7 +240,8 @@ def launch_factor_head_tile(
         triton.cdiv(t, chunk_size),
         b * triton.cdiv(h, heads_per_program),
     )
-    _lk(buf, ("factor_ht", h, chunk_size, heads_per_program, beta.dtype), _factor_head_tile_kernel, grid, num_warps, num_stages)(
+    key = ("factor_ht", h, chunk_size, heads_per_program, beta.dtype)
+    _lk(buf, key, _factor_head_tile_kernel, grid, num_warps, num_stages)(
         g,
         beta,
         g_cum,
@@ -282,8 +282,8 @@ def _fold_kernel(
 ):
     """Vector-only folds: plain 1D block loads + ``[:, None]`` broadcast muls.
 
-    No 2D gather, no ``exp`` on a 1D vector, no 2D cumsum — all three would
-    serialize this kernel on triton-ascend 3.5.1 (see FOLD_PARALLELISM.md).
+    No 2D gather, no ``exp`` on a 1D vector, no 2D cumsum: all three would
+    serialize this kernel on triton-ascend 3.5.1.
     """
     i_t0, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -493,7 +493,7 @@ def _factor_headfirst_stride_kernel(
     # (nondeterministic, ~1-15% of rows, first invocations worst), while the
     # non-transposed stores of this kernel were always exact.  This offset
     # expression writes element (b, t, h) at b*T*H + t*H + h, the same layout
-    # as before.  See test_script/probe_strided_fold_fix.py.
+    # as before.
     gc_dst = i_b * T * H + rt[None, :] * H + rh[:, None]
     tl.store(g_cum + gc_dst, b_gc, mask=mask)
     tl.store(e1 + factor_dst, b_e, mask=mask)
@@ -664,7 +664,7 @@ def _fold_gather_kernel(
     """Single-kernel fold for *small* workloads (one chunk-head tile per program).
 
     This is the task-7 kernel: it does 2D gathers from the bf16 inputs (which
-    serialize this backend's vector kernels, see FOLD_PARALLELISM.md), but with
+    serialize this backend's vector kernels), but with
     only ``chunks*H <= 64`` programs the serialized cost is small and one launch
     beats the two-launch ``factor`` + ``fold`` pair on host time.
     """
@@ -1312,9 +1312,9 @@ _GATHER_MAX_T = 512
 
 # --- stride-aware fold dispatch -------------------------------------------
 # Single source of truth shared by ``api.py`` (which decides the input layout)
-# and ``fold_ascend`` (which picks the kernel).  Measured on 910B with
-# ``test_script/probe_dispatch_ab.py``: the materialised fold has two variants
-# and the stride-aware pair only wins once the grid is big enough, but *which*
+# and ``fold_ascend`` (which picks the kernel).  Measured on 910B: the
+# materialised fold has two variants and the stride-aware pair only wins once
+# the grid is big enough, but *which*
 # crossover applies depends on the variant it would replace:
 #
 # * one-launch gather branch (``NC*H <= _SMALL_FOLD_PROGRAMS``): the gather
@@ -1604,7 +1604,9 @@ def fold_ascend(
         # Small/short workload: one launch (serialized 2D gathers are cheap when
         # the grid is small and the sequence is short).
         BK = 64 if K % 64 == 0 else K
-        _lk(buf, ("gather", T, H, Hg, K, V, BT, BK, is_varlen, qe.dtype), _fold_gather_kernel, (NC, H if is_varlen else B * H, K // BK), warps, stages)(
+        key = ("gather", T, H, Hg, K, V, BT, BK, is_varlen, qe.dtype)
+        grid = (NC, H if is_varlen else B * H, K // BK)
+        _lk(buf, key, _fold_gather_kernel, grid, warps, stages)(
             q, k, v, g, beta, g_cum, qe, ke, kr, vb,
             cu_seqlens, chunk_indices, T, H, Hg, K, V, BT, BK, is_varlen,
         )
@@ -1642,7 +1644,9 @@ def fold_ascend(
             buf=buf,
         )
     else:
-        _lk(buf, ("factor", T, H, BT, is_varlen, nchunk, beta.dtype), _factor_kernel, (NC // nchunk, H if is_varlen else B * H), warps, stages)(
+        key = ("factor", T, H, BT, is_varlen, nchunk, beta.dtype)
+        grid = (NC // nchunk, H if is_varlen else B * H)
+        _lk(buf, key, _factor_kernel, grid, warps, stages)(
             g, beta, g_cum, e1, r1, b1, be1,
             cu_seqlens, chunk_indices, T, H, BT, is_varlen, nchunk,
         )
@@ -1669,7 +1673,9 @@ def fold_ascend(
             num_stages=stages,
         )
     else:
-        _lk(buf, ("fold", T, H, Hg, K, V, BT, is_varlen, nchunk, qe.dtype), _fold_kernel, (NC // nchunk, H if is_varlen else B * H), warps, stages)(
+        key = ("fold", T, H, Hg, K, V, BT, is_varlen, nchunk, qe.dtype)
+        grid = (NC // nchunk, H if is_varlen else B * H)
+        _lk(buf, key, _fold_kernel, grid, warps, stages)(
             q, k, v, e1, r1, b1, be1, qe, ke, kr, vb,
             cu_seqlens, chunk_indices, T, H, Hg, K, V, BT, is_varlen, nchunk,
         )
@@ -1703,8 +1709,12 @@ def prep_w_u_ascend(
         u = torch.empty(B, T, H, V, dtype=output_dtype, device=vb.device)
         a_masked = torch.empty(B, T, H, BT, dtype=output_dtype, device=ke.device)
     warps, stages = _prep_wu_config()
-    _lk(buf, ("prep", T, H, H, K, V, BT, BV,
-              max(1, BT.bit_length() - 2), is_varlen, False, qe.dtype), _prep_wu_kernel, (NC, H if is_varlen else B * H), warps, stages)(
+    key = (
+        "prep", T, H, H, K, V, BT, BV, max(1, BT.bit_length() - 2),
+        is_varlen, False, qe.dtype,
+    )
+    grid = (NC, H if is_varlen else B * H)
+    _lk(buf, key, _prep_wu_kernel, grid, warps, stages)(
         qe, ke, kr, vb, w, u, a_masked,
         cu_seqlens, chunk_indices, T, H, H, K, V, BT, BV,
         max(1, BT.bit_length() - 2), is_varlen, False,
@@ -1740,8 +1750,11 @@ def prep_affine_ascend(
     cu = qe.new_empty(B, NT, H, K, V)
     mw = qe.new_empty(B, NT, H, K, K)
     BV = min(V, 128)
-    _lk(buf, ("prep_affine", T, H, H, K, V, BT, BV,
-              max(1, BT.bit_length() - 2), False, True, NT, qe.dtype), _prep_wu_kernel, (NT, B * H), _PREP_WARPS, _PREP_STAGES)(
+    key = (
+        "prep_affine", T, H, H, K, V, BT, BV, max(1, BT.bit_length() - 2),
+        False, True, NT, qe.dtype,
+    )
+    _lk(buf, key, _prep_wu_kernel, (NT, B * H), _PREP_WARPS, _PREP_STAGES)(
         qe, ke, kr, vb, w, u, a_masked, None, None,
         T, H, H, K, V, BT, BV, max(1, BT.bit_length() - 2), False,
         True, qe2, au, cu, mw, NT,
@@ -1792,9 +1805,14 @@ def fwd_h_o_ascend(
         and V <= 128
     )
     if unroll2:
-        _lk(buf, ("fwd_h_o_u2", T, H, Hg, K, V, BT, BV, NT,
-                  g is not None, initial_state is not None,
-                  final_state is not None, u.dtype), _fwd_h_o_unroll2_kernel, (triton.cdiv(V, BV), N * H), num_warps or warps, num_stages or stages)(
+        key = (
+            "fwd_h_o_u2", T, H, Hg, K, V, BT, BV, NT,
+            g is not None, initial_state is not None,
+            final_state is not None, u.dtype,
+        )
+        grid = (triton.cdiv(V, BV), N * H)
+        _lk(buf, key, _fwd_h_o_unroll2_kernel, grid,
+            num_warps or warps, num_stages or stages)(
             qe, kr, a_in, w, u, g, o, initial_state, final_state, scale,
             cu_seqlens, T, H, Hg, K, V, BT, BV,
             g is not None,
@@ -1803,9 +1821,14 @@ def fwd_h_o_ascend(
             NT,
         )
         return o, final_state
-    _lk(buf, ("fwd_h_o", T, H, Hg, K, V, BT, BV,
-              g is not None, initial_state is not None,
-              final_state is not None, cu_seqlens is not None, u.dtype), _fwd_h_o_kernel, (triton.cdiv(V, BV), N * H), num_warps or warps, num_stages or stages)(
+    key = (
+        "fwd_h_o", T, H, Hg, K, V, BT, BV, g is not None,
+        initial_state is not None, final_state is not None,
+        cu_seqlens is not None, u.dtype,
+    )
+    grid = (triton.cdiv(V, BV), N * H)
+    _lk(buf, key, _fwd_h_o_kernel, grid,
+        num_warps or warps, num_stages or stages)(
         qe, kr, a_in, w, u, g, o, initial_state, final_state, scale,
         cu_seqlens, T, H, Hg, K, V, BT, BV,
         g is not None,
@@ -1886,8 +1909,12 @@ def fwd_h_o_2pass_ascend(
     warps, stages = _fwd_h_o_config()
     buf = (_fast_scratch(B, T, H, K, V, BT, au.dtype, au.device)
            if _scratch_enabled() else None)
-    _lk(buf, ("fwd_h_o_2pass", T, H, K, V, BT, BV, NT,
-              initial_state is not None, final_state is not None, au.dtype), _fwd_h_o_2pass_kernel, (triton.cdiv(V, BV), B * H), warps, stages)(
+    key = (
+        "fwd_h_o_2pass", T, H, K, V, BT, BV, NT,
+        initial_state is not None, final_state is not None, au.dtype,
+    )
+    _lk(buf, key, _fwd_h_o_2pass_kernel, (triton.cdiv(V, BV), B * H),
+        warps, stages)(
         qe2, au, cu, mw, g, o, initial_state, final_state, scale,
         T, H, K, V, BT, BV, NT,
         initial_state is not None,

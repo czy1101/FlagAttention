@@ -18,8 +18,7 @@ Three interfaces, each pinned to an upstream implementation:
   decode: single token from a packed ``mixed_qkv`` row with the gate/beta
   computed in-kernel from ``a``/``b``/``A_log``/``dt_bias``.
 
-Math is the GDN v1 recurrence used by the chunk path (see
-``test_script/reference.py`` and the FLA kernel)::
+Math is the GDN v1 recurrence used by the chunk path and upstream FLA::
 
     S_t = diag(exp(g_t)) S_{t-1}
     v_new = beta_t (v_t - k_t^T S_t)
