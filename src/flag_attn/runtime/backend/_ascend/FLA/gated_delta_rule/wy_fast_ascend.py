@@ -8,22 +8,18 @@ This module holds Ascend replacements for
 ``kkt.py``) and ``flag_attn.FLA.gated_delta_rule.wy_fast.recompute_w_u_fwd``.
 The generic and ``kkt.py`` files are left untouched.
 
-Why a copy at all
------------------
-``kkt.py`` already lowered prep to 1.37 ms by folding the decay into the KKT
-dot operands and using Newton doubling, but the *fold itself* uses a 1D->2D
-broadcast multiply::
+Why a separate copy
+-------------------
+``kkt.py`` folds the decay into the KKT dot operands and uses Newton doubling,
+but that fold uses a 1D->2D broadcast multiply::
 
     b_L = tl.dot(b_k * (b_beta * b_e)[:, None], ...)
 
-On Ascend 910B (triton-ascend 3.5 / flagtree 0.7) any broadcast of a ``[BT]``
-vector into a ``[BT, K]`` tile (``v[:, None] * tile``) is ~1000x slower than a
-plain 2D x 2D multiply: measured 0.82 ms vs 0.05 ms for 128 ``[64,128]`` tiles
-on this part, while a 2D x 2D ``tile * tile`` costs 0.065 ms.  A per-program
-budget of ~6.4 us for a single broadcast multiply explains why every stage of
-the pipeline sat at 1-3.5 ms.
+On Ascend any broadcast of a ``[BT]`` vector into a ``[BT, K]`` tile
+(``v[:, None] * tile``) is much slower than a plain 2D x 2D multiply, and a
+per-program broadcast multiply can dominate the cost of the whole pipeline.
 
-The fix used here (and in ``chunk_o_ascend.py`` / ``fwd_h_ascend.py``) is to
+The form used here (and in ``chunk_o_ascend.py`` / ``fwd_h_ascend.py``) is to
 materialise the per-token factor as a *2D tile* with a broadcast *address*
 computation instead of broadcasting a loaded 1D vector::
 
@@ -32,8 +28,8 @@ computation instead of broadcasting a loaded 1D vector::
                    mask=..., other=0.)
 
 The integer address arithmetic is cheap and the resulting ``[BT, K]`` tile
-multiplies a loaded tile at full 2D speed (0.065 ms measured).  Same trick for
-the transposed ``[K, BT]`` factor used by the KKT dot.
+multiplies a loaded tile at full 2D speed.  Same trick for the transposed
+``[K, BT]`` factor used by the KKT dot.
 
 Numerics/behaviour are unchanged relative to ``kkt.py``:
 ``A_inv = (I + L)^-1`` with ``L[i, j] = beta_i (k_i . k_j) exp(g_i - g_j)``
@@ -144,8 +140,8 @@ def _prep_kernel(
         other=0.0,
     ).to(tl.float32)
     # ``beta`` is the fp32 copy materialised by ``_chunk_cumsum_kernel``: a
-    # 2D gather from an fp32 buffer is fast on Ascend while a bf16 gather is
-    # ~10x slower (measured 0.07 ms vs 0.53 ms for 128 [64,128] tiles).
+    # 2D gather from an fp32 buffer is fast on this backend while a bf16
+    # gather is much slower.
     b_beta2 = tl.load(
         beta + base + o_t[:, None] * H + 0 * o_k[None, :],
         mask=m_t[:, None],
@@ -329,8 +325,8 @@ def chunk_local_cumsum_ascend(
     """Chunk-local cumsum in fp32 (and an fp32 copy of ``beta`` if given).
 
     ``beta`` is widened here only so that downstream kernels can load its
-    per-token values with a *2D gather from an fp32 buffer*: bf16 gathers are
-    ~10x slower on 910B (0.53 ms vs 0.07 ms for 128 [64,128] tiles).
+    per-token values with a *2D gather from an fp32 buffer*: bf16 2D gathers
+    are much slower than fp32 gathers on this backend.
     """
     B, T, H = g.shape
     BT = int(chunk_size)

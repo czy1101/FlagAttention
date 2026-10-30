@@ -26,9 +26,9 @@ Math is the GDN v1 recurrence used by the chunk path and upstream FLA::
     o_t = scale q_t^T S_t
 
 The kernels keep the state ``[BV, BK]`` in fp32 registers, use int32 offsets
-(the Ascend AIV path is much better with int32), and do not use dots: the
-recurrent step is bandwidth/latency bound and the two reductions are vector
-reductions over ``BK``.
+(the Ascend AIV path prefers int32), and do not use dots: the recurrent step is
+bandwidth/latency bound and the two reductions are vector reductions over
+``BK``.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ import triton.language as tl
 from .fast_launch import begin_forward, end_forward, fast_launch
 
 # Per-signature launch handles: decode is called once per token, so the Triton
-# Python launch path (60-100us) must not be paid per token.
+# Python launch path must not be paid per token.
 _REC_CACHE: dict = {}
 
 

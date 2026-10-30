@@ -19,31 +19,21 @@ The pipeline is three Triton launches:
 3. ``fwd_h_o`` (grid ``(V/BV, N*H)``) -- state scan fused with the output
    stage; ``h`` and ``v_new`` never hit GM.
 
-Why the fold/prep split, and why fold is two kernels
-----------------------------------------------------
-Measured on T=1024/H=8 with the old fused prep (which gathered the decay
-factors as 2D fp32 tiles *inside* the kernel and fed them into ``tl.dot``)::
+Why fold and prep are separate kernels
+--------------------------------------
+``prep_w_u`` is cube-only because both of its 2D dot operands (``k_e`` and
+``k_r``) come straight from GM as tiles.  A dot operand produced by the vector
+pipeline has to be re-laid out before it can feed a cube dot, which is
+expensive per program per tile on this backend; feeding the same folded values
+into *stores* (vector layout) is cheap.  The folds therefore live in a vector
+kernel and the prep kernel stays cube-only.
 
-    prep kernel (all dots + all gathers)      0.386 ms
-    ... without the Newton chain              0.279 ms   -> Newton = 0.107
-    ... with trivial factor tiles             0.092 ms   -> gathers = 0.294
-    cube-only prep on pre-folded operands     0.080 ms   (no Newton, no A)
-
-i.e. the dominant cost was *not* the Newton chain (0.107 ms) but the two 2D
-fp32 gathers (0.294 ms): a gather result produced by the vector pipeline has to
-be re-laid-out before it can feed a cube dot, and on 910B that conversion costs
-~1.1 us per program per tile.  Feeding the same folds into *stores* (vector
-layout) is cheap, so all folds moved into a vector kernel and the prep kernel
-became cube-only: **prep device 0.386 -> 0.150 ms**.
-
-That vector fold kernel then became the bottleneck (1.287 ms device at
-T=1024/H=8), because on triton-ascend 3.5.1 several vector patterns *serialize*
-across the grid (~5 us/program) instead of running in parallel.  The minimal
-repro identifies them: a bf16 2D gather, two or more 2D gathers, and -- the one
-that bit the broadcast form -- **arithmetic on a 1D vector (e.g. ``exp``) whose
-result is then broadcast into a 2D tile**.  Block-ptr 2D loads/stores, 2D
-``cumsum``, multiple stores and plain 1D-load + ``[:, None]`` broadcast
-multiplies all parallelise fine.
+The fold itself is split into ``factor`` + ``fold`` because several vector
+patterns serialize across the grid on this backend instead of running in
+parallel: a bf16 2D gather, two or more 2D gathers, and arithmetic on a 1D
+vector (e.g. ``exp``) whose result is then broadcast into a 2D tile.
+Block-ptr 2D loads/stores, 2D ``cumsum``, multiple stores and plain 1D-load +
+``[:, None]`` broadcast multiplies all parallelize fine.
 
 The fold is therefore two kernels:
 
@@ -52,13 +42,11 @@ The fold is therefore two kernels:
 * ``fold``: plain 1D block loads of those buffers + ``[:, None]`` broadcast
   multiplies + 4 stores.  No 1D arithmetic is ever broadcast, no gathers.
 
-Measured fold device time: 1.287 -> **0.102 (factor) + 0.076 (fold) = 0.18 ms**
-at T=1024/H=8, which makes the 4-launch fused path the best one at every size
-(``chunk.py`` now always uses it when eligible).
-
-Fast-path invariants (measured on 910B, see ``wy_fast_ascend.py``): fp32
-buffers for anything gathered as a 2D tile, gathered factors never feed a dot,
-K in a single tile, no autotune.
+Fast-path invariants (see ``wy_fast_ascend.py``): fp32 buffers for
+anything gathered as a 2D tile, so 2D gathers read fp32 rather than fp16/bf16;
+gathered factors never feed a dot; K must cover the whole head dimension in a
+single dot tile; multi-trip dot loops are unreliable on this backend; no
+autotune.
 
 Two-pass state scan (``_affine_kernel`` + ``_fwd_h_o_2pass_kernel``, enabled for
 ``NT >= 32`` / ``FLAG_ATTN_ASCEND_GDN_TWOPASS=1``)
@@ -67,14 +55,13 @@ Two-pass state scan (``_affine_kernel`` + ``_fwd_h_o_2pass_kernel``, enabled for
     (chunk-parallel) precomputes ``qe2 = qe - A w``, ``Au = A u``,
     ``Cu = kr u`` and ``Mw = kr w``; pass 2 then needs only two dots per chunk
     (``o = qe2 S + Au``, ``S' = a (S + Cu - Mw S)``) instead of four, halving
-    the serial chain.  Measured at T=2048/H=8: fwd_h_o device **0.256 -> 0.170
-    ms**, e2e 0.813 -> ~0.80 ms.  Note that dropping the ``Mw S`` term (i.e.
-    using only ``C_c = sum_j exp(G-g_j) k_j u_j^T`` and scalar prefix factors)
-    is *not* exact; a fully parallel prefix scan would have to compose the
-    K x K matrices (~31 combines/head, ~1 GMAC) and is more expensive than the
-    sequential scan at these sizes.  Because the affine pass costs 0.109 ms of
-    device plus ~0.10 ms of host, the two-pass path is enabled only once the
-    sequential chain is long (NT >= 32); below that it is a net loss.
+    the serial chain.  Note that dropping the ``Mw S`` term (i.e. using only
+    ``C_c = sum_j exp(G-g_j) k_j u_j^T`` and scalar prefix factors) is *not*
+    exact; a fully parallel prefix scan would have to compose the K x K
+    matrices per chunk and is more expensive than the sequential scan at these
+    sizes.  The affine pass costs extra device time plus a host launch, so the
+    two-pass path is enabled only once the serial chain is long (NT >= 32);
+    below that it is a net loss.
 """
 
 from __future__ import annotations
@@ -118,7 +105,8 @@ def _factor_kernel(
     Writes the chunk-local cumsum ``g_cum`` plus ``exp(g_cum)``,
     ``exp(-g_cum)`` and the fp32 copy of ``beta`` as 1D fp32 buffers.  Doing the
     exponentials here (1D) is what allows the fold kernel to use plain
-    broadcast multiplies instead of ``exp`` on a 1D vector (which serializes).
+    broadcast multiplies instead of ``exp`` on a 1D vector, which would
+    serialize this backend's vector pipeline.
     """
     i_t0, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -282,8 +270,8 @@ def _fold_kernel(
 ):
     """Vector-only folds: plain 1D block loads + ``[:, None]`` broadcast muls.
 
-    No 2D gather, no ``exp`` on a 1D vector, no 2D cumsum: all three would
-    serialize this kernel on triton-ascend 3.5.1.
+    No 2D gather, no ``exp`` on a 1D vector, no 2D cumsum: each of those
+    serializes the vector pipeline on this backend.
     """
     i_t0, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -488,12 +476,11 @@ def _factor_headfirst_stride_kernel(
     # head-first fold. g_cum stays in the standard [B,T,H] output layout.
     factor_dst = i_b * H * FACTOR_T + rh[:, None] * FACTOR_T + rt[None, :]
     # Store g_cum in the same head-major orientation as ``b_gc`` instead of
-    # ``tl.trans(b_gc)``/``tl.trans(mask)``.  On 910B the transposed store was
-    # observed to drop/garble a random subset of token rows for some shapes
-    # (nondeterministic, ~1-15% of rows, first invocations worst), while the
-    # non-transposed stores of this kernel were always exact.  This offset
-    # expression writes element (b, t, h) at b*T*H + t*H + h, the same layout
-    # as before.
+    # ``tl.trans(b_gc)``/``tl.trans(mask)``: a transposed store on this backend
+    # can drop or garble a random subset of token rows for some shapes,
+    # whereas the non-transposed stores of this kernel are exact.  This offset
+    # expression writes element (b, t, h) at b*T*H + t*H + h, i.e. the standard
+    # [B,T,H] layout.
     gc_dst = i_b * T * H + rt[None, :] * H + rh[:, None]
     tl.store(g_cum + gc_dst, b_gc, mask=mask)
     tl.store(e1 + factor_dst, b_e, mask=mask)
@@ -561,8 +548,8 @@ def _fold_headfirst_stride_trim_kernel(
     """Strided fold that materialises only k_e/k_r (v1 fold trim).
 
     qe = q*e1 and vb = v*beta are recomputed inside the affine kernel from the
-    source q/v tensors and the small fp32 factor buffers, which removes
-    qe/vb GM round trips (B4/T4096 fold traffic 1.88 GB -> 0.81 GB).
+    source q/v tensors and the small fp32 factor buffers, which removes the
+    qe/vb GM round trips.
     """
     i_c, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -663,10 +650,10 @@ def _fold_gather_kernel(
 ):
     """Single-kernel fold for *small* workloads (one chunk-head tile per program).
 
-    This is the task-7 kernel: it does 2D gathers from the bf16 inputs (which
-    serialize this backend's vector kernels), but with
-    only ``chunks*H <= 64`` programs the serialized cost is small and one launch
-    beats the two-launch ``factor`` + ``fold`` pair on host time.
+    It does 2D gathers from the bf16 inputs, which serialize this backend's
+    vector kernels; with only ``chunks*H <= 64`` programs the serialized cost
+    stays small and one launch beats the two-launch ``factor`` + ``fold`` pair
+    on host time.
     """
     i_t, i_bh, i_k = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -898,8 +885,9 @@ def _prep_wu_kernel(
         tl.store(p_u, b_u, boundary_check=(0, 1))
 
     if PRECOMPUTE_AFFINE:
-        # Reproduce the original GM round trips: A/W/U were stored in the
-        # input dtype before affine_precompute reloaded them.
+        # Keep A/W/U in the input dtype for these products, matching the
+        # precision they have after the GM round trip the two-pass path
+        # performs in ``affine_precompute_ascend``.
         b_qw = tl.dot(b_A, b_w.to(b_A.dtype))
         p_qe2 = tl.make_block_ptr(
             qe2 + base * K, (T, K), (H * K, 1), (i_t * BT, 0), (BT, K), (1, 0)
@@ -1143,8 +1131,8 @@ def _fwd_h_o_unroll2_kernel(
     """One-pass state scan with two chunks per iteration.
 
     Both chunks' tiles are loaded before chunk 0's dots, which lets the
-    independent work of the two chunks overlap (measured 1.31x on T1024-h8,
-    bit-identical).  Fixed-length only; NT must be even.
+    independent work of the two chunks overlap.  Fixed-length only; NT must be
+    even.
     """
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -1302,25 +1290,21 @@ def _fwd_h_o_2pass_kernel(
 
 # Workload size below which the single-kernel (gather) fold wins on host time.
 _SMALL_FOLD_PROGRAMS = 64
-# The one-launch gather fold only pays off for short sequences.  Its bf16 2D
-# gathers grow with T while the factor+fold pair is launch-bound, and after the
-# fast-launch patch the extra launch is cheap: measured 2026-10-27 on
-# (1,1024,2,1,64,64) gather 0.3396 -> factor+fold 0.3013 ms (-11.3%) while
-# (1,256,8,8,64,64) keeps gather (factor+fold +15.3% there).  T=512 is the
-# kept-safe boundary; shapes above it take factor+fold.
+# The one-launch gather fold only pays off for short sequences: its bf16 2D
+# gathers grow with T, while the factor+fold pair is launch-bound and its extra
+# launch is cheap.  T=512 is the empirical boundary on this backend; shapes
+# above it take factor+fold.
 _GATHER_MAX_T = 512
 
 # --- stride-aware fold dispatch -------------------------------------------
 # Single source of truth shared by ``api.py`` (which decides the input layout)
-# and ``fold_ascend`` (which picks the kernel).  Measured on 910B: the
-# materialised fold has two variants and the stride-aware pair only wins once
-# the grid is big enough, but *which*
-# crossover applies depends on the variant it would replace:
+# and ``fold_ascend`` (which picks the kernel).  The materialised fold has two
+# variants and the stride-aware pair only wins once the grid is big enough,
+# but *which* crossover applies depends on the variant it would replace:
 #
 # * one-launch gather branch (``NC*H <= _SMALL_FOLD_PROGRAMS``): the gather
-#   kernel costs ~0.45 ms on tiny grids but 0.9-2.9 ms once batch/head/K grow,
-#   while the strided pair is shape-flat at ~0.55-0.60 ms.  It therefore loses
-#   from ~64 chunk/head jobs upward.
+#   kernel cost grows with batch/head/K while the strided pair is shape-flat,
+#   so it loses from ~64 chunk/head jobs upward.
 # * two-kernel factor+fold branch: already efficient, the strided pair only
 #   wins on large grids (>=512 jobs) or the long-sequence rule below.
 _STRIDED_MIN_JOBS = 64
@@ -1338,7 +1322,7 @@ def strided_fold_supported(
     cu_seqlens,
     chunk_size: int,
 ) -> bool:
-    """Return True when the stride-aware fold is the measured-fastest choice."""
+    """Return True when the stride-aware fold is the preferred choice here."""
     if cu_seqlens is not None or int(chunk_size) != 64:
         return False
     if dtype not in (torch.bfloat16, torch.float16):
@@ -1359,16 +1343,16 @@ def strided_fold_supported(
 # handles NCHUNK consecutive chunks.  FLAG_ATTN_ASCEND_GDN_NCHUNK overrides the
 # automatic choice; 1 disables batching.
 _NCHUNK_ENV = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_NCHUNK", "0"))
-# The coalesced fixed-length factor kernel is default-on; set this to 0 to use
-# the original pure-Triton one-head factor kernel for A/B or fallback.
+# The coalesced fixed-length factor kernel is default-on; set this to 0 to fall
+# back to the one-head factor kernel.
 _FACTOR_HEAD_TILE_ENABLED = os.environ.get(
     "FLAG_ATTN_ASCEND_GDN_FACTOR_HEAD_TILE", "1"
 ).lower() not in {"0", "false", "off", "no"}
 _FOLD_GROUP_KLOOP_ENABLED = os.environ.get(
     "FLAG_ATTN_ASCEND_GDN_FOLD_GROUP_KLOOP", "1"
 ).lower() not in {"0", "false", "off", "no"}
-# Automatic batching: measured net effect of NCHUNK>1 is at most -6% (T2048) and
-# is neutral/negative elsewhere, so it is OFF unless requested explicitly.
+# Automatic batching: batching several chunks per program is not a win on this
+# backend, so it is OFF unless requested explicitly.
 _NCHUNK_AUTO = 1
 
 
@@ -1387,8 +1371,7 @@ _PREP_STAGES = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_P_STAGES", "2"))
 _HO_WARPS = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_HO_WARPS", "4"))
 _HO_STAGES = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_HO_STAGES", "2"))
 _HO_BV = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_HO_BV", "0"))
-# One-pass state scan with two chunks per iteration: measured 1.31x kernel
-# speedup on T1024-h8 (128 -> 104 us, bit-identical).  Only for fixed-length
+# One-pass state scan with two chunks per iteration.  Only for fixed-length
 # BF16 grids where the two-chunk working set still fits UB.
 _FWD_UNROLL2_ENV = "FLAG_ATTN_ASCEND_GDN_FWD_UNROLL2"
 
@@ -1409,10 +1392,9 @@ _scratch: "OrderedDict[tuple, dict]" = OrderedDict()
 
 _OFF_VALUES = {"0", "false", "off", "no"}
 # v1 fold trim: only materialise k_e/k_r in the strided fold and recompute
-# qe/vb inside the affine kernel.  Measured 2026-10-27 on B4/T4096/H64 BF16:
-# fold 2.467 -> 1.252 ms, E2E -0.97 ms (-4.3%), bit-identical; B2/T16384
-# -0.37 ms.  Only for BF16 fixed-length Raw-prep grids (jobs >= 2048); the
-# FP16 path still uses the full 4-output fold.
+# qe/vb inside the affine kernel, which removes the qe/vb GM round trips.
+# Only for BF16 fixed-length Raw-prep grids (jobs >= 2048); the FP16 path still
+# uses the full 4-output fold.
 _FOLD_TRIM_ENV = "FLAG_ATTN_ASCEND_GDN_FOLD_TRIM"
 
 
@@ -1564,8 +1546,10 @@ def fold_ascend(
            torch.Tensor]:
     """Return ``(g_cum, q_e, k_e, k_r, v_beta)``.
 
-    Fixed-length inputs take the torch/CANN elementwise fold; varlen inputs use
-    the two Triton vector kernels (``_factor_kernel`` + ``_fold_kernel``).
+    Fixed-length inputs choose between the stride-aware fold, the one-launch
+    gather fold for small grids, and the two Triton vector kernels
+    (``_factor_kernel`` + ``_fold_kernel``); varlen inputs always take the two
+    vector kernels.
     """
     B, T, Hg, K = k.shape
     H = beta.shape[-1]
@@ -1894,9 +1878,8 @@ def fwd_h_o_2pass_ascend(
     elif au.dtype == torch.bfloat16 and K == V == 128:
         # Full-width BF16 tile removes the duplicated per-chunk Mw/Qe2 reads,
         # but it also caps the grid at B*H programs.  For tiny grids
-        # (B*H <= 8) halving the tile doubles the grid and is 1.6-2.6x faster
-        # (T2048-h8 state 0.278 -> 0.169 ms, bit-identical; B*H=16 already
-        # regresses, so the crossover is 8).
+        # (B*H <= 8) halving the tile doubles the grid and is the faster
+        # choice, so 8 is the empirical crossover on this backend.
         BV = 64 if B * H <= 8 else 128
     else:
         BV = min(V, _fwd_h_o_bv(V))

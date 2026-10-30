@@ -8,9 +8,10 @@ the NVIDIA-only TLE/direct fast paths are intentionally not used here.  ``BT``
 keeps the upstream contract (only 16/32/64 are meaningful); the internal chunk
 length is ``ascend_chunk_size()`` for the default BT=64.
 
-The fast path is host-bound (3-4 kernel launches, each ~0.14 ms of CPU time),
-so this wrapper keeps the per-call Python as lean as possible while preserving
-exactly the same validation semantics as the generic entry point:
+The fast path is host-bound: a handful of kernel launches per call, where the
+Python/Triton launch side costs more than the device work, so this wrapper keeps
+the per-call Python as lean as possible while preserving exactly the same
+validation semantics as the generic entry point:
 
 * the five ``_as_seq_first`` calls and the ``_validate_inputs`` dict/loop are
   inlined into straight-line checks (same exceptions and messages);
@@ -158,7 +159,7 @@ def chunk_gated_delta_rule(
     # already contiguous. The workload-dependent decision lives in
     # ``fused_ascend.strided_fold_supported`` so this wrapper and
     # ``fold_ascend`` cannot disagree on which shapes take which kernel.
-    # Other calls keep the original materialization and its public
+    # Other calls take the materialised path and keep its public
     # validation/norm behavior.
     chunk_size = ascend_chunk_size() if BT == 64 else BT
     strided_candidate = strided_fold_supported(
@@ -185,7 +186,7 @@ def chunk_gated_delta_rule(
     )
     if not head_first_strided:
         # Most chunk kernels index sequence-first tensors with contiguous
-        # strides, so unsupported inputs retain the established materialize.
+        # strides, so unsupported inputs take the materialised path.
         if not q_seq.is_contiguous():
             q_seq = q_seq.contiguous()
         if not k_seq.is_contiguous():

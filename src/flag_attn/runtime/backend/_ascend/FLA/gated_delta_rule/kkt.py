@@ -15,30 +15,29 @@ tiles: ``L`` is strictly lower triangular (nilpotent, ``L^BT = 0``), so starting
 from ``X0 = I - L`` (residual ``L^2``) each step
 ``X_{k+1} = X_k (2I - (I + L) X_k)`` squares the residual and ``log2(BT) - 1``
 steps are exact -- 2*4 = 8 small ``tl.dot`` for BT=32 instead of BT-1 sequential
-masked reductions (the old row-elimination form cost 17 ms of the 23.5 ms
-forward for T=1024/H=8/K=128; the Newton form plus the input-side decay folding
-below bring prep down to ~1.4 ms).
+masked reductions.  The input-side decay folding described below removes the
+elementwise pass over the BT x BT dot result.
 
 ``L`` is the strictly-lower chunk matrix ``beta_i * (k_i . k_j) * exp(g_i - g_j)``
 (the same quantity the generic kernel stores in ``A``), so the result matches
 the generic ``A_inv`` up to the BT granularity.
 
-Three Ascend-specific notes (all empirically established on 910B):
+Three backend constraints shape the kernel:
 
 * the KKT dot must cover the *whole* head dim in a single ``tl.dot``.  The
   usual ``for i_k in range(cdiv(K, BK)): b_L += tl.dot(...)`` accumulator form
-  is miscompiled as soon as the loop has more than one trip: for K=128 it
-  returned garbage in fp32 (rel err ~1.2 vs torch) and NaN in bf16, while
-  K <= BK (single trip) was exact;
+  is miscompiled as soon as the loop has more than one trip; loading the full
+  head dim in one block and issuing one dot keeps the accumulator exact.
 * the decay ``exp(g_i - g_j)`` is folded into the operands of that single dot
   (``beta_i exp(g_i) k_i`` against ``exp(-g_j) k_j``) instead of being applied
   to the BT x BT dot result.  Elementwise work on the cube output of a dot
-  (in particular the broadcast outer product of the gate) triggers a layout
-  conversion whose cost dominated prep: 6.2 ms -> 1.37 ms for T=1024/H=8;
+  (in particular the broadcast outer product of the gate) forces a layout
+  conversion, so the decay is folded into the dot operands and the whole
+  L/Newton chain stays in one layout.
 * the chunk-local cumsum is written as fp32 (see
-  ``chunk_gated_delta_rule_prep``).  bf16 cumsum storage alone accounted for
-  1.1-1.6% end-to-end relative error because ``|sum(g)| ~ 0.5 * BT`` makes the
-  bf16 ulp of the exponent huge compared with ``exp(g_i - g_j)``.
+  ``chunk_gated_delta_rule_prep``).  bf16 cumsum storage accumulates too much
+  error because ``|sum(g)| ~ 0.5 * BT`` makes the bf16 ulp of the exponent
+  huge compared with ``exp(g_i - g_j)``.
 """
 
 from __future__ import annotations
@@ -97,20 +96,18 @@ def _chunk_gated_delta_rule_prep_kernel(
     )
     b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
     # NOTE: the natural ``for i_k in range(tl.cdiv(K, BK)): b_L += tl.dot(...)``
-    # form is miscompiled on Ascend 910B: as soon as the loop has more than one
-    # trip (K > BK) the fp32 accumulator carried through the loop is garbage
-    # (K=128 fp32: rel err ~1.2 vs torch, bf16: NaN), while K <= BK is exact.
-    # Load the full head dim in a single block and use one dot instead.
+    # form is miscompiled on this backend: as soon as the loop has more than one
+    # trip (K > BK) the fp32 accumulator carried through the loop is
+    # unreliable.  Load the full head dim in a single block and use one dot.
     #
     # The decay is folded into the *inputs* of that dot:
     #     L[i, j] = (beta_i exp(g_i) k_i) . (exp(-g_j) k_j)
-    # instead of scaling the BT x BT dot result by exp(g_i - g_j).  On 910B the
-    # elementwise decay on the cube output forced a layout conversion (and a
-    # second one per Newton step), costing ~5.2 of the 6.2 ms prep time; the
-    # input-side scaling runs on 2*BT values and keeps the whole L/Newton chain
-    # in one layout (measured 6.2 ms -> 1.37 ms).  ``exp(-g)`` is clamped to
-    # e^80: exp(g_i - g_j) <= 1 for the kept strict-lower part, so the clamp
-    # only touches contributions that are already below fp32 resolution.
+    # instead of scaling the BT x BT dot result by exp(g_i - g_j).  Elementwise
+    # decay on the cube output forces a layout conversion (and a second one per
+    # Newton step); the input-side scaling runs on 2*BT values and keeps the
+    # whole L/Newton chain in one layout.  ``exp(-g)`` is clamped to e^80:
+    # exp(g_i - g_j) <= 1 for the kept strict-lower part, so the clamp only
+    # touches contributions that are already below fp32 resolution.
     b_e = tl.exp(b_g)
     b_r = tl.exp(tl.minimum(-b_g, 80.0))
     p_k = tl.make_block_ptr(
@@ -176,10 +173,10 @@ def chunk_gated_delta_rule_prep(
     # The chunk-local cumsum is kept in fp32 on purpose.  Its magnitude grows
     # with BT (|g| ~ 0.5 * BT for a fast-decay gate), so storing it in bf16
     # loses an absolute ~BT * eps / 2 in the exponent: at BT=32 / bf16 this is
-    # ~0.03, i.e. a ~6% error on exp(g_i - g_j) for *every* pair, which
-    # dominated the end-to-end bf16 error (measured 1.1-1.6% vs 0.3-0.5% when
-    # g_cum is fp32).  All downstream generic kernels load g with
-    # `.to(tl.float32)`, so an fp32 g_cumsum is a drop-in for them.
+    # ~0.03, i.e. a sizable relative error on exp(g_i - g_j) for *every* pair,
+    # which accumulates through the downstream recurrence.  All downstream
+    # generic kernels load g with `.to(tl.float32)`, so an fp32 g_cumsum is a
+    # drop-in for them.
     g_out = torch.empty_like(g, dtype=torch.float32)
     A_inv = torch.zeros(B, T, H, BT, device=g.device, dtype=output_dtype)
     _chunk_gated_delta_rule_prep_kernel[(NT, H if cu_seqlens is not None else B * H)](

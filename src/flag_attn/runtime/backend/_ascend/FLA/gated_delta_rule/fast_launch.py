@@ -6,8 +6,9 @@
 The GDN fast path is host-bound on small shapes: four ``kernel[grid](...)``
 calls per forward, and every call re-runs Triton's Python side (option/kwargs
 parsing, device/stream lookup, generated binder, cache-key build, global-value
-check, grid canonicalization).  On 910B that is ~0.06-0.10 ms per launch while
-the actual C launch is only ~0.02-0.03 ms.
+check, grid canonicalization).  That Python work outweighs the actual C launch
+on this backend, so caching the compiled launcher removes a large part of the
+per-call host cost.
 
 This module exposes one explicit entry point, :func:`fast_launch`, that a call
 site opts into: the first call of a site compiles the kernel (Triton's

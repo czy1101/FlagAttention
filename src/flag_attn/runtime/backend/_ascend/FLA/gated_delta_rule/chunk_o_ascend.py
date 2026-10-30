@@ -4,22 +4,22 @@
 """Ascend-only ``chunk_fwd_o`` for GDN v1.
 
 Math identical to ``flag_attn.FLA.chunk_o``; the generic module is untouched.
-Differences, all established by measurement on 910B:
+The differences below are all driven by this backend:
 
 1. **No autotune.**  ``check_shared_mem()`` is False on Ascend, so the generic
-   kernel searched 36 configs per new ``(H, K, V, BT)`` key (7-8.5 s per-process
-   cold start).  The tile is fixed here and measured (``BV``=min(V,128),
-   4 warps: 0.248 ms vs 0.479 ms at BV=64 for T=1024/H=8/K=V=128, BT=64).
+   kernel searches 36 configs per new ``(H, K, V, BT)`` key, paying a long
+   per-process cold start.  The tile is fixed here instead (``BV``=min(V,128),
+   4 warps), which is the empirical choice for this backend: fewer, larger
+   programs beat more, smaller ones.
 2. **K is a single tile** (``BK = K``): the generic loop over ``cdiv(K, 64)``
    trips twice for K=128 and carries a ``BT x BV`` fp32 cube accumulator
-   across the loop, which is miscompiled on 910B (see ``kkt.py``).
+   across the loop, which is miscompiled on this backend (see ``kkt.py``).
 3. **Decay applied through 2D factor tiles.**  The generic form
    ``dot(q, k^T) * exp(g_i - g_j)`` / ``o * exp(g_i)`` does elementwise work on
-   cube outputs (layout conversion) and the obvious fix
-   ``q * exp(g)[:, None]`` is even worse: on this part a 1D->2D broadcast
-   multiply of a ``[64, 128]`` tile costs ~6.4 us per program while a 2D x 2D
-   multiply costs ~0.1 us (measured 0.82 ms vs 0.05 ms for 128 programs).
-   The decay factors are therefore *gathered as 2D tiles*
+   cube outputs (layout conversion), and the obvious fix
+   ``q * exp(g)[:, None]`` is worse: 1D->2D broadcast multiplies are slow on
+   this backend, while a 2D x 2D multiply is cheap.  The decay factors are
+   therefore *gathered as 2D tiles*
 
        b_g2 = tl.load(g + base + o_t[:, None] * H + 0 * arange(K)[None, :], ...)
 
@@ -34,8 +34,8 @@ Differences, all established by measurement on 910B:
 4. **No ``o_t < T`` term in the causal mask.**  Every load is
    ``boundary_check``-guarded and pads with 0, so out-of-range rows/cols
    already contribute nothing.  The generic kernel's extra broadcast
-   ``o_t < T`` mask is what pushes the BT=64 UB footprint over 192KB (measured
-   ub overflow: 3358720 bits required vs 1572864 available).
+   ``o_t < T`` mask is what pushes the BT=64 UB footprint over the 192KB
+   budget.
 """
 
 from __future__ import annotations
@@ -174,8 +174,8 @@ def _chunk_fwd_o_kernel(
 
 
 def _default_bv(V: int) -> int:
-    # BV=128 measured best at BT=64 (0.247 ms vs 0.479 ms at BV=64 on
-    # T=1024/H=8/K=V=128): fewer, larger programs beat more, smaller ones.
+    # BV=128 is the empirical value at BT=64 on this backend: fewer, larger
+    # programs beat more, smaller ones.
     configured = int(os.environ.get("FLAG_ATTN_ASCEND_GDN_O_BV", "0"))
     return configured or min(128, max(16, triton.next_power_of_2(V)))
 

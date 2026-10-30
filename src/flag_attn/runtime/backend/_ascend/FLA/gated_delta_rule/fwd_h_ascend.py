@@ -9,8 +9,8 @@ storing the chunk-start state ``h`` for ``chunk_o``), with three Ascend
 changes; the generic module is left untouched:
 
 * **No autotune.**  The generic wrapper searched 4 warps * 3 stages * 2 BV = 24
-  configs per shape key (7-8.5 s cold start) while the kernel only has
-  ``V/BV * N*H`` programs.
+  configs per shape key, which costs a long per-process cold start while the
+  kernel only has ``V/BV * N*H`` programs.
 * **K is a single tile.**  The generic kernel keeps ``64 x BV`` fp32 state
   tiles (``b_h1..b_h4``) and walks K in 64-wide slabs; for K=128 that is two
   slabs, two cube dots per chunk and two state stores/loads.  Here the state
@@ -19,9 +19,8 @@ changes; the generic module is left untouched:
   over K slabs).
 * **V-axis splitting** (``bv``): the recurrence is sequential over chunks, so
   the only parallelism is over the ``V/BV`` state column tiles times ``N*H``
-  heads.  Fewer, larger programs win on this part: measured 0.16-0.18 ms at
-  BV=64 (16 programs) vs 0.28 ms at BV=32 (32) and 0.21 ms at BV=128 (8) for
-  T=1024/H=8/K=V=128, BT=64.
+  heads.  Fewer, larger programs win on this backend, so ``bv`` defaults to 64
+  at BT=64 (an empirical value for this backend).
 """
 
 from __future__ import annotations
@@ -133,8 +132,8 @@ def _fwd_h_kernel(
             m_t = o_t < T
             b_g_last = tl.load(g + bos * H + last_idx * H + i_h).to(tl.float32)
             # Gather the per-token factor as a [BT, BV] tile: broadcasting a
-            # loaded [BT] vector (``v[:, None] * tile``) costs ~6 us/program on
-            # Ascend while a 2D x 2D multiply costs ~0.1 us (see
+            # loaded [BT] vector (``v[:, None] * tile``) is slow on this
+            # backend while a 2D x 2D multiply is cheap (see
             # ``wy_fast_ascend.py``).  The row scaling is otherwise identical
             # to the generic kernel.
             gb = g + bos * H + i_h
@@ -160,8 +159,7 @@ def _fwd_h_kernel(
 
 
 def _default_bv(V: int) -> int:
-    # BV=64 measured best at BT=64 (0.16-0.18 ms vs 0.28 ms at BV=32 and
-    # 0.21 ms at BV=128 on T=1024/H=8/K=V=128).
+    # BV=64 is the empirical value at BT=64 on this backend.
     return int(os.environ.get("FLAG_ATTN_ASCEND_GDN_H_BV", "0")) or min(V, 64)
 
 

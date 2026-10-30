@@ -3,13 +3,14 @@
 
 """Fixed-length TLE-Raw inverse preparation for eligible GDN workloads.
 
-This module is deliberately separate from the existing prep implementation.
+This module is deliberately separate from the generic prep implementation.
 It materializes a dense contiguous FP32 64x64 chunk-local KKT matrix, applies
 the Raw inverse to its two diagonal 32x32 blocks, stitches the full 64x64
-inverse, then computes the existing two-pass affine outputs. The dense KKT
-write avoids the severe serialization seen with dynamic compact-block
-addressing on CANN 9.1. Dispatch is restricted to the measured large-workload
-class and can be disabled with ``FLAG_ATTN_ASCEND_GDN_RAW_INVERSE=0``.
+inverse, then computes the same two-pass affine outputs as the generic path.
+The dense KKT write avoids the severe serialization seen with dynamic
+compact-block addressing on CANN 9.1. Dispatch is restricted to the
+large-workload class and can be disabled with
+``FLAG_ATTN_ASCEND_GDN_RAW_INVERSE=0``.
 """
 from __future__ import annotations
 
@@ -274,10 +275,9 @@ def _prep_affine_from_inverse_batched_kernel(
 
 
 # The affine kernel is limited by per-program scalar/scheduling overhead, not
-# by MACs or HBM (measured 2026-10-27: B4/T4096 462 GB/s, MAC ~12%).  Folding
-# four consecutive chunks into one program amortises that overhead: 6.68 ->
-# 5.74 ms on B4/T4096 (grid 16384 -> 4096 programs) and 0.824 -> 0.693 ms on
-# B4/T2048, with bit-identical outputs.  BATCH=8 was slightly worse.
+# by MACs or HBM.  Folding four consecutive chunks into one program amortises
+# that overhead, and BATCH=4 is the empirical value for this backend; larger
+# batches do not reduce the program count enough to pay for the longer body.
 _AFFINE_BATCH = 4
 
 
@@ -322,7 +322,7 @@ def raw_inverse_prep_affine_ascend(qe, ke, kr, vb, chunk_size, output_dtype=None
     cu = qe.new_empty((B, NT, H, K, V))
     mw = qe.new_empty((B, NT, H, K, K))
     a_out = torch.empty((B, T, H, BT), dtype=output_dtype, device=ke.device)
-    # Batching crossovers for the chunk-parallel KKT/stitch kernels; the Raw
+    # Batch-size thresholds for the chunk-parallel KKT/stitch kernels; the Raw
     # diagonal inverse stays as is (it is bound inside the CCEC inverse).
     from .raw_inverse_batch import (
         launch_kkt_blocks_dispatch,

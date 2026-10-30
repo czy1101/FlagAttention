@@ -9,23 +9,23 @@ Three paths:
   Triton launches -- ``cumsum(+fp32 beta)`` -> ``prep_w_u`` -> ``fwd_h_o``.
   ``fused_ascend.py`` merges the KKT/Newton inverse with ``recompute_w_u``
   (``A_inv`` never hits GM) and the state scan with the output stage (``h`` and
-  ``v_new`` never hit GM).  This is the default because the staged pipeline was
-  launch/host bound (0.867 of 0.905 ms was host enqueue time on T=1024/H=8),
-  not compute bound.  ``FLAG_ATTN_ASCEND_GDN_FUSE=0`` selects the staged fast
-  path (5 launches) instead.
+  ``v_new`` never hit GM).  This is the default because the staged pipeline is
+  launch/host bound on this backend, not compute bound.
+  ``FLAG_ATTN_ASCEND_GDN_FUSE=0`` selects the staged fast path (5 launches)
+  instead.
 * **staged fast path**: the same math in five Ascend kernels
-  (``wy_fast_ascend.py``, ``fwd_h_ascend.py``, ``chunk_o_ascend.py``), kept for
-  A/B and as a fallback.
+  (``wy_fast_ascend.py``, ``fwd_h_ascend.py``, ``chunk_o_ascend.py``), kept as
+  an explicit alternative.
 * **fallback path** (``K``/``V`` > 128, or
-  ``FLAG_ATTN_ASCEND_GDN_FAST=0``): the previous implementation -- ``kkt.py``
+  ``FLAG_ATTN_ASCEND_GDN_FAST=0``): the generic implementation -- ``kkt.py``
   prep plus the generic ``wy_fast``/``chunk_delta_h``/``chunk_o`` kernels at
   ``BT=32``, so fp16 and K=256 keep working.
 
-All Ascend kernels here share the same measured rules (see the module
+All Ascend kernels here share the same backend rules (see the module
 docstrings): no autotune, K in a single tile, and per-token decay applied
 through *2D factor tiles gathered from fp32 buffers* -- a 1D->2D broadcast
-multiply costs ~6 us/program and a bf16 2D gather ~0.5 ms/128 tiles on 910B,
-vs ~0.07 ms for an fp32 gather.
+multiply is slow on this backend, and bf16 2D gathers are much slower than
+fp32 gathers.
 
 ``FLAG_ATTN_ASCEND_GDN_BT`` selects the internal chunk size (default 64, the
 same chunk CANN's AscendC fused op uses); BT=32 remains available as an
@@ -67,29 +67,29 @@ _FAST_ENV = "FLAG_ATTN_ASCEND_GDN_FAST"
 _FUSE_ENV = "FLAG_ATTN_ASCEND_GDN_FUSE"
 _RAW_INVERSE_ENV = "FLAG_ATTN_ASCEND_GDN_RAW_INVERSE"
 _ONEPASS_SMALL_ENV = "FLAG_ATTN_ASCEND_GDN_ONEPASS_SMALL"
-# Measured on 2026-10-27 (CANN 9.1 / 910B): once the chunk/head grid reaches
-# 1024 jobs the exact two-pass scan plus the Raw inverse wins even for short
-# sequences (T=256..1024, NT=2..16): -18% at gqa-B2-T2048 (jobs 1024),
-# -24% at B8-T1024-d64, -28..-32% at B8-T512/B4-T512/B8-T256 jobs-1024 shapes
-# and B4-T1024-H64. Below 1024 jobs (e.g. T2048-h8, jobs 256) Raw is slower.
+# Job-count threshold for the Raw inverse prep route (an empirical value for
+# this backend): once the chunk/head grid reaches 1024 jobs the exact two-pass
+# scan plus the Raw inverse pays off even for short sequences (NT >= 2).  Below
+# it the Raw prep adds inverse materialisation work that the grid cannot hide.
 _RAW_INVERSE_MIN_JOBS = 1024
 # v1 fold trim (only materialise k_e/k_r) needs the Raw prep path and a grid
-# where the extra qe/vb recompute in the affine kernel is amortised.
+# large enough that the extra qe/vb recompute in the affine kernel is
+# amortised; again an empirical job count for this backend.
 _FOLD_TRIM_MIN_JOBS = 2048
 
 _OFF = {"0", "false", "off", "no"}
 
-# Chunk count from which the exact two-pass state scan beats the fused
-# sequential one (measured crossover; see fused_ascend._affine_kernel).
-# For NT < 32 the two-pass scan still pays off on large grids, so the jobs
-# threshold above is OR-ed in (validated down to NT=2; NT=1 is neutral, so it
-# keeps the one-pass path).
+# Chunk count from which the exact two-pass state scan is preferred over the
+# fused sequential one (an empirical value for this backend; see
+# fused_ascend._affine_kernel).  For NT < 32 the two-pass scan can still pay
+# off on large grids, so the jobs threshold below is OR-ed in; NT=1 keeps the
+# one-pass path because a second pass cannot pay for itself there.
 _TWOPASS_MIN_CHUNKS = 32
 _TWOPASS_MIN_JOBS = 1024
 
 def _use_fused() -> bool:
     """Fused (fold+prep_w_u+fwd_h_o) is the default; the staged 5-launch path
-    remains available via ``FLAG_ATTN_ASCEND_GDN_FUSE=0`` (A/B and fallback)."""
+    remains available via ``FLAG_ATTN_ASCEND_GDN_FUSE=0`` as a fallback."""
     forced = os.environ.get(_FUSE_ENV, "").lower()
     return forced not in _OFF if forced else True
 
@@ -181,11 +181,10 @@ def _fwd_legacy(q, k, v, g, beta, scale, initial_state, output_final_state,
         and 0 < v.shape[-1] <= 256
         and cu_seqlens is None
     )
-    # Use the measured one-warp output kernel for fixed-length FP16 shapes in
-    # this supported width range.  Besides staying within ACL's coreDim limit
-    # on large grids, this avoids the generic autotuner's much slower output
-    # configs (the B8/T1024/H8/K=V=64 FP16 output stage is ~19% faster here).
-    # Keep the established K=V=256 bf16 route as well.
+    # Use the fixed one-warp output kernel for fixed-length FP16 shapes in this
+    # supported width range.  Besides staying within ACL's coreDim limit on
+    # large grids, this avoids the generic autotuner's much slower output
+    # configs on this backend.  The fixed route is also used for K=V=256 bf16.
     needs_fixed_output = q.dtype == torch.float16 or (
         k.shape[-1] == 256 and v.shape[-1] == 256
     )
@@ -224,8 +223,8 @@ def _fwd_legacy(q, k, v, g, beta, scale, initial_state, output_final_state,
 def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
               cu_seqlens, bt, head_first_strided=False):
     # One vector-only pass produces the chunk-local cumsum and an fp32 copy of
-    # ``beta``; the fp32 copy matters because 2D gathers of bf16 data are ~10x
-    # slower than fp32 gathers on this part (see wy_fast_ascend.py).
+    # ``beta``; the fp32 copy matters because 2D gathers of bf16 data are much
+    # slower than fp32 gathers on this backend (see wy_fast_ascend.py).
     if _use_fused():
         # The normal path uses vector folds -> prep (KKT/Newton+w/u+A) ->
         # state scan + output. Long fixed sequences fuse prep with the affine
@@ -234,9 +233,9 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
         #
         # v1 fold trim: on BF16 fixed-length Raw-prep grids (jobs >= 2048) the
         # strided fold only materialises k_e/k_r; qe/vb are recomputed inside
-        # the Raw affine kernel from q/v and the small fp32 factor buffers.
-        # That removes ~1 GB of GM traffic at B4/T4096 (fold 2.47 -> 1.25 ms,
-        # E2E -0.97 ms, bit-identical).  FP16 keeps the full fold.
+        # the Raw affine kernel from q/v and the small fp32 factor buffers,
+        # which removes the GM traffic of writing and reloading them.  FP16
+        # keeps the full fold.
         nt = -(-g.shape[1] // bt)
         jobs = q.shape[0] * nt * beta.shape[2]
         two_pass_env = os.environ.get("FLAG_ATTN_ASCEND_GDN_TWOPASS", "")
@@ -277,12 +276,10 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
             )
         # Optional exact two-pass state scan (pass1 chunk-parallel affine
         # precompute, pass2 with two dots per chunk; see _affine_kernel in
-        # fused_ascend.py).  Measured: fwd_h_o device 0.256 -> 0.170 ms at
-        # T2048/H8, while the extra pass costs 0.109 ms of device + ~0.10 ms of
-        # host; it pays off once the sequential chain is long (NT >= 32) or the
-        # chunk/head grid is large enough (jobs >= 1024, NT >= 2), where the
-        # pass-1 parallelism dominates the extra pass.  Override with
-        # FLAG_ATTN_ASCEND_GDN_TWOPASS=1/0.
+        # fused_ascend.py).  It pays off once the sequential chain is long
+        # (NT >= 32) or the chunk/head grid is large enough (jobs >= 1024,
+        # NT >= 2), where the pass-1 parallelism dominates the cost of the
+        # extra pass.  Override with FLAG_ATTN_ASCEND_GDN_TWOPASS=1/0.
         two_pass_env = os.environ.get("FLAG_ATTN_ASCEND_GDN_TWOPASS", "")
         if two_pass_env:
             two_pass = two_pass_env.lower() not in _OFF
@@ -293,11 +290,10 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
                 nt >= _TWOPASS_MIN_CHUNKS
                 or (nt >= 2 and jobs >= _TWOPASS_MIN_JOBS)
             )
-            # The one-pass scan now unrolls two chunks per iteration and wins
-            # on tiny head grids where the two-pass pass1 cannot pay for
-            # itself: T2048-h8 (B*H=8, NT=32) one-pass 0.522 vs two-pass
-            # 0.552 ms, both within 0.45% of the FP32 recurrence.  Keep
-            # two-pass for B*H >= 16 (gqa-B2-T2048 is 0.55 vs 0.52 x faster).
+            # The one-pass scan unrolls two chunks per iteration and wins on
+            # tiny head grids where the two-pass pass1 cannot pay for itself.
+            # Keep two-pass for B*H >= 16, where the pass-1 parallelism
+            # outweighs the extra pass.
             if (
                 two_pass
                 and os.environ.get(_ONEPASS_SMALL_ENV, "1").lower() not in _OFF
@@ -321,10 +317,8 @@ def _fwd_fast(q, k, v, g, beta, scale, initial_state, output_final_state,
                 and q.dtype in (torch.bfloat16, torch.float16)
             )
             if raw_inverse:
-                # This route defaults on for workloads with at least 1024
-                # independent chunk/head jobs (was 2048 before the 2026-10-27
-                # measurement round: with the current Raw prep, jobs-1024 grids
-                # win by 18-32% once the two-pass scan is also enabled).
+                # This route is chosen for workloads with at least 1024
+                # independent chunk/head jobs (see _RAW_INVERSE_MIN_JOBS).
                 # Below that the fused prep wins because Raw adds inverse
                 # materialization work; one-pass and varlen keep fused prep.
                 if trim_ctx is not None:
