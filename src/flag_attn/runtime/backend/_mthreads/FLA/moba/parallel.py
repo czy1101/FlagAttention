@@ -314,7 +314,7 @@ def _moba_attn_varlen_inference(
         historical_topk,
     )
     block_m = _routed_launch_config(
-        head_dim, q.device, q.shape[0], moba_chunk_size, k, v
+        head_dim, q.device, moba_chunk_size, k, v
     )[0]
     bytes_per_rank = seqlen * num_q_heads * head_dim * q.element_size()
     ranks_per_pass = max(
@@ -411,6 +411,14 @@ def parallel_moba(
     num_q_heads = q.shape[1]
     num_kv_heads = k.shape[1]
     head_dim = q.shape[2]
+    if moba_topk < 1:
+        raise ValueError("moba_topk must be >= 1")
+    if moba_topk > 64:
+        raise ValueError("moba_topk must be <= 64")
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError("num_q_heads must be divisible by num_kv_heads")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise TypeError("q, k, and v must have the same dtype")
     if head_dim > 256:
         raise ValueError(f"head_dim must be <= 256 to match FlashMoBA, got {head_dim}")
 

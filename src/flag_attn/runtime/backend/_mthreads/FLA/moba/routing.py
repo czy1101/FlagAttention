@@ -784,6 +784,17 @@ def _streaming_topk_float_to_key(values):
     return value_bits ^ flip_mask
 
 
+_MAX_STREAMING_TILE_VALUES = 2048
+
+
+def _streaming_topk_tile_shape(topk: int) -> tuple[int, int, int]:
+    """Choose query/chunk tiles with a bounded per-CTA selection workspace."""
+    block_topk = triton.next_power_of_2(topk)
+    block_chunk = max(32, block_topk)
+    block_tok = min(64, _MAX_STREAMING_TILE_VALUES // block_chunk)
+    return block_topk, block_chunk, block_tok
+
+
 @triton.jit
 def _chunk_topk_streaming_kernel(
     q_ptr,
@@ -989,9 +1000,7 @@ def _compute_selected_chunks_streaming_triton(
     if topk > num_chunks:
         raise ValueError(f"topk ({topk}) cannot exceed num_chunks ({num_chunks})")
 
-    block_topk = triton.next_power_of_2(topk)
-    if block_topk > 64:
-        raise ValueError(f"streaming Triton Top-K currently supports topk <= 64, got topk={topk}")
+    block_topk, block_chunk, block_tok = _streaming_topk_tile_shape(topk)
 
     selected_chunks = torch.empty(
         (topk, num_heads, seqlen),
@@ -1001,24 +1010,6 @@ def _compute_selected_chunks_streaming_triton(
     _fill_triton(selected_chunks, -1)
 
     block_d = max(16, triton.next_power_of_2(head_dim))
-    # This kernel intentionally uses an explicit shape policy instead of
-    # triton.autotune.  FlagTree's AABS extension mutates Config.kwargs in
-    # place when a tile is larger than a runtime tensor dimension, so a small
-    # first invocation can permanently shrink every candidate and break later
-    # top-k calls.  NCU shows 64x32 is the best long-sequence K=8 tile on H100:
-    # it reuses each chunk vector across 64 queries while keeping the dot and
-    # selection working sets at 2048 values.  Wider requested top-k values
-    # need a local chunk tile at least as wide as BLOCK_TOPK for tl.topk
-    # correctness, so cap BLOCK_TOK to preserve that same working-set bound.
-    block_chunk = max(32, block_topk)
-    max_block_tok = 2048 // block_chunk
-    # Query reuse pays off once routing traverses at least one full 32-chunk
-    # tile.  Keying this decision to routing work (rather than a benchmark-
-    # specific sequence-length threshold) also scales across chunk sizes and
-    # packed batches.
-    reuse_block_tok = 64 if num_chunks >= 32 else 32
-    block_tok = min(reuse_block_tok, max_block_tok)
-    num_stages = 2 if block_chunk >= 64 else 1
     grid = (cdiv(seqlen, block_tok), num_heads)
 
     _chunk_topk_streaming_kernel[grid](
@@ -1047,7 +1038,7 @@ def _compute_selected_chunks_streaming_triton(
         BLOCK_CHUNK=block_chunk,
         BLOCK_D=block_d,
         num_warps=4,
-        num_stages=num_stages,
+        num_stages=1,
     )
 
     return selected_chunks
@@ -1229,9 +1220,7 @@ def _compute_selected_chunks_batched_streaming_triton(
             f"historical topk ({topk}) must be smaller than the per-sequence chunk capacity ({max_chunks_per_sequence})"
         )
 
-    block_topk = triton.next_power_of_2(topk)
-    if block_topk > 64:
-        raise ValueError(f"streaming Triton Top-K currently supports topk <= 64, got topk={topk}")
+    block_topk, block_chunk, block_tok = _streaming_topk_tile_shape(topk)
     selected_chunks = torch.empty(
         (topk, num_heads, q.shape[0]),
         device=q.device,
@@ -1239,12 +1228,7 @@ def _compute_selected_chunks_batched_streaming_triton(
     )
     _fill_triton(selected_chunks, -1)
 
-    block_chunk = max(32, block_topk)
-    max_block_tok = 2048 // block_chunk
-    reuse_block_tok = 64 if max_chunks_per_sequence >= 32 else 32
-    block_tok = min(reuse_block_tok, max_block_tok)
     block_d = max(16, triton.next_power_of_2(head_dim))
-    num_stages = 2 if block_chunk >= 64 else 1
     grid = (cdiv(max_seqlen, block_tok), num_heads, batch_size)
     _chunk_topk_batched_streaming_kernel[grid](
         q,
@@ -1271,7 +1255,7 @@ def _compute_selected_chunks_batched_streaming_triton(
         BLOCK_CHUNK=block_chunk,
         BLOCK_D=block_d,
         num_warps=4,
-        num_stages=num_stages,
+        num_stages=1,
     )
     return selected_chunks
 

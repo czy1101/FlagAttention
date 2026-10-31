@@ -637,8 +637,8 @@ def _routed_gqa_attn_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    USE_TME_K: tl.constexpr,
-    USE_TME_V: tl.constexpr,
+    USE_TME: tl.constexpr,
+    USE_RANK2: tl.constexpr,
 ):
     descriptor = tl.program_id(0)
     expert = tl.load(descriptor_experts_ptr + descriptor)
@@ -674,8 +674,8 @@ def _routed_gqa_attn_fwd_kernel(
     for n_start in tl.range(0, CHUNK_SIZE, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < CHUNK_SIZE
-        if USE_TME_K:
-            if BLOCK_N == 64 and HEAD_DIM == BLOCK_D and CHUNK_SIZE % BLOCK_N == 0:
+        if USE_TME:
+            if USE_RANK2:
                 # The rank-2 TME tile is consumed directly by QK SQMMA.
                 k_values = k_ptr.load([key_start + n_start, kv_head * HEAD_DIM])
             else:
@@ -697,8 +697,8 @@ def _routed_gqa_attn_fwd_kernel(
         probabilities = tl.where(valid, probabilities, 0.0)
         row_sum = row_sum * alpha + tl.sum(probabilities, axis=1)
         acc *= alpha[:, None]
-        if USE_TME_V:
-            if BLOCK_N == 64 and HEAD_DIM == BLOCK_D and CHUNK_SIZE % BLOCK_N == 0:
+        if USE_TME:
+            if USE_RANK2:
                 # Full historical tiles need no tail mask; rank-2 TME loads
                 # directly into the SQMMA B shared operand on MP31.
                 v_values = v_ptr.load([key_start + n_start, kv_head * HEAD_DIM])
@@ -753,24 +753,54 @@ def _tme_layout_ok(tensor: torch.Tensor) -> bool:
     )
 
 
+def _routed_tme_policy(
+    head_dim: int,
+    block_d: int,
+    device: torch.device,
+    chunk_size: int,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[bool, bool]:
+    # This backend's routed descriptor loads are validated for contiguous K/V.
+    use_tme = _use_musa_tme(device) and _tme_layout_ok(k) and _tme_layout_ok(v)
+    # The rank-2 view needs full-width heads and complete 64-key tiles.
+    # D < 32 stays on the rank-3 path because its rank-2 tile regresses.
+    use_rank2 = (
+        use_tme
+        and head_dim == block_d
+        and block_d >= 32
+        and chunk_size % 64 == 0
+    )
+    return use_tme, use_rank2
+
+
+def _routed_kv_arg(
+    tensor: torch.Tensor,
+    use_tme: bool,
+    use_rank2: bool,
+    block_n: int,
+    block_d: int,
+):
+    if not use_tme:
+        return tensor
+    if use_rank2:
+        return TensorDescriptor.from_tensor(tensor.view(tensor.shape[0], -1), [block_n, block_d])
+    return TensorDescriptor.from_tensor(tensor, [block_n, 1, block_d])
+
+
 def _routed_launch_config(
     head_dim: int,
     device: torch.device,
-    total_tokens: int,
     chunk_size: int,
     k: torch.Tensor,
     v: torch.Tensor,
 ) -> tuple[int, int, int, int, int]:
     block_m, block_n, block_d, num_warps, num_stages = _attention_launch_config(head_dim, device)
-    # D64 benefits from the same direct rank-2 K/V operands at a 32x64 tile.
-    if (head_dim == 64 and total_tokens >= 2048 and _use_musa_tme(device)
-            and chunk_size % 64 == 0 and _tme_layout_ok(k) and _tme_layout_ok(v)):
+    _, use_rank2 = _routed_tme_policy(
+        head_dim, block_d, device, chunk_size, k, v
+    )
+    if use_rank2:
         return 32, 64, block_d, num_warps, num_stages
-    if head_dim == 128 and total_tokens >= 2048 and _use_musa_tme(device):
-        # Routing descriptors and attention must use the same query tile.
-        if chunk_size % 64 == 0 and _tme_layout_ok(k) and _tme_layout_ok(v):
-            return 32, 64, block_d, num_warps, num_stages
-        return 16, 64, block_d, num_warps, num_stages
     return block_m, block_n, block_d, num_warps, num_stages
 
 
@@ -791,25 +821,16 @@ def _routed_sparse_attention_triton(
     group_size = num_q_heads // num_kv_heads
     head_dim = q.shape[2]
     block_m, block_n, block_d, num_warps, num_stages = _routed_launch_config(
-        head_dim, q.device, q.shape[0], chunk_size, k, v
+        head_dim, q.device, chunk_size, k, v
     )
     route_out = torch.empty((query_indices.numel(), head_dim), device=q.device, dtype=q.dtype)
     route_lse = torch.empty((query_indices.numel(),), device=q.device, dtype=torch.float32)
-    # Descriptor setup is measurable on short calls; strided K/V retains the pointer path.
-    use_tme = q.shape[0] >= 2048 and _use_musa_tme(q.device) and _tme_layout_ok(k) and _tme_layout_ok(v)
-    # MP31 D128 16x64: measured faster with pointer-loaded K and TME-loaded V.
-    # Keep the original K TME path for other tiles (notably D256).
-    use_tme_k = use_tme and not (head_dim == 128 and block_m == 16 and block_n == 64)
-    if use_tme_k and block_n == 64 and head_dim in (64, 128) and chunk_size % block_n == 0:
-        # A contiguous zero-copy view selects the KV head by column offset.
-        k_arg = TensorDescriptor.from_tensor(k.view(k.shape[0], -1), [block_n, block_d])
-    else:
-        k_arg = TensorDescriptor.from_tensor(k, [block_n, 1, block_d]) if use_tme_k else k
-    if use_tme and block_n == 64 and head_dim in (64, 128) and chunk_size % block_n == 0:
-        # Zero-copy flattening keeps the per-head V tile contiguous.
-        v_arg = TensorDescriptor.from_tensor(v.view(v.shape[0], -1), [block_n, block_d])
-    else:
-        v_arg = TensorDescriptor.from_tensor(v, [block_n, 1, block_d]) if use_tme else v
+    use_tme, use_rank2 = _routed_tme_policy(
+        head_dim, block_d, q.device, chunk_size, k, v
+    )
+    # Both descriptors and the kernel use the same rank-2 decision.
+    k_arg = _routed_kv_arg(k, use_tme, use_rank2, block_n, block_d)
+    v_arg = _routed_kv_arg(v, use_tme, use_rank2, block_n, block_d)
     _routed_gqa_attn_fwd_kernel[(descriptor_experts.numel(),)](
         q,
         k_arg,
@@ -841,8 +862,8 @@ def _routed_sparse_attention_triton(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_D=block_d,
-        USE_TME_K=use_tme_k,
-        USE_TME_V=use_tme,
+        USE_TME=use_tme,
+        USE_RANK2=use_rank2,
         num_warps=num_warps,
         num_stages=num_stages,
     )
