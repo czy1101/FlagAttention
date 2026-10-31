@@ -31,13 +31,16 @@ except ImportError:
     version_tuple = (0, 0, 0)
 
 
-from flag_attn.piecewise import attention as piecewise_attention  # noqa: E402, F401
-from flag_attn.flash import attention as flash_attention  # noqa: E402, F401
-from flag_attn.split_kv import attention as flash_attention_split_kv  # noqa: E402, F401
-from flag_attn.paged import attention as paged_attention  # noqa: E402, F401
-from flag_attn import testing  # noqa: E402, F401
+from flag_attn import testing  # noqa: F401
+from flag_attn.flash import attention as flash_attention
+from flag_attn.paged import attention as paged_attention
+from flag_attn.piecewise import attention as piecewise_attention
+from flag_attn.split_kv import attention as flash_attention_split_kv
 
 _OPERATOR_EXPORTS = {
+    "InfLLMV2Config": ("flag_attn.infllmv2", "InfLLMV2Config"),
+    "infllmv2_attention": ("flag_attn.infllmv2", "infllmv2_attention"),
+    "infllmv2_decode": ("flag_attn.infllmv2", "infllmv2_decode"),
     "hy3_attention": ("flag_attn.hpc_ops_attention", "hy3_attention"),
     "chunk_gated_delta_rule": (
         "flag_attn.FLA.gated_delta_rule",
@@ -82,24 +85,27 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "hy3_attention",
-    "device",
-    "vendor",
-    "vendor_name",
+    "InfLLMV2Config",
     "backend_info",
-    "piecewise_attention",
+    "chunk_gated_delta_rule",
+    "chunk_gdn2",
+    "chunk_gla",
+    "chunk_kda",
+    "device",
     "flash_attention",
     "flash_attention_split_kv",
-    "paged_attention",
-    "chunk_gated_delta_rule",
-    "chunk_gla",
-    "chunk_gdn2",
-    "chunk_kda",
-    "parallel_wall_attn",
+    "hy3_attention",
+    "infllmv2_attention",
+    "infllmv2_decode",
     "minimax_m3_index_decode",
     "minimax_m3_index_decode_score",
     "minimax_m3_index_score",
     "minimax_m3_index_topk",
     "minimax_m3_sparse_attn",
     "minimax_m3_sparse_attn_decode",
+    "paged_attention",
+    "parallel_wall_attn",
+    "piecewise_attention",
+    "vendor",
+    "vendor_name",
 ]
