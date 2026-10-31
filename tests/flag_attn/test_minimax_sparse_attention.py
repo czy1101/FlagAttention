@@ -685,7 +685,7 @@ def test_prefill_topk_streaming_partial_tile_excludes_padding() -> None:
 
 
 @pytest.mark.skipif(
-    not index_topk_module._HAS_TLE_RADIX,
+    not getattr(index_topk_module, "_HAS_TLE_RADIX", False),
     reason="requires a backend with TLE radix top-k support",
 )
 @pytest.mark.minimax_m3_sparse_attn
@@ -782,7 +782,6 @@ def test_prefill_bf16(case: tuple) -> None:
 @pytest.mark.parametrize(
     "case", PREFILL_QH8_CASES, ids=("selection", "long_ragged")
 )
-@pytest.mark.minimax_sparse_attention_prefill
 @pytest.mark.minimax_m3_sparse_attn
 def test_prefill_bf16_qh8_kernel_choices(
     case: tuple, choice: str, monkeypatch: pytest.MonkeyPatch

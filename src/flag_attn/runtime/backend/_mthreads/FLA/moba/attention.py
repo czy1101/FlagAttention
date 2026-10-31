@@ -14,33 +14,22 @@
 
 """Dense and routed attention kernels for Triton MoBA."""
 
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra.musa import libdevice
 
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ImportError:
+    TensorDescriptor = None
+
 from .routing import _copy_triton, cdiv
 
 
 _LOG2E = tl.constexpr(1.4426950408889634)
-
-
-def _sm_capability(device: torch.device) -> tuple[int, int]:
-    """Return the NVIDIA SM capability, or (0, 0) on any other backend.
-
-    Only the SM90 policy is architecture specific; every other backend keeps
-    the conservative tile fallback, so an unavailable CUDA runtime must
-    degrade to that fallback instead of querying device properties.
-    """
-    if not torch.cuda.is_available():
-        return 0, 0
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    try:
-        return torch.cuda.get_device_capability(device_index)
-    except (AssertionError, RuntimeError, ValueError):
-        return 0, 0
 
 
 @triton.jit
@@ -403,25 +392,7 @@ def _attention_launch_config(
     # tl.dot requires a reduction dimension of at least 16. Padding also lets
     # the same kernels support every head dimension up to FlashMoBA's D=256.
     block_d = max(16, triton.next_power_of_2(head_dim))
-    gpu_arch = _sm_capability(device)
-    if device.type == "musa":
-        # Conservative, correctness-validated baseline for the S5000 toolchain.
-        return 32, 32, block_d, 4, 1
-
-    if gpu_arch == (9, 0):
-        # Preserve the launch policy tuned and validated on SM90/H100.
-        if head_dim <= 64:
-            return 64, 64, block_d, 4, 3
-        if head_dim <= 128:
-            return 128, 128, block_d, 8, 3
-        # A 128x128 tile with BLOCK_D=256 exceeds Hopper's shared-memory budget.
-        return 64, 64, block_d, 8, 2
-
-    # Conservative fallback for every non-SM90 CUDA architecture. In
-    # particular, the 32x32 D=256 tile remains below the tighter shared-memory
-    # limits found on some GPUs, without maintaining per-model tables.
-    if head_dim <= 128:
-        return 64, 64, block_d, 4, 2
+    # Conservative, correctness-validated baseline for the S5000 toolchain.
     return 32, 32, block_d, 4, 1
 
 
@@ -666,6 +637,8 @@ def _routed_gqa_attn_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    USE_TME_K: tl.constexpr,
+    USE_TME_V: tl.constexpr,
 ):
     descriptor = tl.program_id(0)
     expert = tl.load(descriptor_experts_ptr + descriptor)
@@ -701,11 +674,19 @@ def _routed_gqa_attn_fwd_kernel(
     for n_start in tl.range(0, CHUNK_SIZE, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < CHUNK_SIZE
-        k_values = tl.load(
-            k_ptr + (key_start + offs_n[:, None]) * stride_k_t + kv_head * stride_k_h + offs_d[None, :] * stride_k_d,
-            mask=mask_n[:, None] & mask_d[None, :],
-            other=0.0,
-        )
+        if USE_TME_K:
+            if BLOCK_N == 64 and HEAD_DIM == BLOCK_D and CHUNK_SIZE % BLOCK_N == 0:
+                # The rank-2 TME tile is consumed directly by QK SQMMA.
+                k_values = k_ptr.load([key_start + n_start, kv_head * HEAD_DIM])
+            else:
+                k_values = tl.reshape(k_ptr.load([key_start + n_start, kv_head, 0]), (BLOCK_N, BLOCK_D))
+                k_values = tl.where(mask_n[:, None] & mask_d[None, :], k_values, 0.0)
+        else:
+            k_values = tl.load(
+                k_ptr + (key_start + offs_n[:, None]) * stride_k_t + kv_head * stride_k_h + offs_d[None, :] * stride_k_d,
+                mask=mask_n[:, None] & mask_d[None, :],
+                other=0.0,
+            )
         scores = tl.dot(q, tl.trans(k_values), out_dtype=tl.float32) * scale_log2
         valid = mask_m[:, None] & mask_n[None, :]
         scores = tl.where(valid, scores, -float("inf"))
@@ -716,11 +697,20 @@ def _routed_gqa_attn_fwd_kernel(
         probabilities = tl.where(valid, probabilities, 0.0)
         row_sum = row_sum * alpha + tl.sum(probabilities, axis=1)
         acc *= alpha[:, None]
-        v_values = tl.load(
-            v_ptr + (key_start + offs_n[:, None]) * stride_v_t + kv_head * stride_v_h + offs_d[None, :] * stride_v_d,
-            mask=mask_n[:, None] & mask_d[None, :],
-            other=0.0,
-        )
+        if USE_TME_V:
+            if BLOCK_N == 64 and HEAD_DIM == BLOCK_D and CHUNK_SIZE % BLOCK_N == 0:
+                # Full historical tiles need no tail mask; rank-2 TME loads
+                # directly into the SQMMA B shared operand on MP31.
+                v_values = v_ptr.load([key_start + n_start, kv_head * HEAD_DIM])
+            else:
+                v_values = tl.reshape(v_ptr.load([key_start + n_start, kv_head, 0]), (BLOCK_N, BLOCK_D))
+                v_values = tl.where(mask_n[:, None] & mask_d[None, :], v_values, 0.0)
+        else:
+            v_values = tl.load(
+                v_ptr + (key_start + offs_n[:, None]) * stride_v_t + kv_head * stride_v_h + offs_d[None, :] * stride_v_d,
+                mask=mask_n[:, None] & mask_d[None, :],
+                other=0.0,
+            )
         acc += tl.dot(probabilities.to(v_values.dtype), v_values, out_dtype=tl.float32)
         row_max = new_max
 
@@ -736,6 +726,52 @@ def _routed_gqa_attn_fwd_kernel(
         )
     lse = (row_max + libdevice.log2(row_sum)) / _LOG2E
     tl.store(lse_ptr + route_positions, lse, mask=mask_m)
+
+
+@lru_cache(maxsize=16)
+def _musa_tme_capable(device_index: int) -> bool:
+    try:
+        props = torch.musa.get_device_properties(device_index)
+        return props.major * 10 + props.minor >= 31
+    except (AttributeError, RuntimeError, ValueError):
+        return False
+
+
+def _use_musa_tme(device: torch.device) -> bool:
+    if device.type != "musa" or TensorDescriptor is None:
+        return False
+    device_index = device.index if device.index is not None else torch.musa.current_device()
+    return _musa_tme_capable(device_index)
+
+
+def _tme_layout_ok(tensor: torch.Tensor) -> bool:
+    element_size = tensor.element_size()
+    return (
+        tensor.is_contiguous()
+        and tensor.data_ptr() % 16 == 0
+        and all((stride * element_size) % 16 == 0 for stride in tensor.stride()[:-1])
+    )
+
+
+def _routed_launch_config(
+    head_dim: int,
+    device: torch.device,
+    total_tokens: int,
+    chunk_size: int,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[int, int, int, int, int]:
+    block_m, block_n, block_d, num_warps, num_stages = _attention_launch_config(head_dim, device)
+    # D64 benefits from the same direct rank-2 K/V operands at a 32x64 tile.
+    if (head_dim == 64 and total_tokens >= 2048 and _use_musa_tme(device)
+            and chunk_size % 64 == 0 and _tme_layout_ok(k) and _tme_layout_ok(v)):
+        return 32, 64, block_d, num_warps, num_stages
+    if head_dim == 128 and total_tokens >= 2048 and _use_musa_tme(device):
+        # Routing descriptors and attention must use the same query tile.
+        if chunk_size % 64 == 0 and _tme_layout_ok(k) and _tme_layout_ok(v):
+            return 32, 64, block_d, num_warps, num_stages
+        return 16, 64, block_d, num_warps, num_stages
+    return block_m, block_n, block_d, num_warps, num_stages
 
 
 def _routed_sparse_attention_triton(
@@ -754,13 +790,30 @@ def _routed_sparse_attention_triton(
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
     head_dim = q.shape[2]
-    block_m, block_n, block_d, num_warps, num_stages = _attention_launch_config(head_dim, q.device)
+    block_m, block_n, block_d, num_warps, num_stages = _routed_launch_config(
+        head_dim, q.device, q.shape[0], chunk_size, k, v
+    )
     route_out = torch.empty((query_indices.numel(), head_dim), device=q.device, dtype=q.dtype)
     route_lse = torch.empty((query_indices.numel(),), device=q.device, dtype=torch.float32)
+    # Descriptor setup is measurable on short calls; strided K/V retains the pointer path.
+    use_tme = q.shape[0] >= 2048 and _use_musa_tme(q.device) and _tme_layout_ok(k) and _tme_layout_ok(v)
+    # MP31 D128 16x64: measured faster with pointer-loaded K and TME-loaded V.
+    # Keep the original K TME path for other tiles (notably D256).
+    use_tme_k = use_tme and not (head_dim == 128 and block_m == 16 and block_n == 64)
+    if use_tme_k and block_n == 64 and head_dim in (64, 128) and chunk_size % block_n == 0:
+        # A contiguous zero-copy view selects the KV head by column offset.
+        k_arg = TensorDescriptor.from_tensor(k.view(k.shape[0], -1), [block_n, block_d])
+    else:
+        k_arg = TensorDescriptor.from_tensor(k, [block_n, 1, block_d]) if use_tme_k else k
+    if use_tme and block_n == 64 and head_dim in (64, 128) and chunk_size % block_n == 0:
+        # Zero-copy flattening keeps the per-head V tile contiguous.
+        v_arg = TensorDescriptor.from_tensor(v.view(v.shape[0], -1), [block_n, block_d])
+    else:
+        v_arg = TensorDescriptor.from_tensor(v, [block_n, 1, block_d]) if use_tme else v
     _routed_gqa_attn_fwd_kernel[(descriptor_experts.numel(),)](
         q,
-        k,
-        v,
+        k_arg,
+        v_arg,
         query_indices,
         expert_offsets,
         descriptor_experts,
@@ -788,6 +841,8 @@ def _routed_sparse_attention_triton(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_D=block_d,
+        USE_TME_K=use_tme_k,
+        USE_TME_V=use_tme,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -812,7 +867,7 @@ def _prune_merge_configs(configs, named_args, **kwargs):
         triton.Config({"BLOCK_D": 128}, num_warps=2),
         triton.Config({"BLOCK_D": 128}, num_warps=4),
     ],
-    key=["head_dim", "TOPK", "ROW_BUCKET", "GPU_ARCH"],
+    key=["head_dim", "TOPK", "ROW_BUCKET"],
     prune_configs_by={"early_config_prune": _prune_merge_configs},
 )
 @triton.jit
@@ -840,7 +895,6 @@ def _fused_merge_softmax_kernel(
     stride_final_lse_token,
     num_heads: tl.constexpr,
     ROW_BUCKET: tl.constexpr,
-    GPU_ARCH: tl.constexpr,
     BLOCK_D: tl.constexpr,
     TOPK: tl.constexpr,
     NUM_ROUTES: tl.constexpr,
@@ -940,8 +994,6 @@ def _fused_merge_softmax_triton(
 
     block_topk = triton.next_power_of_2(topk)
 
-    major, minor = _sm_capability(self_out.device)
-    gpu_arch = major * 10 + minor
     row_bucket = triton.next_power_of_2(num_rows)
 
     grid = (num_rows,)
@@ -972,5 +1024,4 @@ def _fused_merge_softmax_triton(
         TOPK=block_topk,
         NUM_ROUTES=topk,
         ROW_BUCKET=row_bucket,
-        GPU_ARCH=gpu_arch,
     )
