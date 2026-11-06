@@ -20,11 +20,10 @@ import pytest
 import torch
 
 from flag_attn.testing import backend as test_backend
-from flag_attn import InfLLMV2Config, infllmv2_attention
+from flag_attn import InfLLMV2Config, infllmv2_attention, vendor_name
 from flag_attn.infllmv2 import forward as forward_impl
 from flag_attn.infllmv2.forward import (
     _sparse_attention_forward,
-    compressed_lengths,
     compress_k,
     pool_scores,
     select_blocks,
@@ -40,6 +39,12 @@ from flag_attn.infllmv2.reference import (
     sparse_attention_ref,
     stage1_ref,
 )
+
+
+
+if vendor_name == "metax":
+    from flag_attn.runtime.backend._metax.infllmv2.attention import _sparse_attention_forward
+    from flag_attn.runtime.backend._metax.infllmv2.selection import select_blocks, stage1
 
 
 HAS_GPU = (test_backend.supports_operator("infllmv2_attention") or test_backend.supports_operator("infllmv2_decode")) and importlib.util.find_spec("triton") is not None
