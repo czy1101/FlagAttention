@@ -19,6 +19,11 @@ from __future__ import annotations
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "parallel_wall_attn": (".FLA.wall_attn.parallel", "parallel_wall_attn"),
+    "parallel_wall_attn_decode": (".FLA.wall_attn.decode", "parallel_wall_attn_decode"),
+    "wall_attn_build_kv_cache": (".FLA.wall_attn.decode", "build_wall_kv_cache"),
+    "wall_attn_get_last_route": (".FLA.wall_attn.parallel", "get_last_route"),
+    "wall_attn_select_route": (".FLA.wall_attn.parallel", "select_route"),
     "SPARSE_BLOCK_SIZE": (".msa.index_topk", "SPARSE_BLOCK_SIZE"),
     "chunk_gdn2": (".FLA.gdn2", "chunk_gdn2"),
     "chunk_gla": (".FLA.gla", "chunk_gla"),
