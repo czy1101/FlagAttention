@@ -33,6 +33,8 @@ error = _Error()
 
 
 _OPERATOR_EXPORTS = {
+    "infllmv2_attention": (".infllmv2.operator", "infllmv2_attention"),
+    "infllmv2_decode": (".infllmv2.operator", "infllmv2_decode"),
     "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),
     "sage_attention_forward": (".sage_attention.attn_qk_int8_per_block", "forward"),
     "SPARSE_BLOCK_SIZE": (".msa.index_topk", "SPARSE_BLOCK_SIZE"),
