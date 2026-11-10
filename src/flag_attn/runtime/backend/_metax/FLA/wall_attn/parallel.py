@@ -36,15 +36,6 @@ from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.index import prepare_chunk_indices
 
 
-@lru_cache(maxsize=None)
-def has_large_shared_memory(device_index: int) -> bool:
-    """Use the input device's shared-memory limit when selecting tile sizes."""
-    from triton.runtime import driver
-
-    properties = driver.active.utils.get_device_properties(device_index)
-    return properties["max_shared_mem"] >= 166_000
-
-
 @triton.jit
 def _copy_scale(
     x,
@@ -1027,15 +1018,12 @@ def parallel_wall_attn_bwd_kernel_dkv(
         tl.store(p_dc, b_dc.to(p_dc.dtype.element_ty), boundary_check=(0,))
 
 
-def _wall_varlen_config(T, K, V, device_index):
+def _wall_varlen_config(T, K, V):
     """Use the same chunk size in forward, backward and the packed chunk map."""
-    large_shared_memory = has_large_shared_memory(device_index)
     head_dim = max(triton.next_power_of_2(K), triton.next_power_of_2(V))
-    if not large_shared_memory and head_dim in (64, 128):
+    if head_dim in (64, 128):
         # Bound the query-channel tile to 4096 elements on C550.
         return 4096 // head_dim, 16, 4, 1
-    if large_shared_memory:
-        return 128, min(64, max(16, triton.next_power_of_2(T))), 8, 2
     return 128, min(32, max(16, triton.next_power_of_2(T))), 2, 2
 
 
@@ -1063,16 +1051,16 @@ def parallel_wall_attn_fwd(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
     G = HQ // H
-    large_shared_memory = has_large_shared_memory(q.device.index)
     BK = min(256, max(16, triton.next_power_of_2(K)))
-    BV = min(256 if large_shared_memory else 64, max(16, triton.next_power_of_2(V)))
+    # Keep the C550 value-channel tile at most 64 wide.
+    BV = min(64, max(16, triton.next_power_of_2(V)))
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
     assert NK == 1, "The key dimension can not be larger than 256"
 
     if cu_seqlens is not None:
         # Keep the chunk map tied to the deterministic resource-safe schedule.
-        BT, BS, num_warps, num_stages = _wall_varlen_config(T, K, V, q.device.index)
+        BT, BS, num_warps, num_stages = _wall_varlen_config(T, K, V)
         if chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
         NT = len(chunk_indices)
@@ -1191,7 +1179,7 @@ def parallel_wall_attn_bwd(
     is_varlen = cu_seqlens is not None
     extra = {}
     if is_varlen:
-        BT, BS, num_warps, num_stages = _wall_varlen_config(T, K, V, q.device.index)
+        BT, BS, num_warps, num_stages = _wall_varlen_config(T, K, V)
         if chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
         NT = len(chunk_indices)
@@ -1329,7 +1317,7 @@ class WallParallelAttentionFunction(torch.autograd.Function):
             assert torch.isfinite(v).all(), f"[wall-attn fwd] NaN/Inf in v: {v.abs().max()}"
 
         if cu_seqlens is not None and chunk_indices is None:
-            BT, _, _, _ = _wall_varlen_config(q.shape[1], q.shape[-1], v.shape[-1], q.device.index)
+            BT, _, _, _ = _wall_varlen_config(q.shape[1], q.shape[-1], v.shape[-1])
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
         P = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, scale=RCP_LN2)
         if _DEBUG_ASSERTS:

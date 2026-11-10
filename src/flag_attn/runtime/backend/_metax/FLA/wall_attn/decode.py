@@ -22,8 +22,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from functools import lru_cache
-
 import torch
 import triton
 import triton.language as tl
@@ -31,15 +29,6 @@ import triton.language as tl
 from flag_attn import runtime
 
 from .parallel import exp2, log2
-
-
-@lru_cache(maxsize=None)
-def has_large_shared_memory(device_index: int) -> bool:
-    """Use the input device's shared-memory limit when selecting tile sizes."""
-    from triton.runtime import driver
-
-    properties = driver.active.utils.get_device_properties(device_index)
-    return properties["max_shared_mem"] >= 166_000
 
 
 @triton.jit
@@ -359,9 +348,9 @@ def parallel_wall_attn_decode(
     if sink_bias is not None:
         sink_bias = copy_tensor(sink_bias)
 
-    large_shared_memory = has_large_shared_memory(q.device.index)
     BK = min(256, max(16, triton.next_power_of_2(K)))
-    BV = min(256 if large_shared_memory else 64, max(16, triton.next_power_of_2(V)))
+    # Keep the C550 value-channel tile at most 64 wide.
+    BV = min(64, max(16, triton.next_power_of_2(V)))
     NV = triton.cdiv(V, BV)
     assert triton.cdiv(K, BK) == 1, "decode kernel requires K <= 256"
 
