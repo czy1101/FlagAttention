@@ -21,10 +21,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-#
-# Upstream: https://github.com/fla-org/flash-linear-attention/tree/main/fla/ops/wall_attn
-# Wall attention was contributed upstream by Tilde Research (Timor Averbuch, Dhruv Pai).
-"""Wall-Attention prefill, backward, and MetaX route selection."""
 
 import os
 from contextvars import ContextVar
