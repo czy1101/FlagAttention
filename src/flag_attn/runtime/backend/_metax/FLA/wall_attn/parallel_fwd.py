@@ -517,6 +517,3 @@ def prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe):
         _build_qk_cache(q, k, g, prefix, q_cache, k_cache, anchor, unsafe)
         return prefix
     return None
-
-
-__all__ = ["parallel_wall_attn_fwd", "prepare_qk_cache"]
