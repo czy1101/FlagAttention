@@ -1,7 +1,12 @@
 """Public Forgetting Attention exports."""
 import importlib
 
-from .parallel import forgetting_attention, parallel_forgetting_attn
+from flag_attn.runtime.backend import resolve_operator
+
+parallel_forgetting_attn = resolve_operator(
+    "parallel_forgetting_attn", "flag_attn.forgetting_attention.parallel"
+)
+forgetting_attention = parallel_forgetting_attn
 
 
 def __getattr__(name):
