@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MetaX cached-operand Wall-Attention forward kernels.
-
-BF16 inputs use BF16 QK/PV operands. FP16 inputs use BF16 QK and FP16 PV
-operands. Both paths use FP32 softmax and accumulation, BM=BN=64, and a
-tiled K/V traversal. The host API validates cached operands before launching
-attention; end-to-end timing includes this synchronization.
-"""
+"""MetaX Wall-Attention forward kernels with cached Q/K operands."""
 
 from __future__ import annotations
 

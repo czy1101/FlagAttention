@@ -2,7 +2,7 @@
 # Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright 2026 FlagOS Contributors
 #
-# Upstream kernels: MIT (below). Adapted FlagAttention helpers: Apache-2.0 (see LICENSE).
+# Adapted helpers: Apache-2.0; see repository LICENSE.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 #
 # Upstream: https://github.com/fla-org/flash-linear-attention/tree/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/wall_attn
 # Wall attention was contributed upstream by Tilde Research (Timor Averbuch, Dhruv Pai).
-"""Wall single-step decode kernel and pre-rescaled KV-cache builder."""
+"""Wall-Attention decode and KV-cache construction."""
 
 from functools import lru_cache
 
