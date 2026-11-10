@@ -21,10 +21,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-#
-# Upstream: https://github.com/fla-org/flash-linear-attention/tree/3e61322b615df248e7579222d1a68260560f7c24/fla/ops/wall_attn
-# Wall attention was contributed upstream by Tilde Research (Timor Averbuch, Dhruv Pai).
-"""Wall-Attention decode and KV-cache construction."""
 
 from functools import lru_cache
 
