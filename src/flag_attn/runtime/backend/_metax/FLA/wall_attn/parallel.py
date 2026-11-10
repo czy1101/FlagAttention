@@ -1687,6 +1687,3 @@ def parallel_wall_attn(
     )
     _LAST_ROUTE.set("official_fallback")
     return output
-
-
-__all__ = ["parallel_wall_attn", "select_route", "get_last_route"]
