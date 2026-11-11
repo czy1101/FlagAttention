@@ -2259,13 +2259,13 @@ def parallel_parallax_bwd(
     BK = triton.next_power_of_2(K)
     BT = _BLOCK_T
     NQ = triton.cdiv(T, BT)
+    # D=64, T=256, G=4 uses the fixed dense kernels to avoid DQR autotune compile.
     use_dense_aligned = (
         q.device.type == "gcu"
         and q.dtype in (torch.bfloat16, torch.float16)
         and cu_seqlens is None
-        and K == 128
+        and ((K == 128 and NQ > 16) or (q.dtype == torch.bfloat16 and K == 64 and T == 256 and G == 4))
         and T % BT == 0
-        and NQ > 16
         and T <= _DENSE_ALIGNED_MAX_T
         and window_size_left < 0
     )

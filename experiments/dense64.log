@@ -1,0 +1,23 @@
+[W1111 09:52:22.001402557 gcu_caching_allocator.cpp:2944] Warning: [GCU Allocator] Static initialization: PYTORCH_GCU_ALLOC_CONF="(not set, using default)", selected_backend=native (function BackendStaticInitializer)
+/flagos/lib/python3.12/site-packages/torch_gcu/transfer_to_gcu.py:389: ImportWarning:
+    *************************************************************************************************************
+    The torch.Tensor.cuda and torch.nn.Module.cuda are replaced with torch.Tensor.gcu and torch.nn.Module.gcu now..
+    The backend in torch.distributed.init_process_group set to eccl now..
+    The torch.cuda.* and torch.cuda.amp.* are replaced with torch.gcu.* and torch.gcu.amp.* now..
+    The device parameters have been replaced with gcu in the function below:
+    torch.logspace, torch.randint, torch.hann_window, torch.rand, torch.full_like, torch.ones_like, torch.rand_like, torch.randperm, torch.arange, torch.frombuffer, torch.normal, torch._empty_per_channel_affine_quantized, torch.empty_strided, torch.empty_like, torch.scalar_tensor, torch.tril_indices, torch.bartlett_window, torch.ones, torch.sparse_coo_tensor, torch.randn, torch.kaiser_window, torch.tensor, torch.triu_indices, torch.as_tensor, torch.zeros, torch.randint_like, torch.full, torch.eye, torch._sparse_csr_tensor_unsafe, torch.empty, torch._sparse_coo_tensor_unsafe, torch.blackman_window, torch.zeros_like, torch.range, torch.sparse_csr_tensor, torch.randn_like, torch.from_file, torch._cudnn_init_dropout_state, torch._empty_affine_quantized, torch.linspace, torch.hamming_window, torch.empty_quantized, torch._pin_memory, torch.autocast, torch.load, torch.Tensor.new_empty, torch.Tensor.new_empty_strided, torch.Tensor.new_full, torch.Tensor.new_ones, torch.Tensor.new_tensor, torch.Tensor.new_zeros, torch.Tensor.to, torch.nn.Module.to, torch.nn.Module.to_empty
+    *************************************************************************************************************
+
+  warnings.warn(msg, ImportWarning)
+{"stage": "forward_start", "dtype": "bf16"}
+{"stage": "backward_start", "forward_cold_s": 3.728084093891084}
+
+
+
+
+
+
+{"stage": "reference_start", "backward_cold_s": 73.75334234395996}
+/flagos/lib/python3.12/site-packages/torch_gcu/transfer_to_gcu.py:149: UserWarning: GCU not support Long use Int replace, maybe lead to unexpected overflow issues. (Triggered internally at /builds/workspace/torch_gcu/torch_gcu/csrc/gcu/gcu_utils.h:28.)
+  return fn(*args, **kwargs)
+{"dtype": "bf16", "shape": [2, 256, 2, 8, 64], "forward_cold_s": 3.728084093891084, "backward_cold_s": 73.75334234395996, "output": {"relative_rms": 0.0029990889597684145, "max_abs": 0.125, "finite": true}, "grads": {"q": {"relative_rms": 0.0032238916028290987, "max_abs": 0.1435546875, "finite": true}, "r": {"relative_rms": 0.0027760851662606, "max_abs": 0.0625, "finite": true}, "k": {"relative_rms": 0.002890404313802719, "max_abs": 0.25, "finite": true}, "v": {"relative_rms": 0.002614435274153948, "max_abs": 0.125, "finite": true}}}
