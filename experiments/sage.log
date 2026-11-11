@@ -1,0 +1,40 @@
+[W1111 09:42:45.052310113 gcu_caching_allocator.cpp:2944] Warning: [GCU Allocator] Static initialization: PYTORCH_GCU_ALLOC_CONF="(not set, using default)", selected_backend=native (function BackendStaticInitializer)
+/flagos/lib/python3.12/site-packages/torch_gcu/transfer_to_gcu.py:389: ImportWarning:
+    *************************************************************************************************************
+    The torch.Tensor.cuda and torch.nn.Module.cuda are replaced with torch.Tensor.gcu and torch.nn.Module.gcu now..
+    The backend in torch.distributed.init_process_group set to eccl now..
+    The torch.cuda.* and torch.cuda.amp.* are replaced with torch.gcu.* and torch.gcu.amp.* now..
+    The device parameters have been replaced with gcu in the function below:
+    torch.logspace, torch.randint, torch.hann_window, torch.rand, torch.full_like, torch.ones_like, torch.rand_like, torch.randperm, torch.arange, torch.frombuffer, torch.normal, torch._empty_per_channel_affine_quantized, torch.empty_strided, torch.empty_like, torch.scalar_tensor, torch.tril_indices, torch.bartlett_window, torch.ones, torch.sparse_coo_tensor, torch.randn, torch.kaiser_window, torch.tensor, torch.triu_indices, torch.as_tensor, torch.zeros, torch.randint_like, torch.full, torch.eye, torch._sparse_csr_tensor_unsafe, torch.empty, torch._sparse_coo_tensor_unsafe, torch.blackman_window, torch.zeros_like, torch.range, torch.sparse_csr_tensor, torch.randn_like, torch.from_file, torch._cudnn_init_dropout_state, torch._empty_affine_quantized, torch.linspace, torch.hamming_window, torch.empty_quantized, torch._pin_memory, torch.autocast, torch.load, torch.Tensor.new_empty, torch.Tensor.new_empty_strided, torch.Tensor.new_full, torch.Tensor.new_ones, torch.Tensor.new_tensor, torch.Tensor.new_zeros, torch.Tensor.to, torch.nn.Module.to, torch.nn.Module.to_empty
+    *************************************************************************************************************
+
+  warnings.warn(msg, ImportWarning)
+/workspace/codex-workspaces/sage-eval/benchmark/test_sage_attention_benchmark.py:105: UserWarning: GCU not support UInt64 use UInt32 replace, maybe lead to unexpected overflow issues. (Triggered internally at /builds/workspace/torch_gcu/torch_gcu/csrc/gcu/gcu_utils.h:32.)
+  return F.scaled_dot_product_attention(
+{"shape": [1, 2, 128, 64], "repeat": 0, "cosine": 0.9999159574508667, "relative_l2": 0.012981656938791275, "sdpa_ms": 0.04033450037240982, "sage_pure_ms": 0.09100499749183655, "sage_total_ms": 0.16017000377178192}
+{"shape": [1, 2, 128, 64], "repeat": 1, "cosine": 0.9999159574508667, "relative_l2": 0.012981656938791275, "sdpa_ms": 0.040063999593257904, "sage_pure_ms": 0.0906900018453598, "sage_total_ms": 0.15929950028657913}
+{"shape": [1, 2, 128, 64], "repeat": 2, "cosine": 0.9999159574508667, "relative_l2": 0.012981656938791275, "sdpa_ms": 0.04012500122189522, "sage_pure_ms": 0.09075000137090683, "sage_total_ms": 0.16116000711917877}
+{"shape": [1, 2, 512, 64], "repeat": 0, "cosine": 0.9999210834503174, "relative_l2": 0.012576598674058914, "sdpa_ms": 0.04781250096857548, "sage_pure_ms": 0.13336500525474548, "sage_total_ms": 0.2108840048313141}
+{"shape": [1, 2, 512, 64], "repeat": 1, "cosine": 0.9999210834503174, "relative_l2": 0.012576598674058914, "sdpa_ms": 0.047850001603364944, "sage_pure_ms": 0.13299749791622162, "sage_total_ms": 0.2100439965724945}
+{"shape": [1, 2, 512, 64], "repeat": 2, "cosine": 0.9999210834503174, "relative_l2": 0.012576598674058914, "sdpa_ms": 0.047872500494122505, "sage_pure_ms": 0.13292250037193298, "sage_total_ms": 0.21089999377727509}
+
+
+
+
+
+
+{"shape": [1, 2, 1024, 64], "repeat": 0, "cosine": 0.9999233484268188, "relative_l2": 0.012388535775244236, "sdpa_ms": 0.06169399991631508, "sage_pure_ms": 0.19546499848365784, "sage_total_ms": 0.3401859998703003}
+{"shape": [1, 2, 1024, 64], "repeat": 1, "cosine": 0.9999233484268188, "relative_l2": 0.012388535775244236, "sdpa_ms": 0.05370049923658371, "sage_pure_ms": 0.1945360004901886, "sage_total_ms": 0.3392840027809143}
+{"shape": [1, 2, 1024, 64], "repeat": 2, "cosine": 0.9999233484268188, "relative_l2": 0.012388535775244236, "sdpa_ms": 0.0536389984190464, "sage_pure_ms": 0.19419749826192856, "sage_total_ms": 0.3392775058746338}
+
+
+
+
+{"shape": [1, 2, 2048, 64], "repeat": 0, "cosine": 0.9999202489852905, "relative_l2": 0.01263102050870657, "sdpa_ms": 0.11087249964475632, "sage_pure_ms": 0.3197540044784546, "sage_total_ms": 0.5961599946022034}
+{"shape": [1, 2, 2048, 64], "repeat": 1, "cosine": 0.9999202489852905, "relative_l2": 0.01263102050870657, "sdpa_ms": 0.11080499738454819, "sage_pure_ms": 0.3171299993991852, "sage_total_ms": 0.597029983997345}
+{"shape": [1, 2, 2048, 64], "repeat": 2, "cosine": 0.9999202489852905, "relative_l2": 0.01263102050870657, "sdpa_ms": 0.11119499802589417, "sage_pure_ms": 0.31970998644828796, "sage_total_ms": 0.5973004996776581}
+
+
+{"shape": [1, 2, 4096, 64], "repeat": 0, "cosine": 0.999914288520813, "relative_l2": 0.013105363585054874, "sdpa_ms": 0.26253049075603485, "sage_pure_ms": 1.0258350372314453, "sage_total_ms": 1.6013475060462952}
+{"shape": [1, 2, 4096, 64], "repeat": 1, "cosine": 0.999914288520813, "relative_l2": 0.013105363585054874, "sdpa_ms": 0.2626200020313263, "sage_pure_ms": 1.020704984664917, "sage_total_ms": 1.607956051826477}
+{"shape": [1, 2, 4096, 64], "repeat": 2, "cosine": 0.999914288520813, "relative_l2": 0.013105363585054874, "sdpa_ms": 0.2626730054616928, "sage_pure_ms": 1.0214250087738037, "sage_total_ms": 1.6004849672317505}
