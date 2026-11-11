@@ -672,6 +672,49 @@ def _build_dense_chunk_metadata_triton(
     )
 
 
+def _chunk_means_gather_torch(
+    k: torch.Tensor,
+    starts: torch.Tensor,
+    chunk_size: int,
+    valid_historical: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Chunk means via one contiguous gather + CANN mean reduction.
+
+    The Triton variant is limited by the strided per-(chunk, head) reads on this
+    backend (hundreds of ms at S=4096).  A chunk is a contiguous run of
+    ``chunk_size`` token rows, so a single ``index_select`` of the chunk starts
+    (built on device, no host sync) yields a contiguous ``[num, C, H, D]``
+    tensor whose ``mean(dim=1)`` is a bandwidth-bound CANN kernel.  Extraction
+    of the ``[num, C]`` token index is the only extra traffic.
+
+    Returns ``None`` when the fast path does not apply (caller falls back to the
+    Triton kernel).
+    """
+    if chunk_size is None or chunk_size <= 0:
+        return None
+    num_chunks = starts.numel()
+    if num_chunks == 0:
+        return None
+    total_tokens = k.shape[0]
+    if total_tokens < chunk_size:
+        return None
+    if not k.is_contiguous():
+        return None
+    if k.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return None
+    clamp_max = total_tokens - chunk_size
+    safe_starts = starts.to(torch.int64).clamp_(0, clamp_max)
+    offs = torch.arange(chunk_size, device=k.device, dtype=torch.int64)
+    index = (safe_starts[:, None] + offs[None, :]).reshape(-1)
+    gathered = torch.index_select(k, 0, index).view(
+        num_chunks, chunk_size, k.shape[1], k.shape[2]
+    )
+    means = gathered.mean(dim=1, dtype=torch.float32).to(k.dtype)
+    if valid_historical is not None:
+        means = means * valid_historical.to(k.dtype)[:, None, None]
+    return means
+
+
 @triton.jit
 def _chunk_mean_kernel(
     k_ptr,
@@ -689,42 +732,74 @@ def _chunk_mean_kernel(
     CHUNK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_TOK: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    EXACT_HD: tl.constexpr,
+    EXACT_T: tl.constexpr,
 ):
+    """Chunk means with coalesced token-row reads (one program per chunk).
+
+    A chunk is a contiguous run of ``CHUNK_SIZE`` tokens, so a tile of
+    ``[BLOCK_TOK, num_heads * HEAD_DIM]`` covers whole token rows (4 KB per row
+    for H=16/D=128) and the load is contiguous, unlike the old ``(chunk, head)``
+    programs that walked tokens with a ``num_heads*HEAD_DIM`` stride and fetched
+    only 256 B per row.  The token reduction runs on ``axis=0`` of the wide
+    tile, which is the fast reduction direction on this backend.
     """
-    Kernel to compute the mean of Key vectors within each chunk.
-    Replacing: filtered_kv.view(...).mean(dim=1)
-    """
-    chunk_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-    if chunk_id >= num_chunks or head_id >= num_heads:
-        return
-    source_chunk = tl.load(filtered_chunk_indices_ptr + chunk_id)
-    source_start = tl.load(cu_chunk_ptr + source_chunk)
-
-    offs_d = tl.arange(0, BLOCK_D)
-
-    for d_start in range(0, HEAD_DIM, BLOCK_D):
-        mask_d = (d_start + offs_d) < HEAD_DIM
-        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-
-        for t_start in range(0, CHUNK_SIZE, BLOCK_TOK):
-            offs_t = tl.arange(0, BLOCK_TOK)
-            mask_t = (t_start + offs_t) < CHUNK_SIZE
-
-            ptrs = (
-                k_ptr
-                + (source_start + t_start + offs_t)[:, None] * stride_token
-                + head_id * stride_head
-                + (d_start + offs_d)[None, :] * stride_d
+    pid = tl.program_id(0)
+    stride = tl.num_programs(0)
+    iters = (num_chunks - pid + stride - 1) // stride
+    hd_total = num_heads * HEAD_DIM
+    hd_index = tl.arange(0, BLOCK_HD)
+    toks_index = tl.arange(0, BLOCK_TOK)
+    for i in range(0, iters):
+        chunk_id = pid + i * stride
+        source_chunk = tl.load(filtered_chunk_indices_ptr + chunk_id)
+        source_start = tl.load(cu_chunk_ptr + source_chunk)
+        for hd_start in range(0, hd_total, BLOCK_HD):
+            hd = hd_start + hd_index
+            if EXACT_HD:
+                mask_hd = hd_index >= 0
+            else:
+                mask_hd = hd < hd_total
+            head = hd // HEAD_DIM
+            d = hd - head * HEAD_DIM
+            in_off = head * stride_head + d * stride_d
+            acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
+            for t_start in range(0, CHUNK_SIZE, BLOCK_TOK):
+                toks = t_start + toks_index
+                ptrs = (
+                    k_ptr
+                    + (source_start + toks)[:, None] * stride_token
+                    + in_off[None, :]
+                )
+                if EXACT_HD and EXACT_T:
+                    values = tl.load(ptrs).to(tl.float32)
+                elif EXACT_HD:
+                    values = tl.load(
+                        ptrs, mask=(toks < CHUNK_SIZE)[:, None], other=0.0
+                    ).to(tl.float32)
+                elif EXACT_T:
+                    values = tl.load(
+                        ptrs, mask=mask_hd[None, :], other=0.0
+                    ).to(tl.float32)
+                else:
+                    values = tl.load(
+                        ptrs,
+                        mask=(toks < CHUNK_SIZE)[:, None] & mask_hd[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                acc += tl.sum(values, axis=0)
+            acc = acc / CHUNK_SIZE
+            out_ptrs = (
+                out_ptr
+                + chunk_id * out_stride_chunk
+                + head * out_stride_head
+                + d * out_stride_d
             )
-            vals = tl.load(ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0)
-            vals = vals.to(tl.float32)
-            acc += tl.sum(vals, axis=0)
-
-        acc = acc / CHUNK_SIZE
-        out_ptrs = out_ptr + chunk_id * out_stride_chunk + head_id * out_stride_head + (d_start + offs_d) * out_stride_d
-        tl.store(out_ptrs, acc, mask=mask_d)
+            if EXACT_HD:
+                tl.store(out_ptrs, acc)
+            else:
+                tl.store(out_ptrs, acc, mask=mask_hd)
 
 
 @triton.jit
@@ -744,37 +819,63 @@ def _dense_chunk_mean_kernel(
     CHUNK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_TOK: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    EXACT_HD: tl.constexpr,
+    EXACT_T: tl.constexpr,
 ):
-    slot = tl.program_id(0)
-    kv_head = tl.program_id(1)
-    if slot >= num_chunk_slots or kv_head >= num_kv_heads:
-        return
-    is_historical = tl.load(valid_historical_ptr + slot) != 0
-    source_start = tl.load(cu_chunk_ptr + slot)
-    offs_d = tl.arange(0, BLOCK_D)
+    """Dense-slot variant of ``_chunk_mean_kernel`` (one program per slot).
 
-    for d_start in range(0, HEAD_DIM, BLOCK_D):
-        mask_d = (d_start + offs_d) < HEAD_DIM
-        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-        for t_start in range(0, CHUNK_SIZE, BLOCK_TOK):
-            offs_t = t_start + tl.arange(0, BLOCK_TOK)
-            mask_t = is_historical & (offs_t < CHUNK_SIZE)
-            values = tl.load(
-                k_ptr
-                + (source_start + offs_t[:, None]) * stride_token
-                + kv_head * stride_head
-                + (d_start + offs_d)[None, :] * stride_d,
-                mask=mask_t[:, None] & mask_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            acc += tl.sum(values, axis=0)
-        acc /= CHUNK_SIZE
-        tl.store(
-            out_ptr + slot * out_stride_chunk + kv_head * out_stride_head + (d_start + offs_d) * out_stride_d,
-            acc,
-            mask=mask_d,
-        )
+    Non-historical slots keep the previous behaviour: their token mask is empty
+    so they are written as zeros.
+    """
+    pid = tl.program_id(0)
+    stride = tl.num_programs(0)
+    iters = (num_chunk_slots - pid + stride - 1) // stride
+    hd_total = num_kv_heads * HEAD_DIM
+    hd_index = tl.arange(0, BLOCK_HD)
+    toks_index = tl.arange(0, BLOCK_TOK)
+    for i in range(0, iters):
+        slot = pid + i * stride
+        is_historical = tl.load(valid_historical_ptr + slot) != 0
+        source_start = tl.load(cu_chunk_ptr + slot)
+        for hd_start in range(0, hd_total, BLOCK_HD):
+            hd = hd_start + hd_index
+            if EXACT_HD:
+                mask_hd = hd_index >= 0
+            else:
+                mask_hd = hd < hd_total
+            head = hd // HEAD_DIM
+            d = hd - head * HEAD_DIM
+            in_off = head * stride_head + d * stride_d
+            acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
+            for t_start in range(0, CHUNK_SIZE, BLOCK_TOK):
+                toks = t_start + toks_index
+                mask_t = is_historical & (toks < CHUNK_SIZE)
+                ptrs = (
+                    k_ptr
+                    + (source_start + toks)[:, None] * stride_token
+                    + in_off[None, :]
+                )
+                if EXACT_HD:
+                    values = tl.load(ptrs, mask=mask_t[:, None], other=0.0).to(tl.float32)
+                else:
+                    values = tl.load(
+                        ptrs,
+                        mask=mask_t[:, None] & mask_hd[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                acc += tl.sum(values, axis=0)
+            acc = acc / CHUNK_SIZE
+            out_ptrs = (
+                out_ptr
+                + slot * out_stride_chunk
+                + head * out_stride_head
+                + d * out_stride_d
+            )
+            if EXACT_HD:
+                tl.store(out_ptrs, acc)
+            else:
+                tl.store(out_ptrs, acc, mask=mask_hd)
 
 
 def _compute_dense_chunk_means_triton(
@@ -790,9 +891,16 @@ def _compute_dense_chunk_means_triton(
         device=k.device,
         dtype=k.dtype,
     )
-    block_tok = min(64, triton.next_power_of_2(chunk_size))
-    block_d = max(16, triton.next_power_of_2(head_dim))
-    _dense_chunk_mean_kernel[(num_chunk_slots, num_kv_heads)](
+    fast = _chunk_means_gather_torch(
+        k, cu_chunk[:num_chunk_slots], chunk_size, valid_historical
+    )
+    if fast is not None:
+        return fast
+
+    hd_total = num_kv_heads * head_dim
+    block_hd = min(2048, triton.next_power_of_2(hd_total))
+    block_tok = max(4, min(64, 8192 // block_hd))
+    _dense_chunk_mean_kernel[_capped_grid(num_chunk_slots)](
         k,
         cu_chunk,
         valid_historical,
@@ -808,8 +916,10 @@ def _compute_dense_chunk_means_triton(
         CHUNK_SIZE=chunk_size,
         HEAD_DIM=head_dim,
         BLOCK_TOK=block_tok,
-        BLOCK_D=block_d,
-        num_warps=4 if block_d >= 64 else 2,
+        BLOCK_HD=block_hd,
+        EXACT_HD=(hd_total % block_hd == 0),
+        EXACT_T=(chunk_size % block_tok == 0),
+        num_warps=8 if block_hd >= 1024 else 4,
         num_stages=2,
     )
     return chunk_means
@@ -989,12 +1099,18 @@ def _compute_chunk_means_triton(
         dtype=k.dtype,
     )
 
-    block_tok = min(64, triton.next_power_of_2(chunk_size))
-    block_d = max(16, triton.next_power_of_2(head_dim))
-    num_warps = 4 if block_d >= 64 else 2
-    num_stages = 4 if chunk_size >= 256 else 2
+    hd_total = num_heads * head_dim
+    block_hd = min(2048, triton.next_power_of_2(hd_total))
+    starts = torch.index_select(cu_chunk, 0, filtered_chunk_indices.to(torch.int64))
+    fast = _chunk_means_gather_torch(k, starts, chunk_size)
+    if fast is not None:
+        return fast
 
-    grid = (num_chunks, num_heads)
+    block_tok = max(4, min(64, 8192 // block_hd))
+    num_warps = 8 if block_hd >= 1024 else 4
+    num_stages = 2
+
+    grid = _capped_grid(num_chunks)
 
     _chunk_mean_kernel[grid](
         k,
@@ -1012,7 +1128,9 @@ def _compute_chunk_means_triton(
         CHUNK_SIZE=chunk_size,
         HEAD_DIM=head_dim,
         BLOCK_TOK=block_tok,
-        BLOCK_D=block_d,
+        BLOCK_HD=block_hd,
+        EXACT_HD=(hd_total % block_hd == 0),
+        EXACT_T=(chunk_size % block_tok == 0),
         num_warps=num_warps,
         num_stages=num_stages,
     )
