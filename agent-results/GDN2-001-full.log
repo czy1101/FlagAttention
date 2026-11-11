@@ -1,0 +1,64 @@
+[W1111 09:48:57.461147862 gcu_caching_allocator.cpp:2944] Warning: [GCU Allocator] Static initialization: PYTORCH_GCU_ALLOC_CONF="(not set, using default)", selected_backend=native (function BackendStaticInitializer)
+/flagos/lib/python3.12/site-packages/torch_gcu/transfer_to_gcu.py:389: ImportWarning:
+    *************************************************************************************************************
+    The torch.Tensor.cuda and torch.nn.Module.cuda are replaced with torch.Tensor.gcu and torch.nn.Module.gcu now..
+    The backend in torch.distributed.init_process_group set to eccl now..
+    The torch.cuda.* and torch.cuda.amp.* are replaced with torch.gcu.* and torch.gcu.amp.* now..
+    The device parameters have been replaced with gcu in the function below:
+    torch.logspace, torch.randint, torch.hann_window, torch.rand, torch.full_like, torch.ones_like, torch.rand_like, torch.randperm, torch.arange, torch.frombuffer, torch.normal, torch._empty_per_channel_affine_quantized, torch.empty_strided, torch.empty_like, torch.scalar_tensor, torch.tril_indices, torch.bartlett_window, torch.ones, torch.sparse_coo_tensor, torch.randn, torch.kaiser_window, torch.tensor, torch.triu_indices, torch.as_tensor, torch.zeros, torch.randint_like, torch.full, torch.eye, torch._sparse_csr_tensor_unsafe, torch.empty, torch._sparse_coo_tensor_unsafe, torch.blackman_window, torch.zeros_like, torch.range, torch.sparse_csr_tensor, torch.randn_like, torch.from_file, torch._cudnn_init_dropout_state, torch._empty_affine_quantized, torch.linspace, torch.hamming_window, torch.empty_quantized, torch._pin_memory, torch.autocast, torch.load, torch.Tensor.new_empty, torch.Tensor.new_empty_strided, torch.Tensor.new_full, torch.Tensor.new_ones, torch.Tensor.new_tensor, torch.Tensor.new_zeros, torch.Tensor.to, torch.nn.Module.to, torch.nn.Module.to_empty
+    *************************************************************************************************************
+
+  warnings.warn(msg, ImportWarning)
+T= 1 dtype=fp16 initial=True shape=B1,H1,K64,V64 seed=0
+  o : max_abs=1.124611e-05 rms_rel=2.749499e-04 ref_rms=9.416844e-03 act_rms=9.415753e-03
+  ht: max_abs=1.067713e-04 rms_rel=1.985634e-04 ref_rms=5.643899e-02 act_rms=5.643891e-02
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+
+
+T= 1 dtype=fp16 initial=False shape=B1,H1,K64,V64 seed=0
+  o : max_abs=1.323071e-05 rms_rel=3.476732e-04 ref_rms=9.640755e-03 act_rms=9.639819e-03
+  ht: max_abs=7.320894e-05 rms_rel=1.613986e-04 ref_rms=5.578189e-02 act_rms=5.578138e-02
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+T= 1 dtype=bf16 initial=True shape=B1,H1,K64,V64 seed=0
+  o : max_abs=1.206456e-04 rms_rel=2.609841e-03 ref_rms=9.414194e-03 act_rms=9.408742e-03
+  ht: max_abs=1.071712e-03 rms_rel=1.876349e-03 ref_rms=5.642671e-02 act_rms=5.644142e-02
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+
+
+T= 1 dtype=bf16 initial=False shape=B1,H1,K64,V64 seed=0
+  o : max_abs=7.310719e-05 rms_rel=2.135817e-03 ref_rms=9.638066e-03 act_rms=9.644795e-03
+  ht: max_abs=1.035213e-03 rms_rel=1.533590e-03 ref_rms=5.576889e-02 act_rms=5.574729e-02
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+T= 2 dtype=fp16 initial=True shape=B1,H1,K64,V64 seed=0
+  o : max_abs=5.059156e-05 rms_rel=6.454304e-04 ref_rms=1.124608e-02 act_rms=1.125122e-02
+  ht: max_abs=3.616836e-04 rms_rel=3.763079e-04 ref_rms=9.330275e-02 act_rms=9.329344e-02
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+T= 2 dtype=fp16 initial=False shape=B1,H1,K64,V64 seed=0
+  o : max_abs=3.086479e-05 rms_rel=4.180523e-04 ref_rms=1.101632e-02 act_rms=1.101930e-02
+  ht: max_abs=3.032087e-04 rms_rel=3.000544e-04 ref_rms=9.298820e-02 act_rms=9.297770e-02
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+T= 2 dtype=bf16 initial=True shape=B1,H1,K64,V64 seed=0
+  o : max_abs=2.149026e-04 rms_rel=3.376781e-03 ref_rms=1.123509e-02 act_rms=1.122294e-02
+  ht: max_abs=2.078237e-03 rms_rel=2.369357e-03 ref_rms=9.333595e-02 act_rms=9.330721e-02
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+T= 2 dtype=bf16 initial=False shape=B1,H1,K64,V64 seed=0
+  o : max_abs=1.766588e-04 rms_rel=2.829765e-03 ref_rms=1.100519e-02 act_rms=1.100807e-02
+  ht: max_abs=1.315091e-03 rms_rel=1.794372e-03 ref_rms=9.302171e-02 act_rms=9.298007e-02
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+T=65 dtype=fp16 initial=True shape=B1,H1,K64,V64 seed=0
+  o : max_abs=6.769602e-05 rms_rel=5.170724e-04 ref_rms=2.646418e-02 act_rms=2.646350e-02
+  ht: max_abs=5.108829e-04 rms_rel=4.057640e-04 ref_rms=2.366912e-01 act_rms=2.366865e-01
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+T=65 dtype=fp16 initial=False shape=B1,H1,K64,V64 seed=0
+  o : max_abs=7.461536e-05 rms_rel=5.077565e-04 ref_rms=2.644645e-02 act_rms=2.644551e-02
+  ht: max_abs=5.254407e-04 rms_rel=3.625093e-04 ref_rms=2.366914e-01 act_rms=2.366852e-01
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+T=65 dtype=bf16 initial=True shape=B1,H1,K64,V64 seed=0
+  o : max_abs=5.846069e-04 rms_rel=4.102549e-03 ref_rms=2.646255e-02 act_rms=2.646427e-02
+  ht: max_abs=4.944779e-03 rms_rel=3.023054e-03 ref_rms=2.367403e-01 act_rms=2.366526e-01
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+T=65 dtype=bf16 initial=False shape=B1,H1,K64,V64 seed=0
+  o : max_abs=6.787745e-04 rms_rel=4.221563e-03 ref_rms=2.644481e-02 act_rms=2.644909e-02
+  ht: max_abs=4.923781e-03 rms_rel=2.941315e-03 ref_rms=2.367405e-01 act_rms=2.366721e-01
+  gate atol=1.0e-03 rtol=2.0e-02 -> PASS
+SUMMARY: PASS [True, True, True, True, True, True, True, True, True, True, True, True]
