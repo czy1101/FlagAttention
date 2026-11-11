@@ -1001,6 +1001,68 @@ def test_chunk(B, T, H, D, dtype, gate_logit_normalizer):
 
 
 @pytest.mark.chunk_gla
+@pytest.mark.skipif(test_backend.device != "gcu", reason="requires the Enflame GLA gate scan")
+@pytest.mark.parametrize(
+    ("shape", "output_final_state"),
+    [
+        pytest.param((4, 2048, 16, 128), False, id="paired_heads"),
+        pytest.param((1, 95, 3, 128), True, id="odd_heads_tail"),
+    ],
+)
+def test_chunk_gla_bfloat16_gate_scan(shape, output_final_state, monkeypatch):
+    torch.manual_seed(42)
+    device = torch.device(test_backend.device)
+    B, T, H, D = shape
+    q = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    k = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    v = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    g = F.logsigmoid(torch.randn(shape, device=device, dtype=torch.bfloat16))
+    initial_state = (
+        torch.randn(B, H, D, D, device=device, dtype=torch.float32)
+        if output_final_state
+        else None
+    )
+    scale = D**-0.5
+
+    gla = inspect.getmodule(chunk_gla)
+    original_scan = gla.chunk_local_cumsum
+    scan_inputs = []
+
+    def record_scan(gates, chunk_size, **kwargs):
+        scan_inputs.append((tuple(gates.shape), chunk_size))
+        return original_scan(gates, chunk_size, **kwargs)
+
+    monkeypatch.setattr(gla, "chunk_local_cumsum", record_scan)
+    out, final_state = chunk_gla(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+    )
+    assert scan_inputs == [((B, T, 1, H * D), 64)]
+
+    ref_out, ref_state = fused_recurrent_gla(
+        q=q.float(),
+        k=k.float(),
+        v=v.float(),
+        gk=g.float(),
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+    )
+    assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out).all() and torch.isfinite(ref_out).all()
+    _assert_close("o", ref_out, out.float(), 0.004)
+    if output_final_state:
+        assert final_state.dtype == torch.float32
+        assert torch.isfinite(final_state).all() and torch.isfinite(ref_state).all()
+        _assert_close("ht", ref_state, final_state, 0.004)
+
+
+@pytest.mark.chunk_gla
 @pytest.mark.parametrize(
     ("B", "T", "H", "D", "dtype"),
     [

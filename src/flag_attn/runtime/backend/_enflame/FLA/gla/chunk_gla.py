@@ -2007,12 +2007,25 @@ def chunk_gla_fwd(
     chunk_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if g_cumsum is None:
+        scan_g = g
+        if (
+            cu_seqlens is None
+            and chunk_size == 64
+            and g.dtype == torch.bfloat16
+            and g.shape[-1] == 128
+            and g.shape[2] > 1
+            and g.is_contiguous()
+        ):
+            # A 256-feature scan tile can cover two adjacent 128-wide heads.
+            scan_g = g.flatten(2).unsqueeze(2)
         g_cumsum = chunk_local_cumsum(
-            g,
+            scan_g,
             chunk_size,
             scale=RCP_LN2,
             cu_seqlens=cu_seqlens,
         )
+        if scan_g is not g:
+            g_cumsum = g_cumsum.view_as(g)
 
     h, ht = chunk_fwd_h(
         k=k,
