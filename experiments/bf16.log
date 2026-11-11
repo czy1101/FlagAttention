@@ -1,0 +1,17 @@
+[W1111 09:07:10.879110785 gcu_caching_allocator.cpp:2944] Warning: [GCU Allocator] Static initialization: PYTORCH_GCU_ALLOC_CONF="(not set, using default)", selected_backend=native (function BackendStaticInitializer)
+/flagos/lib/python3.12/site-packages/torch_gcu/transfer_to_gcu.py:389: ImportWarning:
+    *************************************************************************************************************
+    The torch.Tensor.cuda and torch.nn.Module.cuda are replaced with torch.Tensor.gcu and torch.nn.Module.gcu now..
+    The backend in torch.distributed.init_process_group set to eccl now..
+    The torch.cuda.* and torch.cuda.amp.* are replaced with torch.gcu.* and torch.gcu.amp.* now..
+    The device parameters have been replaced with gcu in the function below:
+    torch.logspace, torch.randint, torch.hann_window, torch.rand, torch.full_like, torch.ones_like, torch.rand_like, torch.randperm, torch.arange, torch.frombuffer, torch.normal, torch._empty_per_channel_affine_quantized, torch.empty_strided, torch.empty_like, torch.scalar_tensor, torch.tril_indices, torch.bartlett_window, torch.ones, torch.sparse_coo_tensor, torch.randn, torch.kaiser_window, torch.tensor, torch.triu_indices, torch.as_tensor, torch.zeros, torch.randint_like, torch.full, torch.eye, torch._sparse_csr_tensor_unsafe, torch.empty, torch._sparse_coo_tensor_unsafe, torch.blackman_window, torch.zeros_like, torch.range, torch.sparse_csr_tensor, torch.randn_like, torch.from_file, torch._cudnn_init_dropout_state, torch._empty_affine_quantized, torch.linspace, torch.hamming_window, torch.empty_quantized, torch._pin_memory, torch.autocast, torch.load, torch.Tensor.new_empty, torch.Tensor.new_empty_strided, torch.Tensor.new_full, torch.Tensor.new_ones, torch.Tensor.new_tensor, torch.Tensor.new_zeros, torch.Tensor.to, torch.nn.Module.to, torch.nn.Module.to_empty
+    *************************************************************************************************************
+
+  warnings.warn(msg, ImportWarning)
+{"device": "gcu:1", "dtype": "bf16", "shape": [1, 512, 4, 64], "matrix_block": 64, "tle": true}
+{"stage": "cumsum", "first_call_s": 0.0003088638186454773, "samples_ms": [0.07650700211524963, 0.0757950022816658, 0.07605699822306633]}
+{"stage": "state", "first_call_s": 0.00031559402123093605, "samples_ms": [0.10259250178933144, 0.10253999754786491, 0.10243500024080276]}
+{"stage": "matrix", "first_call_s": 0.00022942619398236275, "samples_ms": [0.09512899816036224, 0.0948524996638298, 0.09449999779462814]}
+{"stage": "output", "first_call_s": 0.010581165086477995, "samples_ms": [0.08605600148439407, 0.08574000000953674, 0.08573249727487564]}
+{"stage": "full", "first_call_s": 0.0007424261420965195, "samples_ms": [0.2963925004005432, 0.2936849892139435, 0.2891240119934082]}
