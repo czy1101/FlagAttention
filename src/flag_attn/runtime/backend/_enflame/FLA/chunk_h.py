@@ -1390,9 +1390,15 @@ def chunk_bwd_dh(
         and BT == 64
         and HQ == H
         and not state_v_first
-        and q.dtype == torch.bfloat16
-        and k.dtype == torch.bfloat16
-        and do.dtype == torch.bfloat16
+        # BF16 keeps the original unrestricted parallel path.  FP16 is only
+        # enabled for the 64x64 GLA state, matching the forward gate that
+        # PR #42 already validates.
+        and (
+            k.dtype == torch.bfloat16
+            or (k.dtype == torch.float16 and K == 64 and V == 64)
+        )
+        and q.dtype == k.dtype
+        and do.dtype == k.dtype
         and g is None
         and g_gamma is None
         and gk is not None
