@@ -1,0 +1,3 @@
+[W1111 09:39:37.456335874 gcu_caching_allocator.cpp:2944] Warning: [GCU Allocator] Static initialization: PYTORCH_GCU_ALLOC_CONF="(not set, using default)", selected_backend=native (function BackendStaticInitializer)
+....                                                                     [100%]
+4 passed, 15 deselected, 2 warnings in 77.09s (0:01:17)

@@ -1,0 +1,72 @@
+[W1111 09:42:00.637786593 gcu_caching_allocator.cpp:2944] Warning: [GCU Allocator] Static initialization: PYTORCH_GCU_ALLOC_CONF="(not set, using default)", selected_backend=native (function BackendStaticInitializer)
+/flagos/lib/python3.12/site-packages/torch_gcu/transfer_to_gcu.py:389: ImportWarning:
+    *************************************************************************************************************
+    The torch.Tensor.cuda and torch.nn.Module.cuda are replaced with torch.Tensor.gcu and torch.nn.Module.gcu now..
+    The backend in torch.distributed.init_process_group set to eccl now..
+    The torch.cuda.* and torch.cuda.amp.* are replaced with torch.gcu.* and torch.gcu.amp.* now..
+    The device parameters have been replaced with gcu in the function below:
+    torch.logspace, torch.randint, torch.hann_window, torch.rand, torch.full_like, torch.ones_like, torch.rand_like, torch.randperm, torch.arange, torch.frombuffer, torch.normal, torch._empty_per_channel_affine_quantized, torch.empty_strided, torch.empty_like, torch.scalar_tensor, torch.tril_indices, torch.bartlett_window, torch.ones, torch.sparse_coo_tensor, torch.randn, torch.kaiser_window, torch.tensor, torch.triu_indices, torch.as_tensor, torch.zeros, torch.randint_like, torch.full, torch.eye, torch._sparse_csr_tensor_unsafe, torch.empty, torch._sparse_coo_tensor_unsafe, torch.blackman_window, torch.zeros_like, torch.range, torch.sparse_csr_tensor, torch.randn_like, torch.from_file, torch._cudnn_init_dropout_state, torch._empty_affine_quantized, torch.linspace, torch.hamming_window, torch.empty_quantized, torch._pin_memory, torch.autocast, torch.load, torch.Tensor.new_empty, torch.Tensor.new_empty_strided, torch.Tensor.new_full, torch.Tensor.new_ones, torch.Tensor.new_tensor, torch.Tensor.new_zeros, torch.Tensor.to, torch.nn.Module.to, torch.nn.Module.to_empty
+    *************************************************************************************************************
+
+  warnings.warn(msg, ImportWarning)
+INFO 11-11 09:42:01 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 11-11 09:42:01 [__init__.py:46] - fl -> vllm_fl:register
+INFO 11-11 09:42:01 [__init__.py:58] Loading plugin fl
+INFO 11-11 09:42:07 [__init__.py:237] Platform plugin fl is activated
+WARNING 11-11 09:42:08 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+/flagos/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+WARNING 11-11 09:42:09 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+[2026-11-11 09:42:09] [INFO] [vllm_fl.dispatch.backends.vendor.gcu.impl.chunk_delta_h] Patched chunk_gated_delta_rule_fwd_h for GCU (grid.x <= 65535, grid.y <= 255)
+[2026-11-11 09:42:09] [WARNING] [vllm_fl.dispatch.backends.vendor.gcu.impl.fused_recurrent_packed_decode] Failed to patch fused_recurrent_gated_delta_rule_packed_decode for GCU: No module named 'vllm.model_executor.layers.mamba.gdn_linear_attn'
+[2026-11-11 09:42:09] [INFO] [vllm_fl.dispatch.backends.vendor.gcu.impl.slot_mapping] Patched BlockTable.compute_slot_mapping for GCU (on-device int32; avoids int64 Triton kernel).
+[2026-11-11 09:42:09] [INFO] [vllm_fl.dispatch.backends.vendor.gcu.impl.flash_attn_backend] GCU: enabled native FLASH_ATTN backend (FA2; vendor flash_attn_varlen_func + flag_gems reshape_and_cache_flash)
+WARNING 11-11 09:42:09 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 11-11 09:42:09 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+[2026-11-11 09:42:09] [INFO] [vllm_fl.dispatch.backends.vendor.gcu.impl.bilinear_pos_embed] Patched Qwen3-VL bilinear pos embed for GCU (grid.x <= 65535)
+[2026-11-11 09:42:09] [WARNING] [vllm_fl.dispatch.backends.vendor.gcu.impl.fused_recurrent_packed_decode] Failed to patch fused_recurrent_gated_delta_rule_packed_decode for GCU: No module named 'vllm.model_executor.layers.mamba.gdn_linear_attn'
+REPEAT 0 STAGE decode
+/flagos/lib/python3.12/site-packages/torch_gcu/transfer_to_gcu.py:147: UserWarning: GCU not support Long use Int replace, maybe lead to unexpected overflow issues. (Triggered internally at /builds/workspace/torch_gcu/torch_gcu/csrc/gcu/gcu_utils.h:28.)
+  return fn(*args, **kwargs)
+[device] GCU capability=0.0
+[baseline] vLLM disabled (--no-vllm)
+
+MiniMax M3 paged sparse attention (decode qlen=1)
+dtype=bf16, topk=16, init/local=1/2, pages=random, seed=0, warmup=10ms, rep=50ms
+Timing: eager execution with backend device events
+vLLM baseline: unavailable; FlagAttn only
+---------------------------------------------------------------------
+         Shape [B,Q,S,KVH,H]   FlagAttn(ms)   IdxDec(ms)  AttnDec(ms)
+---------------------------------------------------------------------
+
+
+
+
+               1x1x16384x1x8         0.2018       0.1615       0.1161
+[INFO] {"level": "comprehensive", "op_name": "minimax_m3_sparse_attn_decode", "dtype": "torch.bfloat16", "mode": "kernel", "result": [{"case_id": null, "candidate_source": null, "legacy_shape": null, "shape_detail": [1, 1, 16384, 1, 8], "latency_base": null, "latency": 0.20183899998664856, "gbps_base": null, "gbps": null, "speedup": null, "accuracy": null, "tflops": null, "utilization": null, "compared_speedup": null, "error_msg": null, "steps": {"index_decode": 0.16150499880313873, "attention_decode": 0.1160850003361702}}], "baseline": null, "vllm_kv_layout": null, "phase": "decode", "topk": 16, "decode_qlen": 1}
+REPEAT 1 STAGE decode
+[device] GCU capability=0.0
+[baseline] vLLM disabled (--no-vllm)
+
+MiniMax M3 paged sparse attention (decode qlen=1)
+dtype=bf16, topk=16, init/local=1/2, pages=random, seed=0, warmup=10ms, rep=50ms
+Timing: eager execution with backend device events
+vLLM baseline: unavailable; FlagAttn only
+---------------------------------------------------------------------
+         Shape [B,Q,S,KVH,H]   FlagAttn(ms)   IdxDec(ms)  AttnDec(ms)
+---------------------------------------------------------------------
+               1x1x16384x1x8         0.1995       0.1603       0.1154
+[INFO] {"level": "comprehensive", "op_name": "minimax_m3_sparse_attn_decode", "dtype": "torch.bfloat16", "mode": "kernel", "result": [{"case_id": null, "candidate_source": null, "legacy_shape": null, "shape_detail": [1, 1, 16384, 1, 8], "latency_base": null, "latency": 0.1995459944009781, "gbps_base": null, "gbps": null, "speedup": null, "accuracy": null, "tflops": null, "utilization": null, "compared_speedup": null, "error_msg": null, "steps": {"index_decode": 0.16027399897575378, "attention_decode": 0.11535000056028366}}], "baseline": null, "vllm_kv_layout": null, "phase": "decode", "topk": 16, "decode_qlen": 1}
+REPEAT 2 STAGE decode
+[device] GCU capability=0.0
+[baseline] vLLM disabled (--no-vllm)
+
+MiniMax M3 paged sparse attention (decode qlen=1)
+dtype=bf16, topk=16, init/local=1/2, pages=random, seed=0, warmup=10ms, rep=50ms
+Timing: eager execution with backend device events
+vLLM baseline: unavailable; FlagAttn only
+---------------------------------------------------------------------
+         Shape [B,Q,S,KVH,H]   FlagAttn(ms)   IdxDec(ms)  AttnDec(ms)
+---------------------------------------------------------------------
+               1x1x16384x1x8         0.2020       0.1604       0.1149
+[INFO] {"level": "comprehensive", "op_name": "minimax_m3_sparse_attn_decode", "dtype": "torch.bfloat16", "mode": "kernel", "result": [{"case_id": null, "candidate_source": null, "legacy_shape": null, "shape_detail": [1, 1, 16384, 1, 8], "latency_base": null, "latency": 0.2019594982266426, "gbps_base": null, "gbps": null, "speedup": null, "accuracy": null, "tflops": null, "utilization": null, "compared_speedup": null, "error_msg": null, "steps": {"index_decode": 0.16039499640464783, "attention_decode": 0.11494400352239609}}], "baseline": null, "vllm_kv_layout": null, "phase": "decode", "topk": 16, "decode_qlen": 1}
