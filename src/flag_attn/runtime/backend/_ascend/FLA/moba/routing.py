@@ -32,19 +32,23 @@ def cdiv(x, y):
     return (x + y - 1) // y
 
 
-# Ascend limits ``coreDim`` (the 1D launch extent) to 65535.  Kernels whose
-# program count scales with ``tokens * heads`` or with the routed payload are
-# therefore launched with a capped 1D grid and stride over the remaining items
-# inside the program (``pid, pid + num_programs, ...``); ``tl.num_programs(0)``
-# is verified to work on this backend, and a grid at or below the cap behaves
-# exactly like the old one-item-per-program launch.
-_MAX_CORE_DIM0 = 65535
+# Ascend limits the 1D launch extent.  The hard ``coreDim`` limit is 65535, but
+# for non-trivial kernels a single launch silently hangs above 32768 programs
+# (lead's measurement: desc=32768 -> 865 ms, desc=36864 -> hang with no plog
+# error, while the same work split at 16384 completes in 42.7 ms).  Every
+# "complex" kernel therefore caps its 1D grid at 32768 and strides over the
+# remaining items inside the program (``pid, pid + num_programs, ...``);
+# ``tl.num_programs(0)`` is verified to work on this backend, and a grid at or
+# below the cap behaves exactly like the old one-item-per-program launch.
+# Trivial elementwise kernels (fill/cast/copy) keep the 65535 cap.
+_MAX_CORE_DIM0 = 32768
+_MAX_CORE_DIM0_SIMPLE = 65535
 # Token block used by the blocked route builders.
 _ROUTE_BLOCK_T = 1024
 
 
 def _capped_grid(num_programs: int, dim0_cap: int = _MAX_CORE_DIM0):
-    """Cap a 1D program count at the Ascend ``coreDim`` limit."""
+    """Cap a 1D program count at the Ascend per-launch limit."""
     num_programs = max(1, int(num_programs))
     return (min(num_programs, dim0_cap),)
 
@@ -64,7 +68,7 @@ def _fill_triton(tensor: torch.Tensor, value) -> None:
     if tensor.numel() == 0:
         return
     block = 256
-    _fill_kernel[_capped_grid(cdiv(tensor.numel(), block))](
+    _fill_kernel[_capped_grid(cdiv(tensor.numel(), block), _MAX_CORE_DIM0_SIMPLE)](
         tensor,
         tensor.numel(),
         value=value,
@@ -90,7 +94,7 @@ def _cast_triton(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     if tensor.numel() == 0:
         return output
     block = 256
-    _cast_kernel[_capped_grid(cdiv(tensor.numel(), block))](
+    _cast_kernel[_capped_grid(cdiv(tensor.numel(), block), _MAX_CORE_DIM0_SIMPLE)](
         tensor,
         output,
         tensor.numel(),
@@ -103,7 +107,7 @@ def _copy_triton(input_tensor: torch.Tensor, output_tensor: torch.Tensor) -> Non
     if input_tensor.numel() == 0:
         return
     block = 256
-    _cast_kernel[_capped_grid(cdiv(input_tensor.numel(), block))](
+    _cast_kernel[_capped_grid(cdiv(input_tensor.numel(), block), _MAX_CORE_DIM0_SIMPLE)](
         input_tensor,
         output_tensor,
         input_tensor.numel(),
@@ -1577,7 +1581,9 @@ def _routes_counts_kernel(
     stride = tl.num_programs(0)
     total = num_experts * n_blocks
     slots_per_rank = num_heads * seqlen
-    for idx in range(pid, total, stride):
+    iters = (total - pid + stride - 1) // stride
+    for i in range(0, iters):
+        idx = pid + i * stride
         expert = idx // n_blocks
         t_block = idx - expert * n_blocks
         head = expert % num_heads
@@ -1603,7 +1609,9 @@ def _routes_bases_kernel(
     """Exclusive per-block base inside each expert's compact range."""
     pid = tl.program_id(0)
     stride = tl.num_programs(0)
-    for expert in range(pid, num_experts, stride):
+    iters = (num_experts - pid + stride - 1) // stride
+    for i in range(0, iters):
+        expert = pid + i * stride
         running = tl.load(offsets_ptr + expert)
         for b in range(0, n_blocks):
             idx = expert * n_blocks + b
@@ -1630,7 +1638,9 @@ def _routes_scatter_kernel(
     stride = tl.num_programs(0)
     total = num_experts * n_blocks
     slots_per_rank = num_heads * seqlen
-    for idx in range(pid, total, stride):
+    iters = (total - pid + stride - 1) // stride
+    for i in range(0, iters):
+        idx = pid + i * stride
         expert = idx // n_blocks
         t_block = idx - expert * n_blocks
         head = expert % num_heads

@@ -24,12 +24,19 @@ from .routing import _copy_triton, cdiv
 _LOG2E = tl.constexpr(1.4426950408889634)
 
 # Ascend rejects any launch whose total program count (``coreDim``) exceeds
-# 65535 with Invalid_Argument(EE1003). A 2-D grid does not lift the limit: the
+# 65535 with Invalid_Argument(EE1003). A 2-D grid does not lift that limit: the
 # runtime flattens the grid and checks the product of its dimensions, so
-# ``(1024, 64)`` (65536 programs) already fails. Large program counts are
-# therefore split into consecutive launches of at most 65535 programs, with the
-# offset handed to the kernel as a runtime argument.
-_PROGRAM_LIMIT = 65535
+# ``(1024, 64)`` (65536 programs) already fails.
+#
+# Splitting into launches of up to 65535 programs is not enough for these
+# kernels though: a single launch with more than 32768 programs hangs the
+# device (no plog error, the call never returns). Measured with the routed
+# attention kernel on synthetic data with no route anomalies: 32768 programs
+# complete, 36864 programs with one launch hang, while the same 36864
+# descriptors split into 2 launches of 32768/4096 complete. The launch cap is
+# therefore 32768; large program counts are split into consecutive launches
+# with the offset handed to the kernel as a runtime argument.
+_PROGRAM_LIMIT = 32768
 
 
 def _process_launches(num_programs: int):
@@ -709,8 +716,12 @@ def _routed_gqa_attn_fwd_kernel(
         row_max = new_max
 
     acc /= row_sum[:, None]
+    # Route row ids reach topk * tokens * heads (7 * 524288 * 16 at the largest
+    # benchmark shape), so ``row * head_dim`` overflows int32; the output row
+    # offset is therefore computed in int64.
+    route_rows_out = route_positions.to(tl.int64)
     tl.store(
-        out_ptr + route_positions[:, None] * stride_out_t + offs_d[None, :] * stride_out_d,
+        out_ptr + route_rows_out[:, None] * stride_out_t + offs_d[None, :] * stride_out_d,
         acc,
         mask=mask_m[:, None] & mask_d[None, :],
     )
@@ -824,6 +835,12 @@ def _fused_merge_softmax_kernel(
     tokens = token_block * ROWS_PER_PROGRAM + tl.arange(0, ROWS_PER_PROGRAM)
     mask_t = tokens < num_tokens
     rows = tokens * num_heads + head
+    # The routed row ids are indexed by ``topk * tokens * heads`` (up to 5.9e7
+    # at the largest benchmark shape); multiplying them by head_dim overflows
+    # int32 past ~2^31 elements, so every element-level row offset is computed
+    # in int64. The self-attention/output row ids stay below that bound today
+    # but use the same widened arithmetic for safety.
+    rows_i64 = rows.to(tl.int64)
 
     token_lse = tl.load(
         self_lse_ptr + head * stride_self_lse_head + tokens * stride_self_lse_token,
@@ -838,7 +855,7 @@ def _fused_merge_softmax_kernel(
         running_max = token_lse
         running_sum = tl.where(mask_t, 1.0, 0.0)
         output_values = tl.load(
-            self_out_ptr + rows[:, None] * stride_self_row + d_offsets[None, :] * stride_self_d,
+            self_out_ptr + rows_i64[:, None] * stride_self_row + d_offsets[None, :] * stride_self_d,
             mask=mask_t[:, None] & mask_d[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -862,7 +879,9 @@ def _fused_merge_softmax_kernel(
             weight = tl.where(valid, tl.exp(routed_lse - new_max), 0.0)
             running_sum = running_sum * rescale + weight
             routed_values = tl.load(
-                moba_out_ptr + safe_positions[:, None] * stride_moba_row + d_offsets[None, :] * stride_moba_d,
+                moba_out_ptr
+                + safe_positions.to(tl.int64)[:, None] * stride_moba_row
+                + d_offsets[None, :] * stride_moba_d,
                 mask=valid[:, None] & mask_d[None, :],
                 other=0.0,
             ).to(tl.float32)
@@ -871,7 +890,7 @@ def _fused_merge_softmax_kernel(
 
         inverse_total = 1.0 / running_sum
         tl.store(
-            out_ptr + rows[:, None] * stride_out_row + d_offsets[None, :] * stride_out_d,
+            out_ptr + rows_i64[:, None] * stride_out_row + d_offsets[None, :] * stride_out_d,
             output_values * inverse_total[:, None],
             mask=mask_t[:, None] & mask_d[None, :],
         )
