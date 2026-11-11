@@ -79,3 +79,9 @@ _fused_attnres_fwd_kernel:
   - META: {}
     num_warps: 4
     num_stages: 2
+
+# Curated Hygon gfx936 defaults for Inkling FA4 relative attention.
+_fa4_rel_attn_paged_kernel:
+  - META: {BLOCK_Q: 32, BLOCK_K: 32}
+    num_warps: 4
+    num_stages: 2
