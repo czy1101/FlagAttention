@@ -103,8 +103,13 @@ def input_guard(fn):
     return wrapped
 
 
+# Preserve the existing tuning guard, not a queried hardware capacity.
+# The current MetaX driver reports LOCAL_SIZE_BYTES / 4 in n_spills.
+_WALL_LOCAL_MEMORY_BUDGET_BYTES = 4096
+
+
 def resource_pruner(kernel_getter):
-    """Reject compiled configurations exceeding C550 launch resource limits."""
+    """Filter launch resource failures and the existing local-memory budget."""
 
     def prune(configs, named_args, **kwargs):
         from triton.runtime.errors import OutOfResources
@@ -120,14 +125,20 @@ def resource_pruner(kernel_getter):
                     grid=(1, 1, 1),
                     warmup=True,
                 )
-                # Loading metadata does not execute the kernel. The MACA driver
-                # returns LOCAL_SIZE_BYTES / 4 as n_spills; C550 permits 4 KiB
-                # private storage per thread in the supported runtime.
+                # Initialize handles to let Triton check shared memory and threads;
+                # this does not launch the kernel.
                 compiled._init_handles()
-                if compiled.n_spills * 4 <= 4096:
+                local_bytes = compiled.n_spills * 4
+                if local_bytes <= _WALL_LOCAL_MEMORY_BUDGET_BYTES:
                     valid.append(config)
             except OutOfResources:
                 continue
+        if not valid:
+            raise RuntimeError(
+                "Wall-Attention has no eligible autotune configurations after "
+                "Triton resource checks and the local-memory tuning budget "
+                f"({_WALL_LOCAL_MEMORY_BUDGET_BYTES} bytes per thread)."
+            )
         return valid
 
     return prune
