@@ -1569,12 +1569,14 @@ def _exclusive_prefix_sum_triton(
 def _routes_counts_kernel(
     selected_ptr,
     counts_eb_ptr,
+    chunk_end_ptr,
     num_experts,
     seqlen,
     n_blocks,
     num_heads: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    USE_CHUNK_END: tl.constexpr,
 ):
     """Per (expert, token-block) route counts; each program owns its own cell."""
     pid = tl.program_id(0)
@@ -1591,10 +1593,11 @@ def _routes_counts_kernel(
         toks = t_block * BLOCK_T + tl.arange(0, BLOCK_T)
         mask = toks < seqlen
         count = tl.zeros([BLOCK_T], dtype=tl.int32)
-        for r in tl.static_range(TOPK):
-            base = r * slots_per_rank + head * seqlen
-            vals = tl.load(selected_ptr + base + toks, mask=mask, other=-1)
-            count += tl.where(mask & (vals == chunk), 1, 0)
+        if (not USE_CHUNK_END) or ((t_block + 1) * BLOCK_T > tl.load(chunk_end_ptr + chunk)):
+            for r in tl.static_range(TOPK):
+                base = r * slots_per_rank + head * seqlen
+                vals = tl.load(selected_ptr + base + toks, mask=mask, other=-1)
+                count += tl.where(mask & (vals == chunk), 1, 0)
         tl.store(counts_eb_ptr + idx, tl.sum(count, axis=0))
 
 
@@ -1626,12 +1629,14 @@ def _routes_scatter_kernel(
     bases_eb_ptr,
     query_indices_ptr,
     route_positions_ptr,
+    chunk_end_ptr,
     num_experts,
     seqlen,
     n_blocks,
     num_heads: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    USE_CHUNK_END: tl.constexpr,
 ):
     """Write each routed slot into its expert range without atomics."""
     pid = tl.program_id(0)
@@ -1647,27 +1652,35 @@ def _routes_scatter_kernel(
         chunk = expert // num_heads
         toks = t_block * BLOCK_T + tl.arange(0, BLOCK_T)
         mask = toks < seqlen
-        hits = tl.zeros([BLOCK_T], dtype=tl.int32)
-        rank_of_hit = tl.zeros([BLOCK_T], dtype=tl.int32)
-        for r in tl.static_range(TOPK):
-            base = r * slots_per_rank + head * seqlen
-            vals = tl.load(selected_ptr + base + toks, mask=mask, other=-1)
-            hit = mask & (vals == chunk) & (hits == 0)
-            hits += hit.to(tl.int32)
-            rank_of_hit += tl.where(hit, r, 0)
-        writer = tl.load(bases_eb_ptr + idx)
-        positions = writer + tl.cumsum(hits, axis=0) - 1
-        keep = hits > 0
-        tl.store(query_indices_ptr + positions, toks * num_heads + head, mask=keep)
-        route_slot = rank_of_hit * slots_per_rank + toks * num_heads + head
-        tl.store(route_positions_ptr + route_slot, positions, mask=keep)
+        chunk_end = tl.load(chunk_end_ptr + chunk) if USE_CHUNK_END else 0
+        if (not USE_CHUNK_END) or ((t_block + 1) * BLOCK_T > chunk_end):
+            hits = tl.zeros([BLOCK_T], dtype=tl.int32)
+            rank_of_hit = tl.zeros([BLOCK_T], dtype=tl.int32)
+            for r in tl.static_range(TOPK):
+                base = r * slots_per_rank + head * seqlen
+                vals = tl.load(selected_ptr + base + toks, mask=mask, other=-1)
+                hit = mask & (vals == chunk) & (hits == 0)
+                hits += hit.to(tl.int32)
+                rank_of_hit += tl.where(hit, r, 0)
+            writer = tl.load(bases_eb_ptr + idx)
+            positions = writer + tl.cumsum(hits, axis=0) - 1
+            keep = hits > 0
+            tl.store(query_indices_ptr + positions, toks * num_heads + head, mask=keep)
+            route_slot = rank_of_hit * slots_per_rank + toks * num_heads + head
+            tl.store(route_positions_ptr + route_slot, positions, mask=keep)
 
 
 import os
 
 
-def _compact_routes_fast(selected_chunks, num_experts, num_heads, seqlen):
-    """Return (query_indices, route_positions, expert_counts, expert_offsets)."""
+def _compact_routes_fast(selected_chunks, num_experts, num_heads, seqlen, chunk_ends=None):
+    """Return (query_indices, route_positions, expert_counts, expert_offsets).
+
+    ``chunk_ends[k]`` is the last token of chunk ``k``; a chunk can only be
+    selected by later tokens, so token blocks fully inside it are skipped.  That
+    removes about half of the (expert, token block) cells, which dominate the
+    cost at the benchmark shapes.
+    """
     topk = selected_chunks.shape[0]
     if topk == 1:
         # Known Ascend codegen issue: with a single rank the scatter kernel drops
@@ -1688,9 +1701,12 @@ def _compact_routes_fast(selected_chunks, num_experts, num_heads, seqlen):
     query_indices = torch.full((selected_chunks.numel(),), -1, device=device, dtype=torch.int32)
     route_positions = torch.full((topk, seqlen * num_heads), -1, device=device, dtype=torch.int32)
 
+    use_chunk_end = chunk_ends is not None
+    chunk_end_ptr = chunk_ends if use_chunk_end else expert_counts
     _routes_counts_kernel[grid](
-        selected_chunks, counts_eb, num_experts, seqlen, n_blocks,
+        selected_chunks, counts_eb, chunk_end_ptr, num_experts, seqlen, n_blocks,
         num_heads=num_heads, TOPK=topk, BLOCK_T=_ROUTE_BLOCK_T,
+        USE_CHUNK_END=use_chunk_end,
     )
     expert_counts.copy_(counts_eb.view(num_experts, n_blocks).sum(dim=1, dtype=torch.int32))
     torch.cumsum(expert_counts, 0, dtype=torch.int32, out=expert_offsets[1:])
@@ -1700,8 +1716,9 @@ def _compact_routes_fast(selected_chunks, num_experts, num_heads, seqlen):
     )
     _routes_scatter_kernel[grid](
         selected_chunks, bases_eb, query_indices, route_positions,
-        num_experts, seqlen, n_blocks,
+        chunk_end_ptr, num_experts, seqlen, n_blocks,
         num_heads=num_heads, TOPK=topk, BLOCK_T=_ROUTE_BLOCK_T,
+        USE_CHUNK_END=use_chunk_end,
     )
     return query_indices, route_positions, expert_counts, expert_offsets
 
@@ -1866,6 +1883,7 @@ def _build_sparse_routes_triton(
     num_chunks: int,
     num_heads: int,
     seqlen: int,
+    chunk_ends: torch.Tensor | None = None,
 ):
     """Group selected queries by (target chunk, head).  Contract unchanged."""
     num_experts = num_chunks * num_heads
@@ -1874,7 +1892,7 @@ def _build_sparse_routes_triton(
         route_positions,
         expert_counts,
         expert_offsets,
-    ) = _compact_routes_fast(selected_chunks, num_experts, num_heads, seqlen)
+    ) = _compact_routes_fast(selected_chunks, num_experts, num_heads, seqlen, chunk_ends)
     max_count = int(expert_counts.max().item())
     num_routes = int(expert_offsets[-1].item())
     return (
@@ -1892,6 +1910,7 @@ def _build_sparse_routes_device_triton(
     num_heads: int,
     seqlen: int,
     block_m: int,
+    chunk_ends: torch.Tensor | None = None,
 ):
     """Device-side route metadata (descriptors are expert-major, no atomics)."""
     num_experts = num_chunks * num_heads
@@ -1902,7 +1921,7 @@ def _build_sparse_routes_device_triton(
         route_positions,
         expert_counts,
         expert_offsets,
-    ) = _compact_routes_fast(selected_chunks, num_experts, num_heads, seqlen)
+    ) = _compact_routes_fast(selected_chunks, num_experts, num_heads, seqlen, chunk_ends)
     block = 256
     descriptor_counts = torch.empty((num_experts,), device=device, dtype=torch.int32)
     descriptor_offsets = torch.empty((num_experts + 1,), device=device, dtype=torch.int32)

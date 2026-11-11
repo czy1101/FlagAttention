@@ -242,6 +242,25 @@ class MixedAttention(torch.autograd.Function):
         return dq, dk, dv, None, dmq, dmkv, None, None, None, None, None, None, None
 
 
+def _dense_chunk_ends(
+    cu_seqlens: torch.Tensor,
+    max_chunks_per_sequence: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    """End token of every dense chunk slot, built on the device."""
+    batch_size = cu_seqlens.numel() - 1
+    slots = torch.arange(
+        batch_size * max_chunks_per_sequence,
+        device=cu_seqlens.device,
+        dtype=torch.int32,
+    )
+    batches = slots // max_chunks_per_sequence
+    local_chunks = slots - batches * max_chunks_per_sequence
+    sequence_start = cu_seqlens[batches]
+    sequence_end = cu_seqlens[batches + 1]
+    return torch.minimum(sequence_start + (local_chunks + 1) * chunk_size, sequence_end)
+
+
 def _moba_attn_varlen_inference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -339,6 +358,7 @@ def _moba_attn_varlen_inference(
             num_q_heads,
             seqlen,
             block_m,
+            _dense_chunk_ends(cu_seqlens, max_chunks_per_sequence, moba_chunk_size),
         )
         route_out, route_lse = _routed_sparse_attention_triton(
             q,
@@ -547,6 +567,7 @@ def parallel_moba(
         num_filtered_chunk,
         num_head,
         seqlen,
+        chunk_end,
     )
 
     if moba_q_sh_indices.numel() == 0:
