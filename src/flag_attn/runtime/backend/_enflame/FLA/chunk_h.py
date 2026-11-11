@@ -1156,8 +1156,12 @@ def chunk_fwd_h(
         # with the independently controlled parallel backward-state path.
         and (not states_in_fp32 or PARALLEL_BWD_STATE_ENABLED)
         and not state_v_first
-        and k.dtype == torch.bfloat16
-        and v.dtype == torch.bfloat16
+        # The FP16 specialization is validated for the 64x64 GLA state.
+        and (
+            k.dtype == torch.bfloat16
+            or (k.dtype == torch.float16 and K == 64 and V == 64)
+        )
+        and v.dtype == k.dtype
         and g is None
         and g_gamma is None
         and gk is not None
@@ -1386,9 +1390,15 @@ def chunk_bwd_dh(
         and BT == 64
         and HQ == H
         and not state_v_first
-        and q.dtype == torch.bfloat16
-        and k.dtype == torch.bfloat16
-        and do.dtype == torch.bfloat16
+        # BF16 keeps the original unrestricted parallel path.  FP16 is only
+        # enabled for the 64x64 GLA state, matching the forward gate that
+        # PR #42 already validates.
+        and (
+            k.dtype == torch.bfloat16
+            or (k.dtype == torch.float16 and K == 64 and V == 64)
+        )
+        and q.dtype == k.dtype
+        and do.dtype == k.dtype
         and g is None
         and g_gamma is None
         and gk is not None
