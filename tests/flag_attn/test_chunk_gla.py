@@ -940,6 +940,7 @@ def _assert_close(name, actual, expected, ratio, err_atol=1e-6):
         pytest.param(*c, id="B{}-T{}-H{}-D{}-gate_logit_normalizer{}-{}".format(*c))
         for c in [
             (1, 63, 1, 64, 1.0, torch.float16),
+            (1, 512, 4, 64, 1.0, torch.float16),
             (2, 1024, 4, 60, 1.0, torch.float16),
             (2, 1024, 8, 128, 0.1, torch.float16),
             (2, 1024, 8, 128, 1.0, torch.float16),
