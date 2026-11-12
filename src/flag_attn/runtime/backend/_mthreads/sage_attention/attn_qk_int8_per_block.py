@@ -18,6 +18,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 
 @triton.jit
@@ -32,11 +33,12 @@ def _attn_fwd_inner(
     K_ptrs,
     K_scale_ptr,
     V_ptrs,
+    V_desc,
+    v_row,
     stride_kn,
     stride_vn,
     mask_ptrs,
     stride_maskn,
-    BLOCK_M: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,
     offs_m: tl.constexpr,
@@ -45,6 +47,7 @@ def _attn_fwd_inner(
     MASK_IS_BOOL: tl.constexpr,
     USE_INT8_DOT: tl.constexpr,
     EVEN_KV: tl.constexpr,
+    USE_TME_V: tl.constexpr,
 ):
     for start_n in range(0, kv_len, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -89,7 +92,9 @@ def _attn_fwd_inner(
         l_i = l_i * alpha + l_ij
         acc *= alpha[:, None]
 
-        if EVEN_KV:
+        if USE_TME_V:
+            v = V_desc.load([(v_row + start_n).to(tl.int32), 0])
+        elif EVEN_KV:
             v = tl.load(V_ptrs)
         else:
             v = tl.load(
@@ -120,6 +125,7 @@ def _attn_fwd(
     Q,
     K,
     V,
+    V_desc,
     Q_scale,
     K_scale,
     Out,
@@ -157,6 +163,7 @@ def _attn_fwd(
     USE_INT8_DOT: tl.constexpr,
     EVEN_Q: tl.constexpr,
     EVEN_KV: tl.constexpr,
+    USE_TME_V: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_h = tl.program_id(1).to(tl.int64)
@@ -221,11 +228,12 @@ def _attn_fwd(
         K_ptrs,
         K_scale_ptr,
         V_ptrs,
+        V_desc,
+        (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * kv_len,
         stride_kn,
         stride_vn,
         mask_ptrs,
         stride_maskn,
-        BLOCK_M,
         HEAD_DIM,
         BLOCK_N,
         offs_m,
@@ -234,6 +242,7 @@ def _attn_fwd(
         MASK_IS_BOOL,
         USE_INT8_DOT,
         EVEN_KV,
+        USE_TME_V,
     )
 
     acc /= l_i[:, None]
@@ -344,6 +353,10 @@ def forward(
     return_lse=False,
     maxnreg=None,
 ):
+    """Run MUSA attention; maxnreg is accepted for public API compatibility.
+
+    MUSA launches do not apply a physical register cap.
+    """
     if maxnreg is not None and maxnreg <= 0:
         raise ValueError("maxnreg must be positive")
     _validate_forward_inputs(q, k, v, q_scale, k_scale, tensor_layout, attn_mask)
@@ -417,11 +430,22 @@ def forward(
     # changes D=64 scheduling/register allocation enough to regress it.  Keep
     # the original predicated D=64 specialization even for aligned shapes.
     use_aligned_io = head_dim == 128
+    # A rank-two descriptor can feed MP31's SQMMA B layout directly.
+    # Keep ordinary masked loads for unsupported layouts, alignment and tails.
+    use_tme_v = (
+        tensor_layout == "HND"
+        and v.is_contiguous()
+        and kv_len % block_n == 0
+        and v.data_ptr() % 16 == 0
+        and b * h_kv * kv_len <= 2**31 - 1
+    )
+    v_desc = TensorDescriptor(v, [b * h_kv * kv_len, head_dim], [head_dim, 1], [block_n, head_dim]) if use_tme_v else v
     grid = (triton.cdiv(qo_len, block_m), h_qo, b)
     _attn_fwd[grid](
         q,
         k,
         v,
+        v_desc,
         q_scale,
         k_scale,
         o,
@@ -447,6 +471,7 @@ def forward(
         USE_INT8_DOT=os.environ.get("FLAG_ATTN_MTHREADS_INT8_DOT", "1") != "0",
         EVEN_Q=use_aligned_io and qo_len % block_m == 0,
         EVEN_KV=use_aligned_io and kv_len % block_n == 0,
+        USE_TME_V=use_tme_v,
         num_warps=num_warps,
         num_stages=num_stages,
     )

@@ -13,28 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utility functions extracted from vLLM framework dependencies."""
-
-import re
-
-import torch
+"""Small MUSA helpers and the shared benchmark compatibility interface."""
 
 
 class _CurrentPlatform:
-    """Small platform adapter used by the MSA Triton kernels."""
+    """Keep the shared benchmark interface without CUDA feature probing."""
 
     def is_arch_support_pdl(self) -> bool:
-        if not torch.cuda.is_available():
-            return False
-        # HIP/ROCm does not accept CUDA's launch_pdl runtime argument.
-        if torch.version.hip is not None:
-            return False
-        try:
-            capability = torch.cuda.get_device_capability()
-        except RuntimeError:
-            return False
-        # PDL is enabled only for CUDA devices with the required capability.
-        return capability >= (9, 0)
+        return False
 
 
 current_platform = _CurrentPlatform()
@@ -43,16 +29,3 @@ current_platform = _CurrentPlatform()
 def round_up(n: int, d: int) -> int:
     """Round n up to the nearest multiple of d."""
     return (n + d - 1) // d * d
-
-
-def has_triton_tle(major: int = 0, minor: int = 0, patch: int = 0) -> bool:
-    """Return whether the installed Triton exposes the TLE language module."""
-    try:
-        import triton
-        import triton.experimental.tle.language as _tle  # noqa: F401
-    except ImportError:
-        return False
-    version = str(getattr(triton, "__version__", "0.0.0"))
-    release = [int(value) for value in re.findall(r"\d+", version)[:3]]
-    release += [0] * (3 - len(release))
-    return tuple(release[:3]) >= (major, minor, patch)

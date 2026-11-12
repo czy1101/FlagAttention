@@ -31,12 +31,18 @@ except ModuleNotFoundError:  # Direct script execution.
     from recording import BenchmarkRecorder
 
 from flag_attn.testing import backend as test_backend
-from flag_attn import sage_attention
+from flag_attn import runtime, sage_attention
 from flag_attn.sage_attention import per_block_int8
 
 
+IS_MTHREADS = runtime.device.vendor_name == "mthreads"
+if IS_MTHREADS:
+    from sageattention import sageattn
+
 SDPA_BASELINE_NAME = "torch_sdpa"
-BENCHMARK_SCOPE = "attention_kernel_only"
+BENCHMARK_SCOPE = (
+    "mate_full_forward_vs_flagattention_kernel" if IS_MTHREADS else "attention_kernel_only"
+)
 DEFAULT_WARMUP = 25
 DEFAULT_REPETITIONS = 100
 MAX_ACCURACY_ELEMENTS = 1_048_576
@@ -178,7 +184,19 @@ def _benchmark_case(
     del baseline_output, flagattention_output
 
     baseline_ms = test_backend.do_bench(
-        lambda: _run_baseline(q, k, v).to(output_dtype),
+        lambda: (
+            sageattn(
+                q, k, v,
+                tensor_layout="HND",
+                is_causal=False,
+                qk_quant_dtype="int8",
+                quant_recipe=(128, 16, -1, 1),
+                smooth_k=True,
+                return_lse=False,
+            )
+            if IS_MTHREADS
+            else _run_baseline(q, k, v)
+        ).to(output_dtype),
         warmup=warmup,
         rep=rep,
         return_mode="median",
@@ -211,6 +229,8 @@ def _shape_name(shape: tuple[int, int, int, int]) -> str:
 
 
 def _baseline_name(output_dtype: torch.dtype) -> str:
+    if IS_MTHREADS:
+        return "mate_sageattention"
     if output_dtype == torch.float16:
         return SDPA_BASELINE_NAME
     return f"{SDPA_BASELINE_NAME}_plus_{str(output_dtype).removeprefix('torch.')}_cast"
@@ -228,12 +248,17 @@ def _print_header(
     print(f"\n{'=' * 104}")
     print("  sage_attention benchmark — FWD ONLY")
     print(f"  provider: {_baseline_name(output_dtype)} vs flag_attn_sage_attention")
-    print("  timing: Q/K quantization excluded from both providers")
+    if IS_MTHREADS:
+        print("  timing: MATE includes quantization; FlagAttention excludes Q/K quantization")
+        print("  accuracy: FlagAttention vs torch_sdpa")
+    else:
+        print("  timing: Q/K quantization excluded from both providers")
     print(f"  warmup={warmup}ms  rep={rep}ms")
     print(f"{'=' * 104}")
+    provider = "mate" if IS_MTHREADS else "sdpa"
     print(
         f"{'B':>3} {'T':>6} {'H':>4} {'D':>4} {'dtype':>8} "
-        f"{'sdpa(ms)':>10} {'flag_attn(ms)':>14} {'sdpa/flag_attn':>14} "
+        f"{provider + '(ms)':>10} {'flag_attn(ms)':>14} {provider + '/flag_attn':>14} "
         f"{'cosine':>10} {'rel_l2':>10}"
     )
 
@@ -269,7 +294,8 @@ def _record_result(
     prefix = f"{_shape_name(shape)}_{_dtype_name(output_dtype)}"
     record_property(f"{prefix}.baseline_ms", result.baseline_ms)
     record_property(f"{prefix}.flagattention_ms", result.flagattention_ms)
-    record_property(f"{prefix}.speedup_vs_sdpa", result.speedup)
+    provider = "mate" if IS_MTHREADS else "sdpa"
+    record_property(f"{prefix}.speedup_vs_{provider}", result.speedup)
     record_property(f"{prefix}.cosine_similarity", result.cosine_similarity)
     record_property(f"{prefix}.relative_l2", result.relative_l2)
 

@@ -776,11 +776,83 @@ def _format_columns(columns: list[tuple[str, int]]) -> str:
     return "  ".join(f"{value:>{width}s}" for value, width in columns)
 
 
+def _mate_msa_run(data: MSAData, args: MSABenchmarkArgs, shape, output) -> Callable:
+    import fmha_sm100 as official
+    from mate.msa_interface import MsaRuntimeMetadata
+
+    batch, query_len, seq_len, num_kv_heads, num_heads = shape
+    if num_heads // num_kv_heads not in (8, 16):
+        raise ValueError("MATE MSA requires Q heads / KV heads to equal 8 or 16")
+    pages = (seq_len + BLOCK - 1) // BLOCK
+    device = data.q.device
+    k = data.kv_cache[..., :HEAD_DIM].permute(0, 2, 1, 3).contiguous()
+    v = data.kv_cache[..., HEAD_DIM:].permute(0, 2, 1, 3).contiguous()
+    index_k = data.index_kv_cache.unsqueeze(2).expand(-1, -1, num_kv_heads, -1).contiguous()
+    flat_pages = data.block_table.reshape(-1)
+    metadata = MsaRuntimeMetadata(
+        qo_lens=torch.full((batch,), query_len, device=device, dtype=torch.int32),
+        kv_lens=data.seq_lens,
+        qo_offset=data.prefix_lens,
+        cu_seqlens_q=data.cu_q,
+        cu_seqlens_k=torch.arange(batch + 1, device=device, dtype=torch.int32) * seq_len,
+        seqused_k=data.seq_lens,
+        kv_page_indptr=torch.arange(batch + 1, device=device, dtype=torch.int32) * pages,
+    )
+    positions = (
+        torch.arange(query_len, device=device, dtype=torch.int64) + seq_len - query_len
+    ).repeat(batch)
+    q_lens = torch.full((batch,), query_len, dtype=torch.int32)
+    kv_lens = torch.full((batch,), seq_len, dtype=torch.int32)
+    plan_args = dict(
+        page_size=BLOCK,
+        sparse_block_size=BLOCK,
+        num_kv_splits=1,
+        causal=True,
+        qo_offset=torch.full((batch,), seq_len - query_len, dtype=torch.int32),
+        split_prefill_decode=False,
+    )
+    index_plan = official.fmha_sm100_plan(
+        q_lens, kv_lens, num_kv_heads, num_kv_heads,
+        output_maxscore=True, **plan_args,
+    )
+    attention_plan = official.fmha_sm100_plan(
+        q_lens, kv_lens, num_heads, num_kv_heads,
+        kv_block_num=args.topk,
+        sparse_kernel_mode="decode" if args.decode else "prefill",
+        **plan_args,
+    )
+    lse = torch.empty((batch * query_len, num_heads), device=device, dtype=torch.float32)
+
+    def run():
+        _, scores = official.fmha_sm100(
+            data.idx_q, index_k, index_k, index_plan,
+            kv_indices=flat_pages, output_o=False, output_maxscore=True,
+            runtime_metadata=metadata,
+        )
+        selected = official.sparse_topk_select(
+            scores,
+            topk=args.topk,
+            num_valid_pages=pages,
+            force_begin_blocks=args.init_blocks,
+            force_end_blocks=args.local_blocks,
+            force_blocks_count_in_topk=True,
+            query_positions=positions,
+        )
+        return official.fmha_sm100(
+            data.q, k, v, attention_plan,
+            kv_indices=flat_pages, kv_block_indexes=selected,
+            sm_scale=data.sm_scale, runtime_metadata=metadata, out=output, lse=lse,
+        )
+
+    return run
+
+
 def _run_dtype(
     args: MSABenchmarkArgs,
     dtype_name: str,
     record_property: Callable[[str, object], None] | None = None,
 ) -> None:
+    run_mate = runtime.device.vendor_name == "mthreads" and dtype_name == "bf16"
     run_vllm = (
         VLLM_AVAILABLE
         and runtime.device.vendor_name in VLLM_BASELINE_VENDORS
@@ -809,14 +881,18 @@ def _run_dtype(
     if run_vllm:
         print(f"vLLM KV cache layout: {vllm_layout}; outputs checked before timing")
         print("Provider order: alternates by shape")
-    else:
+    elif not run_mate:
         print("vLLM baseline: unavailable; FlagAttn only")
+    if run_mate:
+        print("MATE baseline: timing only; plans, metadata and cache packing excluded")
 
     headers = [("Shape [B,Q,S,KVH,H]", 28), ("FlagAttn(ms)", 13)]
     if run_vllm:
         headers.extend(
             [("vLLM(ms)", 10), ("vLLM/ours", 10), ("Cosine", 9), ("Match", 6)]
         )
+    if run_mate:
+        headers.extend([("MATE(ms)", 10), ("MATE/ours", 10)])
     if args.per_step:
         if args.decode:
             headers.extend([("IdxDec(ms)", 11), ("AttnDec(ms)", 11)])
@@ -832,7 +908,7 @@ def _run_dtype(
         record_property,
         op_name="minimax_m3_sparse_attn",
         dtype=str(torch.bfloat16 if dtype_name == "bf16" else FP8_DTYPE),
-        baseline="vLLM" if run_vllm else None,
+        baseline="MATE" if run_mate else "vLLM" if run_vllm else None,
         vllm_kv_layout=vllm_layout,
         phase="decode" if args.decode else "prefill",
         topk=args.topk,
@@ -961,6 +1037,11 @@ def _run_dtype(
         else:
             flag_attn_ms = bench_fn(flag_attn_run, args.warmup, args.rep)
 
+        mate_ms = None
+        if run_mate:
+            mate_run = _mate_msa_run(data, args, shape, torch.empty_like(data.q))
+            mate_ms = bench_fn(mate_run, args.warmup, args.rep)
+
         steps = _bench_steps(data, args.decode, args, shape) if args.per_step else {}
         row = [
             (f"{batch}x{query_len}x{seq_len}x{num_kv_heads}x{num_heads}", 28),
@@ -975,6 +1056,8 @@ def _run_dtype(
                     ("pass" if can_compare else "N/A", 6),
                 ]
             )
+        if run_mate:
+            row.extend([(f"{mate_ms:.4f}", 10), (f"{mate_ms / flag_attn_ms:.2f}x", 10)])
         if args.per_step:
             if args.decode:
                 row.extend(
@@ -995,7 +1078,7 @@ def _run_dtype(
         sys.stdout.flush()
         recorder.add(
             shape_detail=shape,
-            latency_base=vllm_ms,
+            latency_base=mate_ms if run_mate else vllm_ms,
             latency=flag_attn_ms,
             accuracy=accuracy,
             steps=steps,
@@ -1005,6 +1088,8 @@ def _run_dtype(
         # closures and provider tuple also hold references to GPU tensors.
         if can_compare:
             del providers, timings
+        if run_mate:
+            del mate_run
         del flag_attn_run, vllm_run, flag_attn_output, vllm_output, vllm_data, data, generator
         test_backend.device_fn.empty_cache()
 
