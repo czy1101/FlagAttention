@@ -54,20 +54,23 @@ vdup_i32(__ubuf__ int32_t *dst, int32_t value, int32_t n) {
     }                                                                          \
   }
 
-// Rank-unrolled bucket body: cursor per chunk, positions and run payload.
-// `idx` is the scan-order counter (rank * bt + t).
-#define BUCKET_RANK(P)                                                         \
+// Rank-unrolled bucket body.  `st` doubles as the run-destination cursor (a
+// run's first destination is its tile-local start) and `bs` as the compact
+// position cursor (its first value is the cell's global base), which removes the
+// separate cursor buffer (the raw channel silently drops the op at 19 operands).
+// Positions land in a per-call buffer at index rank * bt + t, so a tile streamed
+// through several calls needs no call offset.
+#define BUCKET_RANK(P, RANK)                                                   \
   for (int32_t t = 0; t < bt; ++t) {                                           \
     const int32_t x = (P)[t];                                                  \
     if (x >= 0 && x < nc) {                                                    \
-      const int32_t q = cu[x];                                                 \
-      cu[x] = q + 1;                                                           \
-      o[st[x] + (q - bs[x])] = row_base + t * num_heads + h;                    \
-      p[idx] = q;                                                              \
-    } else {                                                                   \
-      p[idx] = -1;                                                             \
+      const int32_t dest = st[x];                                              \
+      st[x] = dest + 1;                                                        \
+      const int32_t q = bs[x];                                                 \
+      bs[x] = q + 1;                                                           \
+      o[dest] = row_base + t * num_heads + h;                                  \
+      p[(RANK) * bt + t] = q;                                                  \
     }                                                                          \
-    ++idx;                                                                     \
   }
 
 extern "C" {
@@ -100,32 +103,26 @@ __aiv__ void _mlir_ciface_moba_routes_bucket(
     memref_t<__ubuf__ int32_t, 1> *i4, memref_t<__ubuf__ int32_t, 1> *i5,
     memref_t<__ubuf__ int32_t, 1> *i6, memref_t<__ubuf__ int32_t, 1> *i7,
     memref_t<__ubuf__ int32_t, 1> *start, memref_t<__ubuf__ int32_t, 1> *base,
-    memref_t<__ubuf__ int32_t, 1> *cur, int32_t topk, int32_t bt, int32_t h,
-    int32_t num_heads, int32_t row_base, memref_t<__ubuf__ int32_t, 1> *out,
+    int32_t topk, int32_t bt, int32_t h, int32_t num_heads, int32_t row_base,
+    memref_t<__ubuf__ int32_t, 1> *out,
     memref_t<__ubuf__ int32_t, 1> *pos) {
   __ubuf__ int32_t *st = start->aligned + start->offset;
   __ubuf__ int32_t *bs = base->aligned + base->offset;
-  __ubuf__ int32_t *cu = cur->aligned + cur->offset;
   __ubuf__ int32_t *o = out->aligned + out->offset;
   __ubuf__ int32_t *p = pos->aligned + pos->offset;
   const int32_t nc = (int32_t)(start->sizes[0]);
 
-  pipe_barrier(PIPE_ALL);
-  vdup_i32(o, -1, topk * bt);
-  pipe_barrier(PIPE_ALL);   // the fill is async; order it before the scalar loop
-  for (int32_t j = 0; j < nc; ++j) {
-    cu[j] = bs[j];
-  }
+  // No -1 fill: Triton pre-fills the run buffer once, because a tile may be
+  // streamed through several calls and a per-call fill would wipe earlier blocks.
   pipe_barrier(PIPE_ALL);
 
-  int32_t idx = 0;
-  if (topk > 0) BUCKET_RANK(i0->aligned + i0->offset)
-  if (topk > 1) BUCKET_RANK(i1->aligned + i1->offset)
-  if (topk > 2) BUCKET_RANK(i2->aligned + i2->offset)
-  if (topk > 3) BUCKET_RANK(i3->aligned + i3->offset)
-  if (topk > 4) BUCKET_RANK(i4->aligned + i4->offset)
-  if (topk > 5) BUCKET_RANK(i5->aligned + i5->offset)
-  if (topk > 6) BUCKET_RANK(i6->aligned + i6->offset)
-  if (topk > 7) BUCKET_RANK(i7->aligned + i7->offset)
+  if (topk > 0) BUCKET_RANK(i0->aligned + i0->offset, 0)
+  if (topk > 1) BUCKET_RANK(i1->aligned + i1->offset, 1)
+  if (topk > 2) BUCKET_RANK(i2->aligned + i2->offset, 2)
+  if (topk > 3) BUCKET_RANK(i3->aligned + i3->offset, 3)
+  if (topk > 4) BUCKET_RANK(i4->aligned + i4->offset, 4)
+  if (topk > 5) BUCKET_RANK(i5->aligned + i5->offset, 5)
+  if (topk > 6) BUCKET_RANK(i6->aligned + i6->offset, 6)
+  if (topk > 7) BUCKET_RANK(i7->aligned + i7->offset, 7)
 }
 }
