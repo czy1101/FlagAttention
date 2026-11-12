@@ -1,0 +1,129 @@
+// Copyright 2026 FlagOS Contributors
+// SPDX-License-Identifier: Apache-2.0
+//
+// TLE-Raw (AscendC, vector core) kernels for MoBA route compaction.
+//
+// Triton cannot express this on Ascend: bucketing route slots by chunk needs
+// per-cell cursors (a scalar read-modify-write loop) and there is no GM scatter
+// primitive at all, so the compact layout has to be produced with UB-local
+// cursors and then written out as contiguous runs.
+//
+// A program owns one (token tile, head) cell group: the 8 rank segments of the
+// per-slot chunk routing are staged into separate UB buffers (one parent buffer
+// plus subviews loses the MTE2->V dependency in the IR sync pass and races; an
+// array of UB pointers makes ccec emit a device-side malloc reference that
+// fails to link).
+//
+// `topk` is a runtime argument (the routed top-k is `moba_topk - 1`): the rank
+// bodies are guarded so any 1..8 works with the same 8 staged buffers.
+//
+//   sel    : [TOPK, num_heads, num_tokens] int32, chunk id or -1
+//   counts : per-(tile, head) chunk histogram          [n_blocks, H, NC]
+//   start  : tile-local exclusive prefix of run starts [n_blocks, H, NC]
+//   base   : global compact base of each cell          [n_blocks, H, NC]
+//   out    : packed query rows `row_base + t * num_heads + h` grouped by chunk,
+//            runs (see `row_base` below),
+//            one (tile, head) row of TOPK * bt entries
+//   pos    : global compact position per slot, slot order i = rank * bt + t
+#include "Utils.h"
+
+#define INTRINSIC(NAME, ...) NAME(__VA_ARGS__)
+#define INTRINSIC_NO_ARGS(NAME) NAME()
+
+static constexpr int32_t VDUP_CHUNK_I32 = 255 * (256 / 4);
+
+__aiv__ __attribute__((always_inline)) void
+vdup_i32(__ubuf__ int32_t *dst, int32_t value, int32_t n) {
+  constexpr int32_t ELEMS_PER_REPEAT = 256 / 4;
+  for (int32_t done = 0; done < n; done += VDUP_CHUNK_I32) {
+    const int32_t len = MIN(n - done, VDUP_CHUNK_I32);
+    INTRINSIC_NO_ARGS(set_mask_count);
+    INTRINSIC(set_vector_mask, 0, len);
+    INTRINSIC(vector_dup, dst + done, value, CEIL_DIV(len, ELEMS_PER_REPEAT), 1,
+              1, 8, 0);
+    INTRINSIC_NO_ARGS(set_mask_norm);
+  }
+}
+
+// Rank-unrolled histogram body: cnt[chunk] += 1 over one rank segment.
+#define HIST_RANK(P)                                                           \
+  for (int32_t t = 0; t < bt; ++t) {                                           \
+    const int32_t x = (P)[t];                                                  \
+    if (x >= 0 && x < nc) {                                                    \
+      c[x] = c[x] + 1;                                                         \
+    }                                                                          \
+  }
+
+// Rank-unrolled bucket body: cursor per chunk, positions and run payload.
+// `idx` is the scan-order counter (rank * bt + t).
+#define BUCKET_RANK(P)                                                         \
+  for (int32_t t = 0; t < bt; ++t) {                                           \
+    const int32_t x = (P)[t];                                                  \
+    if (x >= 0 && x < nc) {                                                    \
+      const int32_t q = cu[x];                                                 \
+      cu[x] = q + 1;                                                           \
+      o[st[x] + (q - bs[x])] = row_base + t * num_heads + h;                    \
+      p[idx] = q;                                                              \
+    } else {                                                                   \
+      p[idx] = -1;                                                             \
+    }                                                                          \
+    ++idx;                                                                     \
+  }
+
+extern "C" {
+
+// Per-(tile, head) chunk histogram.
+__aiv__ void _mlir_ciface_moba_routes_hist(
+    memref_t<__ubuf__ int32_t, 1> *i0, memref_t<__ubuf__ int32_t, 1> *i1,
+    memref_t<__ubuf__ int32_t, 1> *i2, memref_t<__ubuf__ int32_t, 1> *i3,
+    memref_t<__ubuf__ int32_t, 1> *i4, memref_t<__ubuf__ int32_t, 1> *i5,
+    memref_t<__ubuf__ int32_t, 1> *i6, memref_t<__ubuf__ int32_t, 1> *i7,
+    int32_t topk, int32_t bt, int32_t nc,
+    memref_t<__ubuf__ int32_t, 1> *cnt) {
+  __ubuf__ int32_t *c = cnt->aligned + cnt->offset;
+  pipe_barrier(PIPE_ALL);
+  vdup_i32(c, 0, nc);
+  if (topk > 0) HIST_RANK(i0->aligned + i0->offset)
+  if (topk > 1) HIST_RANK(i1->aligned + i1->offset)
+  if (topk > 2) HIST_RANK(i2->aligned + i2->offset)
+  if (topk > 3) HIST_RANK(i3->aligned + i3->offset)
+  if (topk > 4) HIST_RANK(i4->aligned + i4->offset)
+  if (topk > 5) HIST_RANK(i5->aligned + i5->offset)
+  if (topk > 6) HIST_RANK(i6->aligned + i6->offset)
+  if (topk > 7) HIST_RANK(i7->aligned + i7->offset)
+}
+
+// Counting-sort bucket of one (tile, head): runs in chunk order + positions.
+__aiv__ void _mlir_ciface_moba_routes_bucket(
+    memref_t<__ubuf__ int32_t, 1> *i0, memref_t<__ubuf__ int32_t, 1> *i1,
+    memref_t<__ubuf__ int32_t, 1> *i2, memref_t<__ubuf__ int32_t, 1> *i3,
+    memref_t<__ubuf__ int32_t, 1> *i4, memref_t<__ubuf__ int32_t, 1> *i5,
+    memref_t<__ubuf__ int32_t, 1> *i6, memref_t<__ubuf__ int32_t, 1> *i7,
+    memref_t<__ubuf__ int32_t, 1> *start, memref_t<__ubuf__ int32_t, 1> *base,
+    memref_t<__ubuf__ int32_t, 1> *cur, int32_t topk, int32_t bt, int32_t h,
+    int32_t num_heads, int32_t row_base, memref_t<__ubuf__ int32_t, 1> *out,
+    memref_t<__ubuf__ int32_t, 1> *pos) {
+  __ubuf__ int32_t *st = start->aligned + start->offset;
+  __ubuf__ int32_t *bs = base->aligned + base->offset;
+  __ubuf__ int32_t *cu = cur->aligned + cur->offset;
+  __ubuf__ int32_t *o = out->aligned + out->offset;
+  __ubuf__ int32_t *p = pos->aligned + pos->offset;
+  const int32_t nc = (int32_t)(start->sizes[0]);
+
+  pipe_barrier(PIPE_ALL);
+  vdup_i32(o, -1, topk * bt);
+  for (int32_t j = 0; j < nc; ++j) {
+    cu[j] = bs[j];
+  }
+
+  int32_t idx = 0;
+  if (topk > 0) BUCKET_RANK(i0->aligned + i0->offset)
+  if (topk > 1) BUCKET_RANK(i1->aligned + i1->offset)
+  if (topk > 2) BUCKET_RANK(i2->aligned + i2->offset)
+  if (topk > 3) BUCKET_RANK(i3->aligned + i3->offset)
+  if (topk > 4) BUCKET_RANK(i4->aligned + i4->offset)
+  if (topk > 5) BUCKET_RANK(i5->aligned + i5->offset)
+  if (topk > 6) BUCKET_RANK(i6->aligned + i6->offset)
+  if (topk > 7) BUCKET_RANK(i7->aligned + i7->offset)
+}
+}

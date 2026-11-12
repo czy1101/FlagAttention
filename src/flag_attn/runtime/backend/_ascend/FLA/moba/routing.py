@@ -20,6 +20,8 @@ import torch
 import triton
 import triton.language as tl
 
+from . import routes_raw
+
 _PREFIX_SCAN_BLOCK = 1024
 
 
@@ -1784,6 +1786,326 @@ def _compact_routes_torch(
     )
 
 
+# ---------------------------------------------------------------------------
+# Linear-time route compaction
+# ---------------------------------------------------------------------------
+# The blocked builder above is O(num_experts * seqlen): every token block is
+# rescanned once per expert, so its cost grows quadratically with the sequence
+# (measured: 18.6 ms at S=4096, 91 s at S=262144, i.e. 52%-98% of end-to-end).
+#
+# The builder below touches every route slot exactly once.  Route slots are
+# grouped into (token tile, head, chunk) cells, where a tile is
+# `_route_tile_size()` tokens:
+#
+#   1. `counts[b, h, c]` - route slots of tile `b` of head `h` that select `c`;
+#   2. prefix sums       - per-cell tile-local run start `start`,
+#                          global compact base `base`, expert offsets;
+#   3. out_ids / pos     - per (tile, head) the slots reordered by chunk (one
+#                          contiguous run per cell) and the compact position of
+#                          every slot;
+#   4. inverse kernel    - expand the runs into `query_indices` with
+#                          uniform-base contiguous loads and stores only.
+#
+# The result keeps the exact meaning of the blocked builder, so the attention
+# and merge kernels are untouched:
+#   `query_indices[p]` = packed query row `t * num_heads + h` of compact
+#   position `p`, `route_positions[r, t * num_heads + h]` = `p`.
+import os as _os
+
+_ROUTE_LINEAR = _os.environ.get("MOBA_ROUTES_LINEAR", "1") != "0"
+_ROUTE_RAW = _os.environ.get("MOBA_ROUTES_RAW", "1") != "0"
+_ROUTE_TILE_TOKENS = 1024
+_ROUTE_TILE_TOKENS_MAX = 4096
+_ROUTE_INVERSE_BLOCK = 32
+_ROUTE_INVERSE_CELLS = 32
+_ROUTE_LINEAR_MIN_SEQLEN = 0
+
+
+def _route_tile_size(seqlen: int, num_chunks: int, topk: int) -> int:
+    """Tokens per bucket tile.
+
+    The tile governs the number of cells (and therefore the inverse pass
+    overhead) as well as the average run length, `topk * tile / num_chunks`.
+    Aim for ~32 slots per cell, capped by the raw-kernel UB budget and by the
+    sequence length itself.
+    """
+    target = max(1, 32 * num_chunks // max(topk, 1))
+    tile = _ROUTE_TILE_TOKENS
+    while tile < target and tile < _ROUTE_TILE_TOKENS_MAX and tile * 2 <= seqlen:
+        tile *= 2
+    return min(tile, max(seqlen, 1))
+
+
+@triton.jit(do_not_specialize=["num_tokens", "num_chunks", "tiles"])
+def _route_counts_cell_kernel(
+    selected_ptr,
+    counts_ptr,
+    num_tokens,
+    num_chunks,
+    tiles,
+    num_heads: tl.constexpr,
+    TOPK: tl.constexpr,
+    TILE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """`counts[(b * num_heads + h) * num_chunks + c]` for one (tile, head)."""
+    pid = tl.program_id(0)
+    head = pid % num_heads
+    tile = pid // num_heads
+    cell = pid * num_chunks
+    slots_per_rank = num_heads * num_tokens
+    first = tile * TILE
+    for rank in tl.static_range(TOPK):
+        base = rank * slots_per_rank + head * num_tokens + first
+        for k in range(0, tl.cdiv(TILE, BLOCK)):
+            offs = k * BLOCK + tl.arange(0, BLOCK)
+            mask = (first + offs) < num_tokens
+            chunk = tl.load(selected_ptr + base + offs, mask=mask, other=-1)
+            tl.atomic_add(
+                counts_ptr + cell + chunk, 1, mask=mask & (chunk >= 0), sem="relaxed"
+            )
+
+
+def _route_cell_counts(selected_chunks, tile, num_chunks):
+    """Fill `counts[b, h, c]` (int32) for every (tile, head, chunk) cell."""
+    topk, num_heads, seqlen = selected_chunks.shape
+    n_blocks = cdiv(seqlen, tile)
+    device = selected_chunks.device
+    counts = torch.zeros(
+        (n_blocks * num_heads * num_chunks,), device=device, dtype=torch.int32
+    )
+    block = 256
+    _route_counts_cell_kernel[_capped_grid(n_blocks * num_heads)](
+        selected_chunks,
+        counts,
+        seqlen,
+        num_chunks,
+        n_blocks,
+        num_heads=num_heads,
+        TOPK=topk,
+        TILE=tile,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return counts.view(n_blocks, num_heads, num_chunks)
+
+
+@triton.jit(do_not_specialize=["num_groups", "num_cells", "num_chunks", "tile_slots"])
+def _route_inverse_kernel(
+    counts_ptr,
+    base_ptr,
+    start_ptr,
+    out_ids_ptr,
+    query_ptr,
+    num_groups,
+    num_cells,
+    num_chunks,
+    tile_slots,
+    BLOCK: tl.constexpr,
+    CELLS: tl.constexpr,
+):
+    """`query_indices[base + j] = row` for every cell run (contiguous copies).
+
+    `out_ids` already holds the packed query row (`t * num_heads + h`) of every
+    bucketed slot, so expanding a cell is a masked 1-D copy at two uniform
+    runtime bases.  The cell loop is a *static* unroll: on this backend that is
+    what hides the DMA latency (measured 6.96 -> 4.37 ns/cell at S=65536, and
+    73.6 -> 7.95 ns/cell at S=4096, where per-cell launch/latency dominates).
+    """
+    pid = tl.program_id(0)
+    stride = tl.num_programs(0)
+    off = tl.arange(0, BLOCK)
+    iters = (num_groups - pid + stride - 1) // stride
+    for g in range(0, iters):
+        first = (pid + g * stride) * CELLS
+        for i in tl.static_range(0, CELLS):
+            cell = first + i
+            if cell < num_cells:
+                count = tl.load(counts_ptr + cell)
+                cell_base = tl.load(base_ptr + cell)
+                run_start = tl.load(start_ptr + cell)
+                run = out_ids_ptr + (cell // num_chunks) * tile_slots + run_start
+                mask = off < count
+                row = tl.load(run + off, mask=mask, other=0)
+                tl.store(query_ptr + cell_base + off, row, mask=mask)
+                extra = count - BLOCK
+                if extra > 0:
+                    for k in range(1, (count + BLOCK - 1) // BLOCK):
+                        offs = k * BLOCK + off
+                        mask_k = offs < count
+                        row_k = tl.load(run + offs, mask=mask_k, other=0)
+                        tl.store(query_ptr + cell_base + offs, row_k, mask=mask_k)
+
+
+def _route_inverse_expand(counts3, base3, start3, out_ids):
+    """Compact position -> packed query row, from the per-cell runs."""
+    n_blocks, num_heads, num_chunks = counts3.shape
+    tile_slots = out_ids.shape[1]
+    device = counts3.device
+    query_indices = torch.empty(
+        (out_ids.shape[0] * tile_slots,), device=device, dtype=torch.int32
+    )
+    num_cells = counts3.numel()
+    cells = _ROUTE_INVERSE_CELLS
+    num_groups = cdiv(num_cells, cells)
+    _route_inverse_kernel[_capped_grid(num_groups)](
+        counts3.reshape(-1),
+        base3.reshape(-1),
+        start3.reshape(-1),
+        out_ids,
+        query_indices,
+        num_groups,
+        num_cells,
+        num_chunks,
+        tile_slots,
+        BLOCK=_ROUTE_INVERSE_BLOCK,
+        CELLS=cells,
+        num_warps=4,
+    )
+    return query_indices
+
+
+def _route_bucket_tiles_torch(selected_chunks, start3, base3, tile):
+    """Reference bucket pass (slow; the raw kernel mirrors it exactly)."""
+    topk, num_heads, seqlen = selected_chunks.shape
+    n_blocks, _, num_chunks = start3.shape
+    device = selected_chunks.device
+    tile_slots = topk * tile
+    rows = torch.arange(tile, device=device, dtype=torch.int64)
+    ranks = torch.arange(topk, device=device, dtype=torch.int64)
+    keys = torch.arange(tile_slots, device=device, dtype=torch.int64)
+    sentinel = (num_chunks + 1) * tile_slots
+    out_ids = torch.full(
+        (n_blocks * num_heads, tile_slots), -1, device=device, dtype=torch.int32
+    )
+    positions = torch.full(
+        (topk, num_heads * seqlen), -1, device=device, dtype=torch.int32
+    )
+    flat_positions = positions.view(-1)
+    for b in range(n_blocks):
+        first = b * tile
+        width = min(tile, seqlen - first)
+        for h in range(num_heads):
+            chunk_ids = selected_chunks[:, h, first:first + width].to(torch.int64)
+            if width < tile:
+                pad = torch.full((topk, tile - width), -1, device=device,
+                                 dtype=torch.int64)
+                chunk_ids = torch.cat((chunk_ids, pad), dim=1)
+            slots = (
+                ranks[:, None] * (num_heads * seqlen)
+                + (first + rows)[None, :] * num_heads + h
+            )
+            slots = torch.where(
+                rows[None, :] < width, slots, ranks[:, None] * (num_heads * seqlen)
+            )
+            flat_ids = chunk_ids.reshape(-1)
+            valid = flat_ids >= 0
+            key = torch.where(valid, flat_ids * tile_slots + keys, sentinel)
+            order = torch.argsort(key)
+            keep = valid[order]
+            if not bool(keep.any().item()):
+                continue
+            order = order[keep]
+            chunk_of = flat_ids[order]
+            slot_of = slots.reshape(-1)[order]
+            run_start = start3[b, h].to(torch.int64)[chunk_of]
+            inside = torch.arange(order.numel(), device=device) - run_start
+            out_ids[b * num_heads + h].index_copy_(
+                0, run_start + inside, (slot_of % (num_heads * seqlen)).to(torch.int32)
+            )
+            flat_positions.index_copy_(
+                0, slot_of, (base3[b, h].to(torch.int64)[chunk_of] + inside).to(torch.int32)
+            )
+    return out_ids, positions
+
+
+def _route_expert_layout(counts3):
+    """Expert-major offsets and per-cell compact bases from cell counts."""
+    n_blocks, num_heads, num_chunks = counts3.shape
+    device = counts3.device
+    # Tile-local exclusive prefix over chunks: the run start inside a tile.
+    start3 = torch.cumsum(counts3, -1, dtype=torch.int32) - counts3
+    # Expert ids are `chunk * num_heads + head`; `counts3` is head-major, so the
+    # sums are transposed once (8 MB, negligible next to the route arrays).
+    expert_counts = (
+        counts3.sum(0).transpose(0, 1).reshape(-1).contiguous()
+    )
+    expert_offsets = torch.empty(
+        (expert_counts.numel() + 1,), device=device, dtype=torch.int32
+    )
+    expert_offsets[0] = 0
+    torch.cumsum(expert_counts, 0, dtype=torch.int32, out=expert_offsets[1:])
+    offsets_hc = (
+        expert_offsets[:-1]
+        .view(num_chunks, num_heads)
+        .transpose(0, 1)
+        .reshape(-1)
+        .contiguous()
+    )
+    flat_counts = counts3.reshape(n_blocks, num_heads * num_chunks)
+    base3 = (
+        torch.cumsum(flat_counts, 0, dtype=torch.int32)
+        - flat_counts
+        + offsets_hc[None, :]
+    )
+    return start3, base3.view(n_blocks, num_heads, num_chunks), expert_counts, expert_offsets
+
+
+def _compact_routes_linear(
+    selected_chunks: torch.Tensor,
+    num_experts: int,
+    num_heads: int,
+    seqlen: int,
+    chunk_ends: torch.Tensor | None = None,
+):
+    """O(topk * num_heads * seqlen) route compaction (see the banner above)."""
+    del chunk_ends  # cells are visited once, so the causal pruning is moot
+    topk, heads_dim, num_tokens = selected_chunks.shape
+    if heads_dim != num_heads:
+        raise ValueError("selected_chunks head dimension does not match num_heads")
+    num_chunks = num_experts // num_heads
+    device = selected_chunks.device
+    if selected_chunks.dtype != torch.int32:
+        selected_chunks = selected_chunks.to(torch.int32)
+    selected_chunks = selected_chunks.contiguous()
+    use_raw = _ROUTE_RAW
+
+    counts3 = None
+    if use_raw:
+        counts3 = routes_raw.route_cell_hist(selected_chunks, num_chunks)
+    if counts3 is None:
+        tile = _route_tile_size(num_tokens, num_chunks, topk)
+        counts3 = _route_cell_counts(selected_chunks, tile, num_chunks)
+    start3, base3, expert_counts, expert_offsets = _route_expert_layout(counts3)
+
+    bucketed = None
+    if use_raw:
+        bucketed = routes_raw.route_cell_bucket(selected_chunks, start3, base3)
+    if bucketed is None:
+        tile = num_tokens // counts3.shape[0]
+        bucketed = _route_bucket_tiles_torch(selected_chunks, start3, base3, tile)
+    out_rows, positions = bucketed
+    query_indices = _route_inverse_expand(counts3, base3, start3, out_rows)
+    return query_indices, positions, expert_counts, expert_offsets
+
+
+def _compact_routes(
+    selected_chunks: torch.Tensor,
+    num_experts: int,
+    num_heads: int,
+    seqlen: int,
+    chunk_ends: torch.Tensor | None = None,
+):
+    """Route compaction entry point (linear builder by default)."""
+    if _ROUTE_LINEAR:
+        return _compact_routes_linear(
+            selected_chunks, num_experts, num_heads, seqlen, chunk_ends
+        )
+    return _compact_routes_fast(
+        selected_chunks, num_experts, num_heads, seqlen, chunk_ends
+    )
+
+
 @triton.jit
 def _descriptor_counts_kernel(
     expert_counts_ptr,
@@ -1892,7 +2214,7 @@ def _build_sparse_routes_triton(
         route_positions,
         expert_counts,
         expert_offsets,
-    ) = _compact_routes_fast(selected_chunks, num_experts, num_heads, seqlen, chunk_ends)
+    ) = _compact_routes(selected_chunks, num_experts, num_heads, seqlen, chunk_ends)
     max_count = int(expert_counts.max().item())
     num_routes = int(expert_offsets[-1].item())
     return (
@@ -1921,7 +2243,7 @@ def _build_sparse_routes_device_triton(
         route_positions,
         expert_counts,
         expert_offsets,
-    ) = _compact_routes_fast(selected_chunks, num_experts, num_heads, seqlen, chunk_ends)
+    ) = _compact_routes(selected_chunks, num_experts, num_heads, seqlen, chunk_ends)
     block = 256
     descriptor_counts = torch.empty((num_experts,), device=device, dtype=torch.int32)
     descriptor_offsets = torch.empty((num_experts + 1,), device=device, dtype=torch.int32)
