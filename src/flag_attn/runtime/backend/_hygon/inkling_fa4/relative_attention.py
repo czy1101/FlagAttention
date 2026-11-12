@@ -711,6 +711,3 @@ def inkling_fa4_rel_attention(
         f"unknown Hygon Inkling FA4 backend={selected!r}; "
         "choose from auto, hygon, or triton"
     )
-
-
-__all__ = ["inkling_fa4_rel_attention", "inkling_fa4_rel_attention_triton"]
