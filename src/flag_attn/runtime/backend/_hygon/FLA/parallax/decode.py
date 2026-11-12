@@ -529,6 +529,3 @@ def parallax_decode(
         scale=qk_scale,
         out=out,
     )
-
-
-__all__ = ["HAS_TLE", "parallax_attn_with_kvcache", "parallax_decode"]
