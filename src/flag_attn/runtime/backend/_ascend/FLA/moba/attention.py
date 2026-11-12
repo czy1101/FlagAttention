@@ -928,6 +928,10 @@ def _fused_merge_softmax_kernel(
             )
 
 
+#: Tokens of one head merged per program (see the row-tiling note below).
+_MERGE_ROWS_PER_PROGRAM = 64
+
+
 def _fused_merge_softmax_triton(
     self_out: torch.Tensor,
     self_lse: torch.Tensor,
@@ -950,11 +954,12 @@ def _fused_merge_softmax_triton(
     num_tokens = num_rows // num_heads
     block_d = min(128, triton.next_power_of_2(head_dim))
     num_d_blocks = cdiv(head_dim, block_d)
-    # Head-major row tiling: one program merges 64 tokens of one head.  It both
-    # keeps the launch under the Ascend 65535-program limit for benchmark
-    # shapes (one token row per program would need num_tokens * num_heads) and
-    # turns the routed row gather into a nearly sequential access pattern.
-    rows_per_program = 64
+    # Head-major row tiling: one program merges `_MERGE_ROWS_PER_PROGRAM` tokens
+    # of one head.  It both keeps the launch under the Ascend 65535-program
+    # limit for benchmark shapes (one token row per program would need
+    # num_tokens * num_heads) and turns the routed row gather into a nearly
+    # sequential access pattern.
+    rows_per_program = _MERGE_ROWS_PER_PROGRAM
     num_token_blocks = cdiv(num_tokens, rows_per_program)
     num_programs = num_token_blocks * num_heads
 

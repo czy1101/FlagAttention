@@ -1817,6 +1817,10 @@ _ROUTE_RAW = _os.environ.get("MOBA_ROUTES_RAW", "1") != "0"
 _ROUTE_TILE_TOKENS = 1024
 _ROUTE_TILE_TOKENS_MAX = 4096
 _ROUTE_INVERSE_BLOCK = 32
+# Cells expanded per program (static unroll).  S=4096 measured 32 -> 2.99 ms vs
+# 64 -> 2.88 ms for the whole route builder, but the largest shape measured
+# 2336 ms at 32 against 2489 ms at 64 within run-to-run spread, so the original
+# value is kept.
 _ROUTE_INVERSE_CELLS = 32
 _ROUTE_LINEAR_MIN_SEQLEN = 0
 
