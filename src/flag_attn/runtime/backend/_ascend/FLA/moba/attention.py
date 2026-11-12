@@ -654,10 +654,18 @@ def _routed_gqa_attn_fwd_kernel(
     CHUNK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    TILES: tl.constexpr,
     DESCRIPTOR_OFFSET,
 ):
+    """Routed attention for one descriptor = up to ``TILES * BLOCK_M`` route rows.
+
+    Each descriptor covers route rows of a *single* (chunk, head) expert, so the
+    K/V tile of that chunk is loaded once and reused by all ``TILES`` row tiles.
+    That cuts the routed-attention K/V traffic by ``TILES`` (the previous
+    one-descriptor-per-64-rows form reloaded the same 128x128 K/V once per 64
+    rows: ~1.07 GB at S=4096, i.e. 32x the expert-major minimum).
+    """
     descriptor = tl.program_id(0) + DESCRIPTOR_OFFSET
     expert = tl.load(descriptor_experts_ptr + descriptor)
     if expert < 0:
@@ -672,61 +680,77 @@ def _routed_gqa_attn_fwd_kernel(
     sequence_start = tl.load(cu_seqlens_ptr + batch)
     key_start = sequence_start + local_chunk * CHUNK_SIZE
 
-    offs_m = tl.arange(0, BLOCK_M)
-    route_positions = route_start + offs_m
-    mask_m = route_positions < expert_end
-    flat_query_indices = tl.load(query_indices_ptr + route_positions, mask=mask_m, other=0)
-    query_tokens = flat_query_indices // NUM_Q_HEADS
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < HEAD_DIM
-    q = tl.load(
-        q_ptr + query_tokens[:, None] * stride_q_t + q_head * stride_q_h + offs_d[None, :] * stride_q_d,
-        mask=mask_m[:, None] & mask_d[None, :],
-        other=0.0,
+    offs_n = tl.arange(0, CHUNK_SIZE)
+    kv_ptrs = (
+        (key_start + offs_n[:, None]) * stride_k_t
+        + kv_head * stride_k_h
+        + offs_d[None, :] * stride_k_d
     )
-
-    row_max = tl.full([BLOCK_M], -float("inf"), tl.float32)
-    row_sum = tl.zeros([BLOCK_M], tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+    k_values = tl.load(k_ptr + kv_ptrs, mask=mask_d[None, :], other=0.0)
+    v_ptrs = (
+        (key_start + offs_n[:, None]) * stride_v_t
+        + kv_head * stride_v_h
+        + offs_d[None, :] * stride_v_d
+    )
+    v_values = tl.load(v_ptr + v_ptrs, mask=mask_d[None, :], other=0.0)
+    kt = tl.trans(k_values)
+    valid_n = offs_n < CHUNK_SIZE
     scale_log2 = softmax_scale * _LOG2E
-    for n_start in tl.range(0, CHUNK_SIZE, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < CHUNK_SIZE
-        k_values = tl.load(
-            k_ptr + (key_start + offs_n[:, None]) * stride_k_t + kv_head * stride_k_h + offs_d[None, :] * stride_k_d,
-            mask=mask_n[:, None] & mask_d[None, :],
-            other=0.0,
-        )
-        scores = tl.dot(q, tl.trans(k_values), out_dtype=tl.float32) * scale_log2
-        valid = mask_m[:, None] & mask_n[None, :]
-        scores = tl.where(valid, scores, -float("inf"))
-        block_max = tl.max(scores, axis=1)
-        new_max = tl.maximum(row_max, block_max)
-        alpha = tl.exp2(row_max - new_max)
-        probabilities = tl.exp2(scores - new_max[:, None])
-        probabilities = tl.where(valid, probabilities, 0.0)
-        row_sum = row_sum * alpha + tl.sum(probabilities, axis=1)
-        acc *= alpha[:, None]
-        v_values = tl.load(
-            v_ptr + (key_start + offs_n[:, None]) * stride_v_t + kv_head * stride_v_h + offs_d[None, :] * stride_v_d,
-            mask=mask_n[:, None] & mask_d[None, :],
-            other=0.0,
-        )
-        acc += tl.dot(probabilities.to(v_values.dtype), v_values, out_dtype=tl.float32)
-        row_max = new_max
 
-    acc /= row_sum[:, None]
-    # Route row ids reach topk * tokens * heads (7 * 524288 * 16 at the largest
-    # benchmark shape), so ``row * head_dim`` overflows int32; the output row
-    # offset is therefore computed in int64.
-    route_rows_out = route_positions.to(tl.int64)
-    tl.store(
-        out_ptr + route_rows_out[:, None] * stride_out_t + offs_d[None, :] * stride_out_d,
-        acc,
-        mask=mask_m[:, None] & mask_d[None, :],
-    )
-    lse = (row_max + tl.log2(row_sum)) / _LOG2E
-    tl.store(lse_ptr + route_positions, lse, mask=mask_m)
+    offs_m = tl.arange(0, BLOCK_M)
+    for tile in tl.static_range(TILES):
+        route_positions = route_start + tile * BLOCK_M + offs_m
+        mask_m = route_positions < expert_end
+        if route_start + tile * BLOCK_M < expert_end:
+            flat_query_indices = tl.load(
+                query_indices_ptr + route_positions, mask=mask_m, other=0
+            )
+            query_tokens = flat_query_indices // NUM_Q_HEADS
+            q = tl.load(
+                q_ptr
+                + query_tokens[:, None] * stride_q_t
+                + q_head * stride_q_h
+                + offs_d[None, :] * stride_q_d,
+                mask=mask_m[:, None] & mask_d[None, :],
+                other=0.0,
+            )
+            scores = tl.dot(q, kt, out_dtype=tl.float32) * scale_log2
+            valid = mask_m[:, None] & valid_n[None, :]
+            scores = tl.where(valid, scores, -float("inf"))
+            row_max = tl.max(scores, axis=1)
+            probabilities = tl.exp2(scores - row_max[:, None])
+            probabilities = tl.where(valid, probabilities, 0.0)
+            row_sum = tl.sum(probabilities, axis=1)
+            acc = tl.dot(
+                probabilities.to(v_values.dtype), v_values, out_dtype=tl.float32
+            )
+            acc /= row_sum[:, None]
+            route_rows_out = route_positions.to(tl.int64)
+            tl.store(
+                out_ptr
+                + route_rows_out[:, None] * stride_out_t
+                + offs_d[None, :] * stride_out_d,
+                acc,
+                mask=mask_m[:, None] & mask_d[None, :],
+            )
+            lse = (row_max + tl.log2(row_sum)) / _LOG2E
+            tl.store(lse_ptr + route_positions, lse, mask=mask_m)
+
+
+#: Route rows covered by one routed-attention descriptor (= route rows whose
+#: K/V tile is reused).  Four 64-row tiles are what the UB budget allows:
+#: K + V (2 x 32 KiB bf16) + one Q tile + scores + accumulator.
+_ROUTED_TILES = 4
+
+
+def _routed_rows_per_descriptor(head_dim: int, device: torch.device) -> int:
+    """Route rows per descriptor for the routed attention (K/V reuse width)."""
+    block_m = _attention_launch_config(head_dim, device)[0]
+    if head_dim > 128 or device.type != "npu":
+        return block_m
+    return block_m * _ROUTED_TILES
 
 
 def _routed_sparse_attention_triton(
@@ -746,6 +770,8 @@ def _routed_sparse_attention_triton(
     group_size = num_q_heads // num_kv_heads
     head_dim = q.shape[2]
     block_m, block_n, block_d, num_warps, num_stages = _attention_launch_config(head_dim, q.device)
+    rows_per_descriptor = _routed_rows_per_descriptor(head_dim, q.device)
+    tiles = max(1, rows_per_descriptor // block_m)
     route_out = torch.empty((query_indices.numel(), head_dim), device=q.device, dtype=q.dtype)
     route_lse = torch.empty((query_indices.numel(),), device=q.device, dtype=torch.float32)
     num_descriptors = descriptor_experts.numel()
@@ -779,8 +805,8 @@ def _routed_sparse_attention_triton(
             CHUNK_SIZE=chunk_size,
             HEAD_DIM=head_dim,
             BLOCK_M=block_m,
-            BLOCK_N=block_n,
             BLOCK_D=block_d,
+            TILES=tiles,
             DESCRIPTOR_OFFSET=descriptor_offset,
             num_warps=num_warps,
             num_stages=num_stages,

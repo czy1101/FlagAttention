@@ -18,6 +18,7 @@ import torch
 
 from .attention import (
     _attention_launch_config,
+    _routed_rows_per_descriptor,
     _fused_merge_softmax_triton,
     _routed_sparse_attention_triton,
     _triton_varlen_backward,
@@ -330,7 +331,7 @@ def _moba_attn_varlen_inference(
         max_chunks_per_sequence,
         historical_topk,
     )
-    block_m = _attention_launch_config(head_dim, q.device)[0]
+    block_m = _routed_rows_per_descriptor(head_dim, q.device)
     bytes_per_rank = seqlen * num_q_heads * head_dim * q.element_size()
     ranks_per_pass = max(
         1,
