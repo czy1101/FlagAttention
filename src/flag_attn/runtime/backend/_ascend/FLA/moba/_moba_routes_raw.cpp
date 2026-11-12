@@ -112,9 +112,11 @@ __aiv__ void _mlir_ciface_moba_routes_bucket(
 
   pipe_barrier(PIPE_ALL);
   vdup_i32(o, -1, topk * bt);
+  pipe_barrier(PIPE_ALL);   // the fill is async; order it before the scalar loop
   for (int32_t j = 0; j < nc; ++j) {
     cu[j] = bs[j];
   }
+  pipe_barrier(PIPE_ALL);
 
   int32_t idx = 0;
   if (topk > 0) BUCKET_RANK(i0->aligned + i0->offset)
