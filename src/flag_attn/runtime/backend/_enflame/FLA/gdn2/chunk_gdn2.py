@@ -468,7 +468,7 @@ def chunk_gdn2_fwd_intra_infer(
         K=K,
         V=V,
         BT=BT,
-        BK=_S60_INTRA_BK,
+        BK=64 if K == 64 else _S60_INTRA_BK,
         BV=_S60_INTRA_BV,
         GRID_MODE=grid_mode,
         num_warps=_S60_INTRA_NUM_WARPS,
