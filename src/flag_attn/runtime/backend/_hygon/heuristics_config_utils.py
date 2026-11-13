@@ -19,4 +19,13 @@ HEURISTICS_CONFIGS = {
         "default": {"join_reductions_max_rows": 1024},
         "by_sm_count": {},
     },
+    "parallax": {
+        "default": {
+            "forward_shared_memory_bytes": 232448,
+            "decode_min_split_kv_len": 512,
+            "decode_target_waves": 2,
+            "decode_merge_min_kv_tiles_per_split": 1,
+        },
+        "by_sm_count": {},
+    },
 }

@@ -30,17 +30,13 @@ The implementation has two forward-only paths:
 from __future__ import annotations
 
 import math
-import os
-from functools import lru_cache
 
 import torch
 import triton
 import triton.language as tl
 
-from flag_attn.runtime.backend._hygon.FLA.parallax.compat import (
-    get_num_sms,
-    is_cuda_graph_capturing,
-)
+from flag_attn.runtime.backend._hygon.device_info import get_sm_count
+from flag_attn.runtime.backend._hygon.heuristics_config_utils import HEURISTICS_CONFIGS
 
 # Kept as an import-compatibility flag; this Decode implementation uses Triton
 # language primitives and does not require TLE.
@@ -48,10 +44,15 @@ HAS_TLE = False
 # Triton 3.6 rejects ordinary Python globals referenced by @triton.jit.  This
 # must be an instantiated tl.constexpr (a type annotation is not sufficient).
 _LOG2E = tl.constexpr(1.4426950408889634)
-_BLOCK_N: int = 128
-_MAX_SPLITS: int = 32
-_NUM_WARPS: int = 4
-_NUM_STAGES: int = 3
+_PARALLAX_HEURISTICS = HEURISTICS_CONFIGS.get("parallax", {})
+_DECODE_HEURISTICS = _PARALLAX_HEURISTICS.get("default", {})
+
+
+def _is_cuda_graph_capturing() -> bool:
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except (AssertionError, RuntimeError):
+        return False
 
 
 @triton.jit
@@ -271,23 +272,29 @@ def _parallax_decode_merge_kernel(
     tl.store(out + i_bh * K + offs_d, result, mask=mask_d)
 
 
-@lru_cache(maxsize=None)
-def _env_choice(name: str, default: int, choices: tuple[int, ...]) -> int:
-    value = int(os.environ.get(name, default))
-    if value not in choices:
-        allowed = ", ".join(str(choice) for choice in choices)
-        raise ValueError(f"{name} must be one of {{{allowed}}}, got {value}")
-    return value
+def _launch_config(kv_len: int, head_dim: int) -> tuple[int, ...]:
+    """Read the curated Hygon decode launch from the backend tuning file."""
+    del kv_len, head_dim
+    from flag_attn.runtime import get_tuned_config
 
+    def first(name):
+        configs = get_tuned_config(name)
+        return configs[0] if configs else None
 
-def _launch_config(kv_len: int, head_dim: int) -> tuple[int, int, int, int]:
-    """Select a shape-aware default while retaining explicit tuning overrides."""
-    default_block_n = _BLOCK_N
-    block_n = _env_choice("PARALLAX_DECODE_BLOCK_N", default_block_n, (64, 128))
-    num_warps = _env_choice("PARALLAX_DECODE_NUM_WARPS", _NUM_WARPS, (2, 4, 8))
-    num_stages = _env_choice("PARALLAX_DECODE_NUM_STAGES", _NUM_STAGES, (1, 2, 3, 4))
-    max_splits = _env_choice("PARALLAX_DECODE_MAX_SPLITS", _MAX_SPLITS, (8, 16, 32, 64))
-    return block_n, num_warps, num_stages, max_splits
+    single = first("_parallax_decode_kernel")
+    split = first("_parallax_decode_split_kernel")
+    merge = first("_parallax_decode_merge_kernel")
+    meta = single.kwargs if single else {}
+    return (
+        int(meta.get("BN", 128)),
+        (single.num_warps if single else None) or 4,
+        (single.num_stages if single else None) or 3,
+        int(meta.get("MAX_SPLITS", 32)),
+        (split.num_warps if split else None) or 4,
+        (split.num_stages if split else None) or 3,
+        (merge.num_warps if merge else None) or 4,
+        (merge.num_stages if merge else None) or 1,
+    )
 
 
 def _choose_num_splits(
@@ -297,20 +304,20 @@ def _choose_num_splits(
     block_n: int,
     max_splits: int,
 ) -> int:
-    """Choose enough split CTAs to fill an under-occupied GPU."""
-    override = os.environ.get("PARALLAX_DECODE_SPLITS")
+    """Split long scans only when the extra merge launch can fill idle CUs."""
+    del device_index
     num_blocks = triton.cdiv(kv_len, block_n)
-    if override is not None:
-        requested = int(override)
-        if requested < 1:
-            raise ValueError("PARALLAX_DECODE_SPLITS must be >= 1")
-        return min(requested, num_blocks, max_splits)
-    # Keep a single CTA/head for short caches; splitting adds a merge launch.
-    if kv_len < 512 or batch_heads >= get_num_sms(device_index):
+    num_sms = get_sm_count()
+    min_kv_len = int(_DECODE_HEURISTICS.get("decode_min_split_kv_len", 512))
+    target_waves = int(_DECODE_HEURISTICS.get("decode_target_waves", 2))
+    min_tiles_per_split = int(
+        _DECODE_HEURISTICS.get("decode_merge_min_kv_tiles_per_split", 1)
+    )
+    if kv_len < min_kv_len or num_sms <= 0 or batch_heads >= num_sms:
         return 1
-    # Aim for two waves, capped so every split owns at least one KV tile.
-    requested = triton.cdiv(2 * get_num_sms(device_index), batch_heads)
-    return max(1, min(requested, num_blocks, max_splits))
+    requested = triton.cdiv(target_waves * num_sms, batch_heads)
+    split_limit = num_blocks // max(min_tiles_per_split, 1)
+    return max(1, min(requested, split_limit, max_splits))
 
 
 _WORKSPACE_CACHE: dict[tuple, tuple[torch.Tensor, ...]] = {}
@@ -376,7 +383,7 @@ def _validate_inputs(
             raise ValueError(f"seqused_k must be int32 with shape ({B},)")
         if not seqused_k.is_cuda or seqused_k.device != q.device:
             raise ValueError("seqused_k must be on the same CUDA device as q")
-        if not is_cuda_graph_capturing():
+        if not _is_cuda_graph_capturing():
             lo = int(seqused_k.min().item())
             hi = int(seqused_k.max().item())
             if lo < 1 or hi > L:
@@ -435,7 +442,7 @@ def parallax_attn_with_kvcache(
     result = torch.empty_like(q) if out is None else out
     BK = triton.next_power_of_2(D)
     batch_heads = B * HQ
-    block_n, num_warps, num_stages, max_splits = _launch_config(L, D)
+    block_n, num_warps, num_stages, max_splits, split_warps, split_stages, merge_warps, merge_stages = _launch_config(L, D)
     device_index = q.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
@@ -488,8 +495,8 @@ def parallax_attn_with_kvcache(
         BK=BK,
         BN=block_n,
         NUM_SPLITS=num_splits,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=split_warps,
+        num_stages=split_stages,
     )
     _parallax_decode_merge_kernel[(batch_heads,)](
         pm,
@@ -502,8 +509,8 @@ def parallax_attn_with_kvcache(
         BK=BK,
         NUM_SPLITS=num_splits,
         BSPLIT=triton.next_power_of_2(num_splits),
-        num_warps=4,
-        num_stages=1,
+        num_warps=merge_warps,
+        num_stages=merge_stages,
     )
     return result
 

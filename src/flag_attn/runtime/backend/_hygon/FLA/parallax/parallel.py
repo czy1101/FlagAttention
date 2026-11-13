@@ -16,9 +16,10 @@ import triton
 import triton.language as tl
 
 from flag_attn.runtime.backend._hygon.FLA.index import prepare_chunk_indices
-from flag_attn.runtime.backend._hygon.FLA.parallax.compat import (
-    get_num_sms,
-    has_shared_memory,
+from flag_attn.runtime.backend._hygon.heuristics_config_utils import HEURISTICS_CONFIGS
+from flag_attn.runtime.backend._hygon.device_info import (
+    get_max_shared_memory,
+    get_sm_count,
 )
 from flag_attn.runtime.backend._hygon.FLA.utils import input_guard
 
@@ -30,7 +31,10 @@ def exp2(x):
 
 def _block_size(head_dim: int, device_index: int) -> int:
     # Dense and variable-length paths share BT so chunk_indices stay consistent.
-    if has_shared_memory(232_448, device_index):
+    del device_index
+    config = HEURISTICS_CONFIGS.get("parallax", {}).get("default", {})
+    required_shared_memory = int(config.get("forward_shared_memory_bytes", 232_448))
+    if get_max_shared_memory() >= required_shared_memory:
         return 64 if head_dim <= 128 else 32
     return 64
 
@@ -2091,7 +2095,7 @@ def parallel_parallax_bwd(
     BT = _block_size(K, q.device.index)
     NQ = triton.cdiv(T, BT)
     dkv_programs = (len(chunk_indices) if cu_seqlens is not None else NQ) * B * H
-    num_sms = get_num_sms(q.device.index)
+    num_sms = get_sm_count()
     group_dkv_heads = G in (4, 8) or (G == 2 and (cu_seqlens is not None or T > 8192))
     use_grouped_dkv = (
         group_dkv_heads
