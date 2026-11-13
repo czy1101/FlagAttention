@@ -111,6 +111,14 @@ CASES = (
         D=64,
         scale=0.1,
     ),
+    ParallaxCase(
+        name="dense-B1-T513-H2-HQ4-D64-tail",
+        B=1,
+        T=513,
+        H=2,
+        HQ=4,
+        D=64,
+    ),
     # Sliding-window causal.
     ParallaxCase(
         name="window-B1-T63-H1-HQ1-D64-W16",

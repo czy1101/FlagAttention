@@ -2135,6 +2135,10 @@ def parallel_parallax_fwd(q, r, k, v, scale, cu_seqlens=None, chunk_indices=None
     G = HQ // H
     BK = triton.next_power_of_2(K)
     BT = _BLOCK_T
+    if (cu_seqlens is None and window_size_left < 0 and q.dtype == torch.bfloat16
+            and K == 64 and T >= 512):
+        # Reuse each K/V tile across more query rows on S60.
+        BT = 128
     o = torch.empty_like(q)
     barv = torch.empty_like(q)
     stats = torch.empty((3, B, T, HQ), device=q.device, dtype=torch.float32)
