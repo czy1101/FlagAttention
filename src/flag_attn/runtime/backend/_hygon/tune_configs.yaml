@@ -79,3 +79,17 @@ _fused_attnres_fwd_kernel:
   - META: {}
     num_warps: 4
     num_stages: 2
+
+# Curated launch settings for the Hygon forgetting-attention kernels.
+_forgetting_attention_fwd:
+  - META: {BLOCK_M: 64, BLOCK_N: 32}
+    num_warps: 4
+    num_stages: 1
+_forgetting_attention_decode:
+  - META: {BLOCK_N: 128}
+    num_warps: 4
+    num_stages: 1
+_forgetting_attention_search:
+  - META: {}
+    num_warps: 1
+    num_stages: 1
