@@ -1,34 +1,5 @@
-"""
-Implementation of Forgetting Attention.
+"""Hygon Triton implementation of Forgetting Attention."""
 
-Our code is adapted from https://github.com/FlagOpen/FlagAttention/blob/ee91638dec6da8c00c4113d179f469e0ffcd5852/src/flag_attn/flash.py. The code is modified to implement Forgetting Attention.
-
-The original license info from FlagAttention:
-
-Copyright 2023 BAAI
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
-# Unoptimized Triton ACP reference, not a dense PyTorch implementation.
-# Forward code is copied from zhixuan-lin/forgetting-transformer:
-# commit 883f260c636e87971339749b0d8310004794a5cc
-# src/forgetting_transformer/ops/forgetting_attention.py
-# Original complete source SHA256:
-# 6a71b9ebef4dbfaf489ca32fb4ad32ed51a3dc474b6d681c21ddf026eef1b5d2
-# This forward-only extraction retains the original forward operations and
-# launch configuration. Loads use .ca for legal 4/8/16-byte async copies.
-# Backward and standalone upstream tests are excluded.
 import math
 from collections import defaultdict
 from typing import Literal, Optional, Union
@@ -41,11 +12,9 @@ from einops import rearrange
 from flag_attn.runtime import get_tuned_config
 from flag_attn.runtime.backend._hygon.heuristics_config_utils import get_heuristics_config
 
-OFFICIAL_COMMIT = "883f260c636e87971339749b0d8310004794a5cc"
 
 def maybe_contiguous(x):
-    # only when the inner most dimension is contiguous can LDGSTS be used
-    # so inner-dimension contiguity is enforced.
+    # Keep the input layout; kernels use the provided tensor strides.
     return x
 
 class ForgettingAttention(torch.autograd.Function):
@@ -98,14 +67,13 @@ class ForgettingAttention(torch.autograd.Function):
         if adaptive_threshold is not None:
             if isinstance(adaptive_threshold, str):
                 assert adaptive_threshold == "auto", f'adaptive_threshold must be either the string "auto", a float, or a Tensor, but got {adaptive_threshold}.'
-                # Otherwise we could calculate the max L2 norms manually
                 max_q_norm = torch.linalg.vector_norm(q, dim=-1).max(dim=-1).values
                 max_k_norm = torch.linalg.vector_norm(k, dim=-1).max(dim=-1).values
                 assert max_q_norm.size() == max_k_norm.size() == (B, H)
 
                 logit_upper_bound = max_q_norm * max_k_norm * sm_scale
                 tolerance = -10
-                # Note we should use N instead of M here
+                # Use the KV sequence length in the logarithmic bound.
                 adaptive_threshold = -(2 * logit_upper_bound + math.log(N)) + tolerance
 
             adaptive_threshold = torch.as_tensor(adaptive_threshold, dtype=torch.float, device=q.device)
@@ -126,9 +94,7 @@ class ForgettingAttention(torch.autograd.Function):
         log_fgate = log_fgate.float()
         if has_seq_start:
             log_fgate = log_fgate.clone()
-            # We absolutely don't want masked value to affect result. If we
-            # don't do this then it could via affecting numerical precision of
-            # cumsum
+            # Keep masked positions at zero so they do not affect the prefix sum.
             mask_index = (torch.arange(N, device=q.device)[None, None, :] < seq_start[:, None, None])
             mask_index = torch.broadcast_to(mask_index, log_fgate.size())
             log_fgate[mask_index] = 0.0
@@ -151,10 +117,9 @@ class ForgettingAttention(torch.autograd.Function):
         assert (not larger_m), "The key/value tensors must be longer than the query tensor"
 
 
-        # contiguity
         q, k, v = maybe_contiguous(q), maybe_contiguous(k), maybe_contiguous(v)
 
-        # to work around https://github.com/openai/triton/issues/2441
+        # Launch under the device context associated with the query tensor.
         device = torch.cuda.device_of(q)
 
         with torch.cuda.device(device):
@@ -171,10 +136,10 @@ class ForgettingAttention(torch.autograd.Function):
             divisible_n = N % BLOCK_N == 0
 
 
-            # Short-query workloads have at most two query tiles. Fuse their
-            # threshold-start search into the attention CTA to avoid a launch
-            # and scratch tensor. Keep the original scan kernel for longer M:
-            # independent searches there would repeat too much work.
+            # Fuse threshold search into the attention CTAs for short and
+            # moderate queries, avoiding a separate launch and scratch tensor.
+            # Use the serial search kernel for longer queries, where independent
+            # per-tile searches add too much work.
             can_fuse_start_index = (
                 adaptive_threshold is not None
                 and not record_find_index_time
@@ -198,8 +163,8 @@ class ForgettingAttention(torch.autograd.Function):
                     (B, H, triton.cdiv(M, BLOCK_M)), dtype=torch.long, device=q.device
                 )
             else:
-                # START_INDEX is not read when IS_ADAPTIVE is false or when its
-                # value is computed inline by the fused short-query path.
+                # START_INDEX is unused when adaptation is disabled or the
+                # start index is computed inside the attention kernel.
                 start_index = q
             if adaptive_threshold is not None and not fuse_start_index:
                 if record_find_index_time:
@@ -211,9 +176,9 @@ class ForgettingAttention(torch.autograd.Function):
                     and query_tiles
                     <= int(heuristics.get("fused_binary_start_max_query_tiles", 16))
                 ):
-                    # The original search CTA handles every query tile for a
-                    # head serially. For a modest number of tiles, distribute
-                    # those independent lower-bound searches across the grid.
+                    # The serial search kernel processes query tiles one by
+                    # one. For a small number of tiles, launch one independent
+                    # lower-bound search per tile.
                     _find_start_index_parallel_kernel[(query_tiles, H, B)](
                         log_lambda,
                         start_index,
@@ -248,9 +213,6 @@ class ForgettingAttention(torch.autograd.Function):
                     ForgettingAttention.info[record_time_key]["fwd_find_index_time"] += elapsed
                     ForgettingAttention.info[record_time_key]["fwd_find_index_count"] += 1
 
-            # Actual forward
-            # consider using 3d grid to avoid div & rem
-            # grid = (triton.cdiv(M, BLOCK_M), H, B)
             def grid(META):
                 return (triton.cdiv(M, META["BLOCK_M"]), H, B)
             o = torch.empty_like(q)
@@ -283,7 +245,6 @@ class ForgettingAttention(torch.autograd.Function):
                 num_warps=num_warps, num_stages=num_stages,
             )
 
-        # autograd context maintenance
         if return_log_normalizer:
             ctx.save_for_backward(q, k, v, o, L, log_lambda, seq_start, adaptive_threshold)
         else:
@@ -328,13 +289,13 @@ def _forgetting_attention_impl(
     adaptive_threshold: Optional[Union[Literal["auto"], float, torch.Tensor]] = None,
 ):
     """
-    A FlashAttention-based implementation of Forgetting Attention.
+    A tiled Triton implementation of Forgetting Attention.
 
     Note:
     - q, k, v should be in bfloat16/float16 and log_fgate should be in float32.
     - We only support seqlen_q <= seqlen_k
     - We only support causal attention
-    - Head dimension must be in one of {16, 32, 64, 128}
+    - Head dimension must be in one of {16, 32, 60, 64, 100, 128}
 
     Arguments:
         - q: (batch_size, seqlen_q, num_heads, head_dim) unless head_first=True.
@@ -474,7 +435,6 @@ def _fwd_kernel(
 
     # load q
     if DIVISIBLE_M:
-        # .ca permits 4/8-byte async loads too; .cg requires 16-byte copies.
         if DIVISIBLE_D:
             q = tl.load(q_ptrs, cache_modifier=".ca")
         else:
@@ -540,7 +500,7 @@ def _fwd_kernel(
                     log_lambda_in_start = tl.load(LOG_LAMBDA + offset_n * stride_log_lambda_n)
                     decay = log_lambda_out_start - log_lambda_in_start
         else:
-            # No need to multiple start_m by BLOCK_M here
+            # The start-index buffer has one entry per query tile.
             START_INDEX += off_z * stride_start_index_z + off_h * stride_start_index_h + start_m * stride_start_index_mb
             start_index = tl.load(START_INDEX)
         lo = tl.maximum(start_index, lo)
@@ -575,7 +535,6 @@ def _fwd_kernel(
             log_lambda_in = tl.load(log_lambda_in_ptrs, mask=mask_n, cache_modifier=".ca")
 
         # -- compute qk ---
-        # s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if BLOCK_M > 1:
             s = tl.dot(q, k, input_precision="ieee") * qk_scale
         else:
@@ -598,11 +557,11 @@ def _fwd_kernel(
         alpha = tl.math.exp2((m_i - m_i_new))
         p = tl.math.exp2(s - m_i_new[:, None])
 
-        # -- compute partial sumexpn before applying dropout
+        # Sum the unnormalized attention weights for the row normalization.
         p_sum = tl.sum(p, 1)
 
 
-        # -- scale and update acc: acc *= alpha[:, None]--
+        # Rescale the previous accumulator before adding this block.
         acc *= alpha[:, None]
         if BLOCK_M > 1:
             acc += tl.dot(p.to(input_dtype), v, input_precision="ieee")
