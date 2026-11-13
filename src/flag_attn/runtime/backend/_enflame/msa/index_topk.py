@@ -86,6 +86,21 @@ _REDUCTION_ROW_TILE = 8
 _REDUCTION_ROW_MAX_BLOCKS = 512
 
 
+def _batched_reduction_rows(
+    topk: int,
+    max_blocks: int,
+    batch: int,
+    num_heads: int,
+) -> bool:
+    """Whether the dense reduction TopK uses batched query rows per program."""
+    return (
+        0 < topk <= 4
+        and max_blocks <= _REDUCTION_ROW_MAX_BLOCKS
+        and batch <= 255
+        and num_heads <= 255
+    )
+
+
 def _select_prefill_topk_path(
     score: torch.Tensor,
     topk: int,
@@ -948,12 +963,7 @@ def minimax_m3_index_topk(
     # by that factor and amortizes per-program overhead without changing the
     # selection, tie-break or -1 padding semantics.  Wide block counts keep the
     # original per-row path to bound the live FP32 tile.
-    if (
-        0 < topk <= 4
-        and max_blocks <= _REDUCTION_ROW_MAX_BLOCKS
-        and batch <= 255
-        and num_heads <= 255
-    ):
+    if _batched_reduction_rows(topk, max_blocks, batch, num_heads):
         row_tile = _REDUCTION_ROW_TILE
         _prefill_topk_rows_enflame[(triton.cdiv(max_query_len, row_tile), batch, num_heads)](
             score,
