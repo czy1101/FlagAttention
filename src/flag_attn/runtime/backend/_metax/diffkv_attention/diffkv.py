@@ -17,9 +17,9 @@
 
 ``api.py`` owns the public input contract and workspace allocation. This module
 selects launch configurations and implements paged QK, online softmax, PV, and
-split-KV reduction, with optimized and fallback Triton paths.
+split-KV reduction using standard Triton.
 
-Both optimized and fallback paths use standard Triton.
+
 """
 
 from __future__ import annotations
@@ -37,12 +37,11 @@ import triton.language as tl
 from .api import (
     DEFAULT_BLOCK_SIZE as _DEFAULT_BLOCK_SIZE,
     LAUNCH as _LAUNCH,
-    OPTIMIZED_HEAD_SIZE_QK as _OPTIMIZED_HEAD_SIZE_QK,
-    OPTIMIZED_HEAD_SIZE_V as _OPTIMIZED_HEAD_SIZE_V,
+    HEAD_SIZE_QK as _HEAD_SIZE_QK,
+    HEAD_SIZE_V as _HEAD_SIZE_V,
     RESOURCE as _RESOURCE,
     SUPPORTED_PATHS as _SUPPORTED_PATHS,
     WORKLOAD as _WORKLOAD,
-    SUPPORTED_BACKENDS as _SUPPORTED_BACKENDS,
 )
 
 # -----------------------------------------------------------------------------
@@ -83,9 +82,7 @@ def cast_indices(source):
 # -----------------------------------------------------------------------------
 
 DiffKVPath = Literal["2d", "3d"]
-DiffKVBackend = Literal["auto", "optimized", "triton"]
 
-_BACKEND_ENV: Final = "FLAG_ATTN_DIFFKV_BACKEND"
 _AUTOTUNE_ENV: Final = "FLAG_ATTN_DIFFKV_AUTOTUNE"
 _FALSE_VALUES: Final = frozenset(("0", "false", "off", "no"))
 _TRUE_VALUES: Final = frozenset(("1", "true", "on", "yes"))
@@ -111,47 +108,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return default
 
 
-def _requested_backend() -> str:
-    requested = os.environ.get(_BACKEND_ENV, "auto").strip().lower()
-    if requested not in _SUPPORTED_BACKENDS:
-        raise ValueError(
-            "FLAG_ATTN_DIFFKV_BACKEND must be one of auto, optimized, triton; "
-            f"got {requested!r}"
-        )
-    return requested
-
-
-REQUESTED_BACKEND = _requested_backend()
-
-
-
-def _default_backend() -> str:
-    """Use the ported optimized algorithm unless standard fallback is explicit."""
-    return "triton" if REQUESTED_BACKEND == "triton" else "optimized"
-
-
-SELECTED_BACKEND = _default_backend()
-
-
-
-
-
-
-def get_diffkv_backend_info() -> dict[str, str | bool | None]:
-    """Return the backend decision made before the first Triton launch."""
-    return {
-        "requested": REQUESTED_BACKEND,
-        "selected": SELECTED_BACKEND,
-    }
-
-
 @lru_cache(maxsize=8)
 # -----------------------------------------------------------------------------
 # Device information and launch-policy utilities
 # -----------------------------------------------------------------------------
 
 def _get_num_sms(device_index: int) -> int:
-    """Cache the device property used by the optimized Triton launch policy."""
+    """Cache the device property used by the Triton launch policy."""
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
@@ -165,29 +128,19 @@ def _device_num_sms(device: torch.device) -> int:
 # Autotune is opt-in because these decode kernels are short enough that the
 # Autotuner wrapper's dispatch overhead is visible in end-to-end timings.
 _DIFFKV_AUTOTUNE = _env_flag(_AUTOTUNE_ENV)
-_OPTIMIZED_MAIN_AUTOTUNE_CONFIGS = [
+_MAIN_AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=2, num_stages=2),
     triton.Config({}, num_warps=4, num_stages=3),
     triton.Config({}, num_warps=8, num_stages=4),
     triton.Config({}, num_warps=4, num_stages=5),
 ]
-_OPTIMIZED_REDUCER_AUTOTUNE_CONFIGS = [
+_REDUCER_AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=1, num_stages=3),
     triton.Config({}, num_warps=2, num_stages=3),
 ]
-_FALLBACK_AUTOTUNE_CONFIGS = [
-    triton.Config({}, num_warps=2, num_stages=2),
-    triton.Config({}, num_warps=4, num_stages=3),
-    triton.Config({}, num_warps=8, num_stages=4),
-]
-_FALLBACK_REDUCER_AUTOTUNE_CONFIGS = [
-    triton.Config({}, num_warps=1, num_stages=2),
-    triton.Config({}, num_warps=2, num_stages=3),
-    triton.Config({}, num_warps=4, num_stages=3),
-]
 
 
-def _reset_optimized_autotune_state(kwargs, reset_only=False):
+def _reset_autotune_state(kwargs, reset_only=False):
     """Reset fused completion state before each optional autotune trial."""
     del reset_only
     if kwargs.get("FUSED_REDUCER", False):
@@ -197,7 +150,7 @@ def _reset_optimized_autotune_state(kwargs, reset_only=False):
 # ---------------------------------------------------------------------------
 # Triton helper functions
 # ---------------------------------------------------------------------------
-def _optimized_workload_class(max_seqlen_k: int | None) -> str | None:
+def _workload_class(max_seqlen_k: int | None) -> str | None:
     """Classify decode work by KV length for launch policy selection."""
     if max_seqlen_k is None:
         return None
@@ -221,7 +174,7 @@ def _medium_work_is_compact(
     """
     compact_tile_budget = 2 * _LAUNCH.fused_segments
     return (
-        _optimized_workload_class(max_seqlen_k) == "medium"
+        _workload_class(max_seqlen_k) == "medium"
         and max_seqlen_k is not None
         and tile_size is not None
         and tile_size > 0
@@ -265,18 +218,18 @@ def _has_softmax_buffers(
 
 
 def _validate_attention_inputs(q: torch.Tensor, causal: bool, sinks) -> None:
-    """Validate arguments shared by the optimized Triton and standard Triton launchers."""
+    """Validate the MetaX attention launch arguments."""
     if not causal:
         raise ValueError("only causal attention is supported")
     if sinks is not None and sinks.shape[0] != q.shape[1]:
         raise ValueError("sinks must have one value per query head")
 
 
-def _has_optimized_head_layout(head_size_qk: int, head_size_v: int) -> bool:
-    """Whether the optimized launch policies support this head layout."""
+def _has_head_layout(head_size_qk: int, head_size_v: int) -> bool:
+    """Whether the launch policies support this head layout."""
     return (
-        head_size_qk == _OPTIMIZED_HEAD_SIZE_QK
-        and head_size_v == _OPTIMIZED_HEAD_SIZE_V
+        head_size_qk == _HEAD_SIZE_QK
+        and head_size_v == _HEAD_SIZE_V
     )
 
 
@@ -485,10 +438,10 @@ def softmax_step(S, M, L):
 
 
 # -----------------------------------------------------------------------------
-# Optimized Triton scheduling policies
+# Triton scheduling policies
 # -----------------------------------------------------------------------------
 
-def should_use_optimized_fused_reducer(
+def should_use_fused_reducer(
     head_size_qk: int,
     head_size_v: int,
     max_seqlen_q: int,
@@ -498,10 +451,10 @@ def should_use_optimized_fused_reducer(
     use_3d: bool,
 ) -> bool:
     """Return whether the fused reducer supports the requested workload."""
-    workload = _optimized_workload_class(max_seqlen_k)
+    workload = _workload_class(max_seqlen_k)
     if not (
         use_3d
-        and _has_optimized_head_layout(head_size_qk, head_size_v)
+        and _has_head_layout(head_size_qk, head_size_v)
         and max_seqlen_q == 1
         and workload is not None
         and block_size == _DEFAULT_BLOCK_SIZE
@@ -515,7 +468,7 @@ def should_use_optimized_fused_reducer(
     # the counter, so enabling fusion would leave the output unfinalized.  The
     # regular reducer handles this case through its active-segment mask.
     fused_segments = _LAUNCH.fused_segments
-    tile_size = get_optimized_tile_size(use_3d, num_seqs, max_seqlen_k)
+    tile_size = get_tile_size(use_3d, num_seqs, max_seqlen_k)
     if (
         tile_size > block_size
         and max_seqlen_k is not None
@@ -541,7 +494,7 @@ def should_use_optimized_fused_reducer(
     return num_seqs <= 4 and _medium_work_is_compact(max_seqlen_k, tile_size)
 
 
-def should_split_optimized_decode_heads(
+def should_split_decode_heads(
     head_size_qk: int,
     head_size_v: int,
     max_seqlen_q: int,
@@ -564,11 +517,11 @@ def should_split_optimized_decode_heads(
     once the batch already provides useful parallelism.
     """
     num_queries_per_kv = num_query_heads // num_kv_heads
-    workload = _optimized_workload_class(max_seqlen_k)
+    workload = _workload_class(max_seqlen_k)
     if not (
         max_seqlen_q == 1
         and workload is not None
-        and _has_optimized_head_layout(head_size_qk, head_size_v)
+        and _has_head_layout(head_size_qk, head_size_v)
         and block_size == _DEFAULT_BLOCK_SIZE
         and num_queries_per_kv <= _LAUNCH.query_block_m
     ):
@@ -587,7 +540,7 @@ def should_split_optimized_decode_heads(
         projected_programs = num_seqs * num_kv_heads * split_factor
         return projected_programs <= max(num_sms // 2, num_kv_heads)
     return (
-        get_optimized_decode_split_block_m(
+        get_decode_split_block_m(
             head_size_qk=head_size_qk,
             head_size_v=head_size_v,
             max_seqlen_q=max_seqlen_q,
@@ -606,7 +559,7 @@ def should_split_optimized_decode_heads(
     )
 
 
-def get_optimized_decode_split_block_m(
+def get_decode_split_block_m(
     *,
     head_size_qk: int,
     head_size_v: int,
@@ -632,13 +585,13 @@ def get_optimized_decode_split_block_m(
 
     ``0`` means that the unsplit query-head group should be used.
     """
-    workload = _optimized_workload_class(max_seqlen_k)
+    workload = _workload_class(max_seqlen_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
     if not (
         use_3d
         and max_seqlen_q == 1
         and workload is not None
-        and _has_optimized_head_layout(head_size_qk, head_size_v)
+        and _has_head_layout(head_size_qk, head_size_v)
         and block_size == _DEFAULT_BLOCK_SIZE
         and num_sms is not None
         and num_sms > 0
@@ -678,7 +631,7 @@ def get_optimized_decode_split_block_m(
     return 0
 
 
-def get_optimized_reduce_num_warps(
+def get_reduce_num_warps(
     num_query_tokens: int,
     num_query_heads: int,
     num_sms: int,
@@ -687,7 +640,7 @@ def get_optimized_reduce_num_warps(
     return 2 if num_query_tokens * num_query_heads < num_sms else 1
 
 
-def get_optimized_main_num_warps(
+def get_main_num_warps(
     max_seqlen_k: int | None,
     num_seqs: int,
     use_3d: bool,
@@ -706,12 +659,12 @@ def get_optimized_main_num_warps(
         return _LAUNCH.fused_warps
     if split_heads and num_seqs == 1:
         return 8
-    if use_3d and _optimized_workload_class(max_seqlen_k) == "medium" and num_seqs >= 32:
+    if use_3d and _workload_class(max_seqlen_k) == "medium" and num_seqs >= 32:
         return 2
     return _LAUNCH.warps
 
 
-def should_use_async_optimized_reducer(
+def should_use_async_reducer(
     max_seqlen_k: int | None,
     num_query_tokens: int,
     num_query_heads: int,
@@ -730,7 +683,7 @@ def should_use_async_optimized_reducer(
     ):
         return False
     return (
-        _optimized_workload_class(max_seqlen_k) == "long"
+        _workload_class(max_seqlen_k) == "long"
         and num_segments > 1
         and num_query_tokens * num_query_heads
         < _RESOURCE.target_cta_waves_per_sm * max(num_sms, 1)
@@ -784,7 +737,7 @@ def get_num_par_softmax_segments(
     """Select the 3D split count from workload and resource descriptors."""
     if not use_3d:
         return 1
-    tile_size = get_optimized_tile_size(
+    tile_size = get_tile_size(
         use_3d,
         num_seqs,
         max_seqlen_k,
@@ -814,7 +767,7 @@ def get_num_par_softmax_segments(
     return 1
 
 
-def get_optimized_num_stages(
+def get_num_stages(
     max_seqlen_k: int | None,
     num_seqs: int,
     use_3d: bool,
@@ -822,14 +775,14 @@ def get_optimized_num_stages(
     tile_size: int | None = None,
     num_kv_heads: int | None = None,
 ) -> int:
-    """Select the optimized Triton software-pipeline depth from workload geometry.
+    """Select the Triton software-pipeline depth from workload geometry.
 
     The light short-2D path is selected from the number of active query/KV
     programs rather than a fixed batch-size exception.  This keeps the
     launch policy usable for different GQA ratios without accumulating one
     more historical ``batch <= N`` knob.
     """
-    workload = _optimized_workload_class(max_seqlen_k)
+    workload = _workload_class(max_seqlen_k)
     if (
         use_3d
         and max_seqlen_k is not None
@@ -870,7 +823,7 @@ def get_optimized_num_stages(
     return _LAUNCH.stages
 
 
-def get_optimized_tile_size(
+def get_tile_size(
     use_3d: bool,
     num_seqs: int,
     max_seqlen_k: int | None = None,
@@ -887,7 +840,7 @@ def get_optimized_tile_size(
     serial KV-loop work.  The thresholds are workload properties rather than
     GPU-specific shape tables.
     """
-    workload = _optimized_workload_class(max_seqlen_k)
+    workload = _workload_class(max_seqlen_k)
     has_geometry = (
         total_num_q_blocks is not None
         and num_kv_heads is not None
@@ -1000,10 +953,8 @@ def should_dedup_block_table(
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # These values are pure functions of compile-time launch arguments.  The
-# standard Triton fallback uses this heuristic layer, following the same
 # pattern as the GLA/MSA kernels: callers provide the real head dimensions and
 # the compiler receives the padded/vectorized dimensions as constexpr values.
-# This avoids duplicating ``next_power_of_2`` in the fallback launcher and
 # intentionally retain explicit constexpr arguments: with the current Triton
 # generated code and regresses several short 3D decode shapes.
 _HEAD_SIZE_HEURISTICS = {
@@ -1015,7 +966,6 @@ _HEAD_SIZE_HEURISTICS = {
     ),
     # BLOCK_Q is fully determined by the query-head tile and GQA group.  Keep
     # this derivation in the compiler specialization instead of duplicating
-    # another shape branch in the fallback launcher.
     "BLOCK_Q": lambda args: max(
         1, args["BLOCK_M"] // args["num_queries_per_kv"]
     ),
@@ -1747,423 +1697,13 @@ def kernel_reduce_segments_diffkv_async(
 
 
 
-# ---- Inlined synchronous Triton fallback -------------------------------
-@triton.heuristics(values=_HEAD_SIZE_HEURISTICS)
-@triton.jit
-def _fallback_kernel_unified_attention_diffkv(
-    # Output destinations.  In 2D mode we write the final result into
-    # ``output_ptr``; in 3D mode we write per-segment partials into
-    # ``segm_*`` and ``output_ptr`` is unused (callers may pass any
-    # non-null pointer).
-    output_ptr,
-    segm_output_ptr,
-    segm_max_ptr,
-    segm_expsum_ptr,
-    query_ptr,
-    key_cache_ptr,  # view of packed cache: [..., :head_size_qk]
-    value_cache_ptr,  # view of packed cache: [..., head_size_qk:hqk+hv]
-    sink_ptr,
-    block_tables_ptr,
-    seq_lens_ptr,
-    alibi_slopes_ptr,
-    scale,
-    softcap,
-    num_query_heads: tl.constexpr,
-    num_queries_per_kv: tl.constexpr,
-    block_table_stride: tl.int64,
-    query_stride_0: tl.int64,
-    query_stride_1: tl.int64,  # == HEAD_SIZE_QK
-    output_stride_0: tl.int64,
-    output_stride_1: tl.int64,  # == HEAD_SIZE_V
-    BLOCK_SIZE: tl.constexpr,
-    TILE_SIZE: tl.constexpr,
-    HEAD_SIZE_QK: tl.constexpr,
-    HEAD_SIZE_QK_PADDED: tl.constexpr,
-    USE_SPLIT_QK: tl.constexpr,
-    HEAD_SIZE_V: tl.constexpr,
-    HEAD_SIZE_V_PADDED: tl.constexpr,
-    USE_ALIBI_SLOPES: tl.constexpr,
-    USE_ALIBI_SQRT: tl.constexpr,
-    USE_SOFTCAP: tl.constexpr,
-    USE_SINKS: tl.constexpr,
-    SLIDING_WINDOW: tl.constexpr,
-    # Strides for both cache views (they share the same packed buffer, so
-    # dims 0/1/2 strides match; only the per-head extent differs).
-    stride_k_cache_0: tl.int64,
-    stride_k_cache_1: tl.int64,
-    stride_k_cache_2: tl.int64,
-    stride_k_cache_3: tl.constexpr,
-    stride_v_cache_0: tl.int64,
-    stride_v_cache_1: tl.int64,
-    stride_v_cache_2: tl.int64,
-    stride_v_cache_3: tl.constexpr,
-    query_start_len_ptr,
-    BLOCK_Q: tl.constexpr,
-    num_seqs: tl.int32,
-    BLOCK_M: tl.constexpr,
-    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
-    # ``IS_3D`` toggles between 2D layout (one program walks the full KV
-    # sequence) and 3D layout (split-KV / FlashDecoding-style: per-segm
-# programs write partials, finalized by the fallback reducer).
-    IS_3D: tl.constexpr,
-    # Decode has exactly one query token per sequence, so program axis 0 maps
-    # directly to the sequence without scanning packed-query boundaries.
-    IS_DECODE: tl.constexpr,
-    SPLIT_HEADS: tl.constexpr,
-    DEDUP_BLOCK_TABLE: tl.constexpr,
-):
-    q_block_global_idx = tl.program_id(0)
-    head_program_idx = tl.program_id(1)
-    split_factor = num_queries_per_kv // BLOCK_M if SPLIT_HEADS else 1
-    kv_head_idx = head_program_idx // split_factor
-    segm_idx = tl.program_id(2) if IS_3D else 0
-
-    if IS_DECODE:
-        seq_idx = q_block_global_idx
-        q_block_local_idx = 0
-        cur_batch_in_all_start_index = seq_idx
-        cur_batch_query_len = 1
-        seq_len = tl.load(seq_lens_ptr + seq_idx)
-    else:
-        (
-            seq_idx,
-            q_block_local_idx,
-            cur_batch_in_all_start_index,
-            cur_batch_query_len,
-            seq_len,
-        ) = resolve_seq_and_query_len(
-            query_start_len_ptr, seq_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q
-        )
-
-    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
-        return
-
-    if IS_3D:
-        tiles_per_segment = tl.cdiv(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
-        if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
-            return
-    else:
-        tiles_per_segment = 0
-
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_d_qk = tl.arange(0, HEAD_SIZE_QK_PADDED)
-    offs_d_v = tl.arange(0, HEAD_SIZE_V_PADDED)
-    offs_t = tl.arange(0, TILE_SIZE)
-    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
-
-    query_offset_0 = cur_batch_in_all_start_index + query_pos
-    query_offset_1 = (
-        kv_head_idx * num_queries_per_kv
-        + (head_program_idx % split_factor) * BLOCK_M
-        + offs_m
-        if SPLIT_HEADS
-        else kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
-    )
-    query_offset_base = (
-        query_offset_0[:, None] * query_stride_0
-        + query_offset_1[:, None] * query_stride_1
-    )
-
-    dim_mask_qk = tl.where(offs_d_qk < HEAD_SIZE_QK, 1, 0).to(tl.int1)
-    dim_mask_v = tl.where(offs_d_v < HEAD_SIZE_V, 1, 0).to(tl.int1)
-    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
-    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
-
-    # Q : (BLOCK_M, HEAD_SIZE_QK_PADDED).  The split layout avoids padding
-    # overhead for the supported 192-wide query head.
-    if USE_SPLIT_QK:
-        offs_d_qk_lo = tl.arange(0, 128)
-        offs_d_qk_hi = 128 + tl.arange(0, 64)
-        Q_lo = tl.load(
-            query_ptr + query_offset_base + offs_d_qk_lo[None, :],
-            mask=(offs_d_qk_lo < HEAD_SIZE_QK)[None, :]
-            & query_mask_0[:, None]
-            & query_mask_1[:, None],
-            other=0.0,
-        )
-        Q_hi = tl.load(
-            query_ptr + query_offset_base + offs_d_qk_hi[None, :],
-            mask=(offs_d_qk_hi < HEAD_SIZE_QK)[None, :]
-            & query_mask_0[:, None]
-            & query_mask_1[:, None],
-            other=0.0,
-        )
-    else:
-        query_offset = query_offset_base + offs_d_qk[None, :]
-        Q = tl.load(
-            query_ptr + query_offset,
-            mask=dim_mask_qk[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-            other=0.0,
-        )
-
-    block_table_offset = seq_idx * block_table_stride
-
-    M = init_softmax_M(
-        sink_ptr, query_offset_1, query_mask_1, segm_idx, BLOCK_M, USE_SINKS, IS_3D
-    )
-    L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
-    # acc : (BLOCK_M, HEAD_SIZE_V_PADDED)
-    acc = tl.zeros([BLOCK_M, HEAD_SIZE_V_PADDED], dtype=tl.float32)
-
-    context_len = seq_len - cur_batch_query_len
-
-    if USE_ALIBI_SLOPES:
-        alibi_slope = tl.load(
-            alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
-        )
-
-    loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
-        context_len,
-        seq_len,
-        cur_batch_query_len,
-        q_block_local_idx,
-        segm_idx,
-        tiles_per_segment,
-        TILE_SIZE,
-        BLOCK_M,
-        BLOCK_Q,
-        num_queries_per_kv,
-        SLIDING_WINDOW,
-        IS_3D,
-    )
-
-    for j in range(loop_lo, loop_hi):
-        seq_offset = j * TILE_SIZE + offs_t
-        tile_mask = seq_offset < max_seq_prefix_len
-
-        if DEDUP_BLOCK_TABLE and TILE_SIZE == 2 * BLOCK_SIZE:
-            # Broadcast page ids for two-page tiles instead of issuing one
-            # scalar page-table load per token lane.
-            table_idx = (j * TILE_SIZE) // BLOCK_SIZE
-            block_idx_0 = tl.load(
-                block_tables_ptr + block_table_offset + table_idx,
-                mask=j * TILE_SIZE < max_seq_prefix_len,
-                other=0,
-                cache_modifier=".ca",
-            ).to(tl.int64)
-            block_idx_1 = tl.load(
-                block_tables_ptr + block_table_offset + table_idx + 1,
-                mask=j * TILE_SIZE + BLOCK_SIZE < max_seq_prefix_len,
-                other=0,
-                cache_modifier=".ca",
-            ).to(tl.int64)
-            physical_block_idx = tl.where(
-                offs_t < BLOCK_SIZE, block_idx_0, block_idx_1
-            )
-        else:
-            physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-            ).to(tl.int64)
-
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d_v[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
-        k_offset_base = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
-        if USE_SPLIT_QK:
-            K_lo = tl.load(
-                key_cache_ptr
-                + k_offset_base
-                + offs_d_qk_lo[:, None] * stride_k_cache_3,
-                mask=tile_mask[None, :],
-                other=0.0,
-            ).to(Q_lo.dtype)
-            K_hi = tl.load(
-                key_cache_ptr
-                + k_offset_base
-                + offs_d_qk_hi[:, None] * stride_k_cache_3,
-                mask=tile_mask[None, :],
-                other=0.0,
-            ).to(Q_hi.dtype)
-        else:
-            k_offset = k_offset_base + offs_d_qk[:, None] * stride_k_cache_3
-            # K : (HEAD_SIZE_QK_PADDED, TILE_SIZE)
-            K_load = tl.load(
-                key_cache_ptr + k_offset,
-                mask=dim_mask_qk[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
-            K = K_load.to(Q.dtype)
-        # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask_v[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
-        V = V_load.to(Q_lo.dtype if USE_SPLIT_QK else Q.dtype)
-
-        query_abs_pos = context_len + query_pos[:, None]
-        seq_mask = compute_causal_kv_seq_mask(
-            query_abs_pos,
-            seq_offset,
-            SLIDING_WINDOW,
-        )
-
-        # S : (BLOCK_M, TILE_SIZE)
-        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_SPLIT_QK:
-            S += scale * tl.dot(Q_lo, K_lo)
-            S += scale * tl.dot(Q_hi, K_hi)
-        else:
-            S += scale * tl.dot(Q, K)
-
-        if USE_SOFTCAP:
-            S = apply_softcap(S, softcap)
-
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
-
-        if USE_ALIBI_SLOPES:
-            S = apply_alibi_to_score(
-                S, alibi_slope, seq_offset, context_len, query_pos, USE_ALIBI_SQRT
-            )
-
-        M, L, P, alpha = softmax_step(S, M, L)
-        acc = acc * alpha[:, None]
-
-        if SLIDING_WINDOW:
-            qpos_lo = q_block_local_idx * BLOCK_Q
-            V = tl.where(
-                (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW,
-                V,
-                0.0,
-            )
-        acc += tl.dot(P.to(V.dtype), V)
-
-    # ---- Epilogue --------------------------------------------------------
-    if IS_3D:
-        # Store per-segment partials; finalized by reduce_segments_diffkv.
-        segm_output_offset = (
-            query_offset_0[:, None].to(tl.int64)
-            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_V_PADDED)
-            + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_V_PADDED)
-            + segm_idx * HEAD_SIZE_V_PADDED
-            + tl.arange(0, HEAD_SIZE_V_PADDED)[None, :]
-        )
-        tl.store(
-            segm_output_ptr + segm_output_offset,
-            acc,
-            mask=dim_mask_v[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-        )
-        store_segm_reduce_scalars(
-            segm_max_ptr,
-            segm_expsum_ptr,
-            query_offset_0,
-            query_offset_1,
-            segm_idx,
-            M,
-            L,
-            query_mask_0,
-            query_mask_1,
-            num_query_heads,
-            NUM_SEGMENTS_PER_SEQ,
-        )
-    else:
-        acc = acc / L[:, None]
-        output_offset = (
-            query_offset_0[:, None] * output_stride_0
-            + query_offset_1[:, None] * output_stride_1
-            + offs_d_v[None, :]
-        )
-        tl.store(
-            output_ptr + output_offset,
-            acc,
-            mask=dim_mask_v[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-        )
 
 
-@triton.heuristics(values=_REDUCER_HEURISTICS)
-@triton.jit
-def _fallback_kernel_reduce_segments_diffkv(
-    output_ptr,  # [num_tokens, num_query_heads, head_size_v]
-    segm_output_ptr,
-    # [num_tokens, num_query_heads, max_num_segments, head_size_v]
-    segm_max_ptr,  # [num_tokens, num_query_heads, max_num_segments]
-    segm_expsum_ptr,  # [num_tokens, num_query_heads, max_num_segments]
-    seq_lens_ptr,  # [num_seqs]
-    num_seqs,
-    num_query_heads: tl.constexpr,
-    output_stride_0: tl.int64,
-    output_stride_1: tl.int64,  # == HEAD_SIZE_V
-    TILE_SIZE: tl.constexpr,
-    HEAD_SIZE_V: tl.constexpr,
-    HEAD_SIZE_V_PADDED: tl.constexpr,
-    query_start_len_ptr,  # [num_seqs+1]
-    BLOCK_Q: tl.constexpr,
-    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
-    IS_DECODE: tl.constexpr,
-):
-    """Combine per-segment partials into the final softmax output.
-
-    Mirrors ``reduce_segments`` from triton_unified_attention.py but
-    indexes V's head size (``HEAD_SIZE_V``) instead of the shared one.
-    """
-    query_token_idx = tl.program_id(0)
-    query_head_idx = tl.program_id(1)
-
-    if IS_DECODE:
-        seq_idx = query_token_idx
-    else:
-        seq_idx = find_seq_idx(
-            query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
-        )
-    seq_len = tl.load(seq_lens_ptr + seq_idx)
-
-    tiles_per_segment = tl.cdiv(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
-    act_num_segments = tl.cdiv(seq_len, tiles_per_segment * TILE_SIZE)
-    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
-        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
-    )
-    dim_mask = tl.where(tl.arange(0, HEAD_SIZE_V_PADDED) < HEAD_SIZE_V, 1, 0).to(
-        tl.int1
-    )
-
-    segm_offset = (
-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_head_idx * NUM_SEGMENTS_PER_SEQ
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
-    )
-    segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
-    overall_max = tl.max(segm_max)
-
-    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
-    overall_expsum = tl.sum(segm_expsum)
-
-    segm_output_offset = (
-        query_token_idx.to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_V_PADDED)
-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_V_PADDED)
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_V_PADDED
-        + tl.arange(0, HEAD_SIZE_V_PADDED)[None, :]
-    )
-    segm_output = tl.load(
-        segm_output_ptr + segm_output_offset,
-        mask=segm_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
-    segm_output *= tl.exp(segm_max - overall_max)[:, None]
-    acc_sum = tl.sum(segm_output, axis=0)
-    acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
-
-    output_offset = (
-        query_token_idx * output_stride_0
-        + query_head_idx * output_stride_1
-        + tl.arange(0, HEAD_SIZE_V_PADDED)
-    )
-    tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
 
 if _DIFFKV_AUTOTUNE:
     _kernel_diffkv_autotuned = triton.autotune(
-        configs=_OPTIMIZED_MAIN_AUTOTUNE_CONFIGS,
+        configs=_MAIN_AUTOTUNE_CONFIGS,
         key=[
             "HEAD_SIZE_QK",
             "HEAD_SIZE_V",
@@ -2173,38 +1713,20 @@ if _DIFFKV_AUTOTUNE:
             "SPLIT_HEADS",
             "FUSED_REDUCER",
         ],
-        pre_hook=_reset_optimized_autotune_state,
+        pre_hook=_reset_autotune_state,
     )(kernel_unified_attention_diffkv)
     _kernel_reduce_autotuned = triton.autotune(
-        configs=_OPTIMIZED_REDUCER_AUTOTUNE_CONFIGS,
+        configs=_REDUCER_AUTOTUNE_CONFIGS,
         key=["HEAD_SIZE_V", "NUM_SEGMENTS_PER_SEQ", "IS_DECODE"],
     )(kernel_reduce_segments_diffkv)
     _kernel_reduce_async_autotuned = triton.autotune(
-        configs=_OPTIMIZED_REDUCER_AUTOTUNE_CONFIGS,
+        configs=_REDUCER_AUTOTUNE_CONFIGS,
         key=["HEAD_SIZE_V", "NUM_SEGMENTS_PER_SEQ", "IS_DECODE"],
     )(kernel_reduce_segments_diffkv_async)
-    _fallback_kernel_autotuned = triton.autotune(
-        configs=_FALLBACK_AUTOTUNE_CONFIGS,
-        key=[
-            "HEAD_SIZE_QK",
-            "HEAD_SIZE_V",
-            "BLOCK_M",
-            "NUM_SEGMENTS_PER_SEQ",
-            "IS_3D",
-            "SPLIT_HEADS",
-            "DEDUP_BLOCK_TABLE",
-        ],
-    )(_fallback_kernel_unified_attention_diffkv)
-    _fallback_reduce_kernel_autotuned = triton.autotune(
-        configs=_FALLBACK_REDUCER_AUTOTUNE_CONFIGS,
-        key=["HEAD_SIZE_V", "NUM_SEGMENTS_PER_SEQ", "IS_DECODE"],
-    )(_fallback_kernel_reduce_segments_diffkv)
 else:
     _kernel_diffkv_autotuned = kernel_unified_attention_diffkv
     _kernel_reduce_autotuned = kernel_reduce_segments_diffkv
     _kernel_reduce_async_autotuned = kernel_reduce_segments_diffkv_async
-    _fallback_kernel_autotuned = _fallback_kernel_unified_attention_diffkv
-    _fallback_reduce_kernel_autotuned = _fallback_kernel_reduce_segments_diffkv
 
 
 # -----------------------------------------------------------------------------
@@ -2218,9 +1740,9 @@ def should_use_split_qk_diffkv(
     num_seqs: int,
     use_3d: bool,
 ) -> bool:
-    workload = _optimized_workload_class(max_seqlen_k)
+    workload = _workload_class(max_seqlen_k)
     return (
-        head_size_qk == _OPTIMIZED_HEAD_SIZE_QK
+        head_size_qk == _HEAD_SIZE_QK
         and max_seqlen_q == 1
         and workload is not None
         and (not use_3d or num_seqs <= 8 or num_seqs >= 16)
@@ -2256,7 +1778,7 @@ class _DiffKVLaunchConfig:
 # All inputs are scalar launch descriptors, so reuse the immutable result for
 # repeated decode calls instead of recomputing the policy on every invocation.
 @lru_cache(maxsize=128)
-def _select_optimized_launch_config(
+def _select_launch_config(
     *,
     head_size_qk: int,
     head_size_v: int,
@@ -2275,7 +1797,7 @@ def _select_optimized_launch_config(
     fused_reducer_available: bool,
 ) -> _DiffKVLaunchConfig:
     """Derive geometry and resource choices from one workload description."""
-    workload = _optimized_workload_class(max_seqlen_k)
+    workload = _workload_class(max_seqlen_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
     block_m = (
         _LAUNCH.query_block_m
@@ -2301,7 +1823,7 @@ def _select_optimized_launch_config(
         if is_decode and base_total_num_q_blocks > num_seqs
         else base_total_num_q_blocks
     )
-    base_tile_size = get_optimized_tile_size(
+    base_tile_size = get_tile_size(
         use_3d,
         num_seqs,
         max_seqlen_k,
@@ -2310,7 +1832,7 @@ def _select_optimized_launch_config(
         num_sms,
         num_query_heads,
     )
-    fused_reducer = fused_reducer_available and should_use_optimized_fused_reducer(
+    fused_reducer = fused_reducer_available and should_use_fused_reducer(
         head_size_qk,
         head_size_v,
         max_seqlen_q,
@@ -2319,7 +1841,7 @@ def _select_optimized_launch_config(
         block_size,
         use_3d,
     )
-    split_heads = is_decode and should_split_optimized_decode_heads(
+    split_heads = is_decode and should_split_decode_heads(
         head_size_qk,
         head_size_v,
         max_seqlen_q,
@@ -2340,7 +1862,7 @@ def _select_optimized_launch_config(
         elif not use_3d:
             block_m = _LAUNCH.split_head_block_m_3d
         else:
-            block_m = get_optimized_decode_split_block_m(
+            block_m = get_decode_split_block_m(
                 head_size_qk=head_size_qk,
                 head_size_v=head_size_v,
                 max_seqlen_q=max_seqlen_q,
@@ -2365,7 +1887,7 @@ def _select_optimized_launch_config(
     total_num_q_blocks = num_query_tokens // block_q + num_seqs
     use_decode_fastpath = is_decode
     launch_num_q_blocks = num_seqs if use_decode_fastpath else total_num_q_blocks
-    tile_size = get_optimized_tile_size(
+    tile_size = get_tile_size(
         use_3d,
         num_seqs,
         max_seqlen_k,
@@ -2403,7 +1925,7 @@ def _select_optimized_launch_config(
     loop_num_stages = (
         _LAUNCH.fused_stages
         if fused_reducer
-        else get_optimized_num_stages(
+        else get_num_stages(
             max_seqlen_k,
             num_seqs,
             use_3d,
@@ -2446,185 +1968,9 @@ def _select_optimized_launch_config(
 # ---------------------------------------------------------------------------
 # Backend launchers
 # ---------------------------------------------------------------------------
-def _unified_attention_diffkv_fallback(
-    q,  # [num_tokens, num_query_heads, head_size_qk]
-    k,  # view: [num_blocks, block_size, num_kv_heads, head_size_qk]
-    v,  # view: [num_blocks, block_size, num_kv_heads, head_size_v]
-    out,  # [num_tokens, num_query_heads, head_size_v]
-    cu_seqlens_q,
-    seqused_k,
-    softmax_scale,
-    causal,
-    window_size,
-    block_table,
-    softcap,
-    max_seqlen_q: int = 1,
-    alibi_slopes=None,
-    sinks=None,
-    use_alibi_sqrt=False,
-    # 3D / split-KV softmax buffers.  They are required when ``path="3d"``.
-    num_par_softmax_segments: int | None = None,
-    softmax_segm_output: torch.Tensor | None = None,
-    softmax_segm_max: torch.Tensor | None = None,
-    softmax_segm_expsum: torch.Tensor | None = None,
-    max_seqlen_k: int | None = None,
-    path: str = "2d",
-):
-    _validate_attention_inputs(q, causal, sinks)
-
-    use_alibi_slopes = alibi_slopes is not None
-
-    block_size = v.shape[1]
-    num_seqs = len(seqused_k)
-    num_query_heads = q.shape[1]
-    num_kv_heads = k.shape[2]
-    num_queries_per_kv = num_query_heads // num_kv_heads
-    head_size_qk = q.shape[2]
-    head_size_v = v.shape[3]
-    workload = _optimized_workload_class(max_seqlen_k)
-
-    BLOCK_M = (
-        _LAUNCH.query_block_m
-        if num_queries_per_kv <= _LAUNCH.query_block_m
-        else triton.next_power_of_2(num_queries_per_kv)
-    )
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
-    is_decode = max_seqlen_q == 1 and q.shape[0] == num_seqs
-    launch_num_q_blocks = num_seqs if is_decode else total_num_q_blocks
-
-    sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
-
-    use_3d = _resolve_3d_path(
-        path,
-        max_seqlen_q=max_seqlen_q,
-        num_par_softmax_segments=num_par_softmax_segments,
-        has_softmax_buffers=_has_softmax_buffers(
-            softmax_segm_output, softmax_segm_max, softmax_segm_expsum
-        ),
-    )
-
-    # Decode uses smaller tiles to expose KV parallelism; medium workloads
-    # can afford a wider tile when the grid already has enough CTAs.
-    tile_size = (
-        _LAUNCH.default_tile
-        if not use_3d
-        else (_LAUNCH.short_3d_tile if q.element_size() >= 2 else _LAUNCH.default_tile)
-    )
-    if use_3d and workload == "medium" and num_seqs >= 8:
-        tile_size = _LAUNCH.default_tile
-    fallback_split_qk = (
-        use_3d
-        and num_seqs <= 8
-        and workload == "medium"
-        and _has_optimized_head_layout(head_size_qk, head_size_v)
-    )
-    fallback_num_segments = num_par_softmax_segments
-    fallback_dedup_block_table = (
-        fallback_split_qk and tile_size == 2 * block_size
-    )
-
-    segm_output_ptr, segm_max_ptr, segm_expsum_ptr = _segment_pointers(
-        out,
-        use_3d,
-        softmax_segm_output,
-        softmax_segm_max,
-        softmax_segm_expsum,
-    )
-    grid: tuple[Any, ...]
-    if use_3d:
-        grid = (
-            launch_num_q_blocks,
-            num_kv_heads,
-            fallback_num_segments,
-        )
-        num_segments = fallback_num_segments
-    else:
-        grid = (launch_num_q_blocks, num_kv_heads)
-        num_segments = 1
-
-    _fallback_kernel_autotuned[grid](
-        output_ptr=out,
-        segm_output_ptr=segm_output_ptr,
-        segm_max_ptr=segm_max_ptr,
-        segm_expsum_ptr=segm_expsum_ptr,
-        query_ptr=q,
-        key_cache_ptr=k,
-        value_cache_ptr=v,
-        sink_ptr=sinks,
-        block_tables_ptr=block_table,
-        seq_lens_ptr=seqused_k,
-        alibi_slopes_ptr=alibi_slopes,
-        scale=softmax_scale,
-        softcap=softcap,
-        num_query_heads=num_query_heads,
-        num_queries_per_kv=num_queries_per_kv,
-        block_table_stride=block_table.stride(0),
-        query_stride_0=q.stride(0),
-        query_stride_1=q.stride(1),
-        output_stride_0=out.stride(0),
-        output_stride_1=out.stride(1),
-        BLOCK_SIZE=block_size,
-        TILE_SIZE=tile_size,
-        HEAD_SIZE_QK=head_size_qk,
-        USE_SPLIT_QK=fallback_split_qk,
-        HEAD_SIZE_V=head_size_v,
-        USE_ALIBI_SLOPES=use_alibi_slopes,
-        USE_ALIBI_SQRT=use_alibi_sqrt,
-        USE_SOFTCAP=(softcap > 0),
-        USE_SINKS=(sinks is not None),
-        SLIDING_WINDOW=sliding_window_val,
-        stride_k_cache_0=k.stride(0),
-        stride_k_cache_1=k.stride(1),
-        stride_k_cache_2=k.stride(2),
-        stride_k_cache_3=k.stride(3),
-        stride_v_cache_0=v.stride(0),
-        stride_v_cache_1=v.stride(1),
-        stride_v_cache_2=v.stride(2),
-        stride_v_cache_3=v.stride(3),
-        query_start_len_ptr=cu_seqlens_q,
-        BLOCK_Q=BLOCK_Q,
-        num_seqs=num_seqs,
-        BLOCK_M=BLOCK_M,
-        NUM_SEGMENTS_PER_SEQ=num_segments,
-        IS_3D=use_3d,
-        IS_DECODE=is_decode,
-        SPLIT_HEADS=False,
-        DEDUP_BLOCK_TABLE=fallback_dedup_block_table,
-    )
-
-    if use_3d:
-        # Use fewer warps for the compact reduction tile.
-        reduce_num_warps = (
-            2 if workload == "medium" and num_seqs >= 8
-            else 1 if workload == "short" and num_seqs >= 8
-            else 4
-        )
-        reducer_kwargs = {}
-        if not _DIFFKV_AUTOTUNE:
-            reducer_kwargs["num_warps"] = reduce_num_warps
-        _fallback_reduce_kernel_autotuned[(q.shape[0], num_query_heads)](
-            output_ptr=out,
-            segm_output_ptr=softmax_segm_output,
-            segm_max_ptr=softmax_segm_max,
-            segm_expsum_ptr=softmax_segm_expsum,
-            seq_lens_ptr=seqused_k,
-            num_seqs=num_seqs,
-            num_query_heads=num_query_heads,
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
-            TILE_SIZE=tile_size,
-            HEAD_SIZE_V=head_size_v,
-            query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
-            NUM_SEGMENTS_PER_SEQ=num_segments,
-            IS_DECODE=is_decode,
-            **reducer_kwargs,
-        )
 
 
-def _unified_attention_diffkv_optimized(
+def _unified_attention_diffkv(
     q,  # [num_tokens, num_query_heads, head_size_qk]
     k,  # view: [num_blocks, block_size, num_kv_heads, head_size_qk]
     v,  # view: [num_blocks, block_size, num_kv_heads, head_size_v]
@@ -2674,7 +2020,7 @@ def _unified_attention_diffkv_optimized(
         path == "3d" and is_decode and num_par_softmax_segments == 1
         and 0 < sliding_window_val <= 128
     )
-    launch = _select_optimized_launch_config(
+    launch = _select_launch_config(
         head_size_qk=head_size_qk,
         head_size_v=head_size_v,
         max_seqlen_q=max_seqlen_q,
@@ -2712,7 +2058,7 @@ def _unified_attention_diffkv_optimized(
     main_kernel_kwargs = {}
     if not _DIFFKV_AUTOTUNE:
         main_kernel_kwargs = {
-            "num_warps": get_optimized_main_num_warps(
+            "num_warps": get_main_num_warps(
                 max_seqlen_k,
                 num_seqs,
                 use_3d,
@@ -2728,7 +2074,7 @@ def _unified_attention_diffkv_optimized(
         and not fuse_reducer
         and sliding_window_val == 0
         and num_seqs >= 32
-        and _optimized_workload_class(max_seqlen_k) == "medium"
+        and _workload_class(max_seqlen_k) == "medium"
     ):
         main_kernel_kwargs["num_warps"] = 4
     # C550 Full 3D: two warps improve the measured tile-32 path.
@@ -2817,7 +2163,7 @@ def _unified_attention_diffkv_optimized(
         )
 
     if use_3d and not fuse_reducer and not direct_single:
-        use_async_reducer = should_use_async_optimized_reducer(
+        use_async_reducer = should_use_async_reducer(
             max_seqlen_k,
             q_shape[0],
             num_query_heads,
@@ -2831,7 +2177,7 @@ def _unified_attention_diffkv_optimized(
         )
         reducer_kwargs = {}
         if not _DIFFKV_AUTOTUNE:
-            reducer_kwargs["num_warps"] = get_optimized_reduce_num_warps(
+            reducer_kwargs["num_warps"] = get_reduce_num_warps(
                 q_shape[0], num_query_heads, num_sms
             )
         reduce_kernel.run(grid=(q_shape[0], num_query_heads), warmup=False,
@@ -2853,19 +2199,3 @@ def _unified_attention_diffkv_optimized(
             IS_DECODE=use_decode_fastpath,
             **reducer_kwargs,
         )
-
-
-__all__ = [
-    "DiffKVBackend",
-    "DiffKVPath",
-    "REQUESTED_BACKEND",
-    "SELECTED_BACKEND",
-    "get_diffkv_backend_info",
-    "get_num_par_softmax_segments",
-    "should_use_optimized_fused_reducer",
-    "_normalize_path",
-    "_select_optimized_launch_config",
-    "_optimized_workload_class",
-    "_unified_attention_diffkv_fallback",
-    "_unified_attention_diffkv_optimized",
-]

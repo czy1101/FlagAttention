@@ -13,14 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MetaX DiffKV public interfaces and call preparation.
-
-This module defines input contracts and shared configuration, validates public
-inputs, and allocates output and split-KV workspace. ``diffkv.py`` owns launch
-heuristics and the standard Triton kernels. Both the optimized implementation
-and the explicit fallback use standard Triton.
-
-Backend diagnostics describe the selected Triton implementation.
+"""MetaX DiffKV public API: input validation, configuration, and output/workspace allocation.
+Triton kernels and launch policies are implemented in diffkv.py.
 """
 
 from __future__ import annotations
@@ -37,7 +31,6 @@ import triton
 # -----------------------------------------------------------------------------
 
 DiffKVMode = Literal["full", "swa"]
-DiffKVBackend = Literal["auto", "optimized", "triton"]
 DiffKVPath = Literal["2d", "3d"]
 
 # Stable operator identifier shared by the public API, pytest marker,
@@ -62,7 +55,6 @@ class DiffKVLayout:
 DEFAULT_LAYOUT: Final = DiffKVLayout()
 SUPPORTED_MODES: Final = frozenset(("full", "swa", "both"))
 SUPPORTED_PATHS: Final = frozenset(("2d", "3d"))
-SUPPORTED_BACKENDS: Final = frozenset(("auto", "optimized", "triton"))
 
 
 def num_kv_heads_for_mode(
@@ -81,8 +73,8 @@ def num_kv_heads_for_mode(
 # -----------------------------------------------------------------------------
 
 DEFAULT_BLOCK_SIZE: Final = DEFAULT_LAYOUT.block_size
-OPTIMIZED_HEAD_SIZE_QK: Final = DEFAULT_LAYOUT.head_size_qk
-OPTIMIZED_HEAD_SIZE_V: Final = DEFAULT_LAYOUT.head_size_v
+HEAD_SIZE_QK: Final = DEFAULT_LAYOUT.head_size_qk
+HEAD_SIZE_V: Final = DEFAULT_LAYOUT.head_size_v
 QK_TILE_LO: Final = 128
 QK_TILE_HI: Final = 64
 
@@ -184,34 +176,27 @@ def _implementation():
 
 _IMPLEMENTATION_EXPORTS = frozenset(
     {
-        "REQUESTED_BACKEND",
-        "SELECTED_BACKEND",
-        "get_diffkv_backend_info",
         "get_num_par_softmax_segments",
-        "should_use_optimized_fused_reducer",
+        "should_use_fused_reducer",
     }
 )
 
 
 def __getattr__(name: str):
-    """Lazily expose implementation diagnostics without an import cycle."""
+    """Lazily expose scheduling utilities without an import cycle."""
     if name in _IMPLEMENTATION_EXPORTS:
         return getattr(_implementation(), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # -----------------------------------------------------------------------------
-# Backend selection and public input validation
+# Public input validation
 # -----------------------------------------------------------------------------
 
-def _resolve_backend(backend: DiffKVBackend | str | None) -> str:
-    """Select the ported optimized algorithm or the explicit Triton fallback."""
-    selected = "auto" if backend is None else backend.strip().lower()
-    if selected == "auto":
-        selected = _implementation()._default_backend()
-    if selected not in {"optimized", "triton"}:
-        raise ValueError(f"backend must be one of auto, optimized, or triton; got {backend!r}")
-    return selected
+def _validate_backend_argument(backend: str | None) -> None:
+    """Accept legacy selectors for the single MetaX Triton implementation."""
+    if backend not in (None, "auto", "triton"):
+        raise ValueError("MetaX DiffKV has one Triton implementation; omit backend or use triton")
 
 
 def _validate_public_inputs(
@@ -269,41 +254,21 @@ def _validate_public_inputs(
 
 def unified_attention_diffkv(
     *args: Any,
-    backend: DiffKVBackend | str | None = None,
+    backend: str | None = None,
     path: DiffKVPath | str = "2d",
     **kwargs: Any,
 ):
-    """Run the ported optimized or explicit standard Triton path."""
-    selected = _resolve_backend(backend)
-    # Keep the legacy vLLM threshold argument accepted by existing callers;
-    # path selection is now centralized in the launchers.
+    """Launch the MetaX Triton attention implementation."""
+    _validate_backend_argument(backend)
     kwargs.pop("seq_threshold_3D", None)
-    if selected == "optimized":
-        return _implementation()._unified_attention_diffkv_optimized(
-            *args, path=path, **kwargs
-        )
-    # The synchronous Triton launcher has no fused-reducer argument.
-    kwargs.pop("fused_reducer_counter", None)
-    return _implementation()._unified_attention_diffkv_fallback(
-        *args, path=path, **kwargs
-    )
+    return _implementation()._unified_attention_diffkv(*args, path=path, **kwargs)
 
 
-def unified_attention_diffkv_optimized(*args: Any, **kwargs: Any):
-    """Explicit optimized Triton implementation entry point."""
-    return unified_attention_diffkv(*args, backend="optimized", **kwargs)
-
-
-def unified_attention_diffkv_fallback(*args: Any, **kwargs: Any):
-    """Explicit standard fallback Triton entry point."""
-    return unified_attention_diffkv(*args, backend="triton", **kwargs)
-
-
-@torch.no_grad()
 # -----------------------------------------------------------------------------
 # Public decode interface and workspace preparation
 # -----------------------------------------------------------------------------
 
+@torch.no_grad()
 def diffkv_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -314,7 +279,7 @@ def diffkv_attention(
     window_size: int = -1,
     path: DiffKVPath = "2d",
     num_segments: int | None = None,
-    backend: DiffKVBackend | None = None,
+    backend: str | None = None,
 ) -> torch.Tensor:
     """Run paged DiffKV attention for decode workloads.
 
@@ -328,13 +293,13 @@ def diffkv_attention(
         window_size: Number of recent KV tokens, or ``-1`` for full context.
         path: Launch path, either ``"2d"`` or ``"3d"``.
         num_segments: Optional split-KV segment count for the 3D path.
-        backend: Optional backend override: ``"auto"``, ``"optimized"`` or
-            ``"triton"``.
+        backend: Legacy compatibility argument. None, "auto", and "triton"
+            all use the same MetaX Triton implementation.
 
     Returns:
         Attention output with shape ``[B, Hq, Dv]``.
     """
-    selected = _resolve_backend(backend)
+    _validate_backend_argument(backend)
     batch, num_query_heads, head_size_qk, head_size_v = _validate_public_inputs(
         query,
         key_cache,
@@ -354,7 +319,7 @@ def diffkv_attention(
         device=query.device,
         dtype=query.dtype,
     )
-    # Public decode always has one query per sequence. Both launchers mark
+    # Public decode always has one query per sequence. The launcher marks
     # IS_DECODE=True, so this compatibility pointer is never dereferenced.
     cu_seqlens_q = context_lens
     max_seqlen_k = block_tables.shape[1] * key_cache.shape[1]
@@ -363,7 +328,6 @@ def diffkv_attention(
     if use_3d:
         if (
             num_segments is None
-            and selected == "optimized"
             and 0 < window_size <= 128
         ):
             num_segments = 1
@@ -377,7 +341,6 @@ def diffkv_attention(
                     if (
                         window_size < 0
                         and max_seqlen_k > 1024
-                        and selected == "optimized"
                     )
                     else 2 * batch
                 ),
@@ -385,7 +348,7 @@ def diffkv_attention(
                 num_sms=_implementation()._device_num_sms(query.device),
                 block_size=key_cache.shape[1],
             )
-        direct_single = selected == "optimized" and 0 < window_size <= 128 and num_segments == 1
+        direct_single = 0 < window_size <= 128 and num_segments == 1
         if direct_single:
             segm_output = segm_max = segm_expsum = None
         else:
@@ -393,7 +356,7 @@ def diffkv_attention(
             segm_output = torch.empty(
                 (batch, num_query_heads, num_segments, padded_v),
                 device=query.device,
-                dtype=query.dtype if selected == "optimized" else torch.float32,
+                dtype=query.dtype,
             )
             segm_max = torch.empty(
                 (batch, num_query_heads, num_segments),
@@ -433,18 +396,6 @@ def diffkv_attention(
         max_seqlen_k=max_seqlen_k,
         fused_reducer_counter=fused_reducer_counter,
         path=path,
-        backend=selected,
+        backend=backend,
     )
     return out
-
-
-__all__ = [
-    "OP_NAME",
-    "diffkv_attention",
-    "unified_attention_diffkv",
-    "unified_attention_diffkv_optimized",
-    "unified_attention_diffkv_fallback",
-    "DiffKVBackend",
-    "DiffKVPath",
-    "_resolve_backend",
-]

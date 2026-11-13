@@ -15,6 +15,18 @@
 
 """MetaX DiffKV attention."""
 
-from .api import diffkv_attention
+from .api import (
+    DEFAULT_LAYOUT,
+    OP_NAME,
+    DiffKVLayout,
+    diffkv_attention,
+    unified_attention_diffkv,
+)
 
-__all__ = ["diffkv_attention"]
+__all__ = [
+    "OP_NAME",
+    "diffkv_attention",
+    "unified_attention_diffkv",
+    "DiffKVLayout",
+    "DEFAULT_LAYOUT",
+]
