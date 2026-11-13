@@ -31,6 +31,7 @@ _OPERATOR_EXPORTS = {
     "minimax_m3_index_topk": (".msa", "minimax_m3_index_topk"),
     "minimax_m3_sparse_attn": (".msa", "minimax_m3_sparse_attn"),
     "minimax_m3_sparse_attn_decode": (".msa", "minimax_m3_sparse_attn_decode"),
+    "parallel_forgetting_attn": (".forgetting_attention", "parallel_forgetting_attn"),
     "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
     "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
     "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),

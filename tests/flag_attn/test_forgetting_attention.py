@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Self-contained Forgetting Attention / ACP correctness tests.
 
 Run: python -m pytest tests/flag_attn/test_forgetting_attention.py -v
@@ -174,6 +188,72 @@ def call_official(inputs, case, threshold=-10.0, scale=None):
     return out if d == padded else out[..., :d].contiguous()
 
 
+@torch.inference_mode()
+def mathematical_reference(inputs, case, query_chunk=64):
+    """Unpruned PyTorch attention reference, independent of hardware tiling.
+
+    Query chunks bound score memory. GQA heads are mapped explicitly; all
+    reductions are FP32. The single-query vector path rounds Q*K products
+    to the input dtype before summation, matching its explicit arithmetic
+    contract (also used by the specialized single-query implementation).
+    """
+    q, k, v, gate = inputs
+    b, m, hq, d = q.shape
+    n, hk = k.shape[1:3]
+    prefix = gate.transpose(1, 2).float().cumsum(-1)
+    out = torch.empty_like(q)
+    keys = torch.arange(n, device=q.device)
+    for head in range(hq):
+        kh = head // (hq // hk)
+        kt = k[:, :, kh].float().transpose(1, 2)
+        vt = v[:, :, kh].float()
+        for start in range(0, m, query_chunk):
+            end = min(start + query_chunk, m)
+            pos = n - m + torch.arange(start, end, device=q.device)
+            if m == 1:
+                # Model the vector kernel's product rounding, not a matmul:
+                # float(q * k) differs from float(q) * float(k) for BF16.
+                products = (q[:, :1, head].float() * k[:, :, kh].float()).to(q.dtype)
+                scores = products.float().sum(-1)[:, None, :] * case["scale"]
+            else:
+                scores = torch.matmul(q[:, start:end, head].float(), kt) * case["scale"]
+            scores += prefix[:, head, pos, None] - prefix[:, head, None, :]
+            scores.masked_fill_(keys[None, None, :] > pos[None, :, None], -float("inf"))
+            out[:, start:end, head] = torch.matmul(scores.softmax(-1), vt).to(q.dtype)
+    return out
+
+
+@pytest.mark.parametrize("case", CASES, ids=case_id)
+@pytest.mark.parametrize("seed", [0, 1])
+@torch.inference_mode()
+@pytest.mark.skipif(test_backend.is_nvidia(), reason="NVIDIA retains official bitwise and frozen-output regressions")
+def test_forgetting_attention_matches_math(case, seed):
+    inputs = make_inputs(case, seed)
+    q, k, v, gate = inputs
+    bounded = (
+        (0.5 * F.normalize(q.float(), dim=-1)).to(q.dtype),
+        (0.5 * F.normalize(k.float(), dim=-1)).to(k.dtype),
+        v.clamp(-1, 1),
+        -0.25 - gate.abs(),
+    )
+    comparisons = (
+        (inputs, case, -1e9),
+        (bounded, dict(case, scale=0.125), -10.0),
+    )
+    for test_inputs, test_case, threshold in comparisons:
+        expected = mathematical_reference(test_inputs, test_case)
+        for _ in range(2):
+            actual = call_optimized(test_inputs, test_case, threshold=threshold)
+            assert actual.shape == expected.shape
+            assert actual.dtype == expected.dtype
+            assert torch.isfinite(actual).all().item()
+            assert torch.isfinite(expected).all().item()
+            torch.testing.assert_close(
+                actual, expected, atol=0.02, rtol=0.02,
+                msg=lambda msg: f"threshold={threshold}: {msg}",
+            )
+
+
 def fingerprint(tensor):
     data = tensor.detach().contiguous().view(torch.int16).cpu().numpy()
     return hashlib.sha256(memoryview(data)).hexdigest()
@@ -201,6 +281,7 @@ pytestmark = [
 @pytest.mark.parametrize("case", CASES, ids=case_id)
 @pytest.mark.parametrize("seed", [0, 1])
 @torch.inference_mode()
+@pytest.mark.skipif(not test_backend.is_nvidia(), reason="official Triton reference requires NVIDIA")
 def test_forgetting_attention_matches_official(case, seed):
     inputs = make_inputs(case, seed)
     expected = call_official(inputs, case)
