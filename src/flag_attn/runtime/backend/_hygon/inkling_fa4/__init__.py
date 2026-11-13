@@ -14,7 +14,7 @@
 
 """Hygon backend implementation of Inkling FA4 relative attention."""
 
-from flag_attn.runtime.backend._hygon.inkling_fa4.relative_attention import (
+from flag_attn.runtime.backend._hygon.inkling_fa4.inkling_fa4 import (
     inkling_fa4_rel_attention,
     inkling_fa4_rel_attention_triton,
 )
