@@ -80,6 +80,10 @@ def minimax_m3_index_score(
 # S60 cannot lower the TLE radix kernel or the generic uint64 packed keys.
 _HAS_TLE_RADIX = False
 _MAX_STREAMING_TOPK = 64
+# Dense reduction TopK batches this many query rows per program when the score
+# row is narrow; wider rows keep the one-row-per-program fallback.
+_REDUCTION_ROW_TILE = 8
+_REDUCTION_ROW_MAX_BLOCKS = 512
 
 
 def _select_prefill_topk_path(
@@ -933,6 +937,42 @@ def minimax_m3_index_topk(
             BLOCK_SIZE_N=triton.next_power_of_2(max_blocks) if row_tile > 1 else 64,
             SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
             **({"BLOCK_SIZE_Q": row_tile} if row_tile > 1 else {}),
+            num_warps=1,
+            num_stages=1,
+        )
+        return topk_idx
+
+    # Small TopK selections stay on the reduction path, where every query row
+    # used to take one program.  The rows kernel above runs the same bounded
+    # scan for BLOCK_SIZE_Q rows per program, so grouping rows cuts the launch
+    # by that factor and amortizes per-program overhead without changing the
+    # selection, tie-break or -1 padding semantics.  Wide block counts keep the
+    # original per-row path to bound the live FP32 tile.
+    if (
+        0 < topk <= 4
+        and max_blocks <= _REDUCTION_ROW_MAX_BLOCKS
+        and batch <= 255
+        and num_heads <= 255
+    ):
+        row_tile = _REDUCTION_ROW_TILE
+        _prefill_topk_rows_enflame[(triton.cdiv(max_query_len, row_tile), batch, num_heads)](
+            score,
+            topk_idx,
+            cu_seqlens_q,
+            prefix_lens,
+            init_blocks,
+            local_blocks,
+            max_blocks,
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            TOPK=topk,
+            BLOCK_SIZE_N=triton.next_power_of_2(max_blocks),
+            SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+            BLOCK_SIZE_Q=row_tile,
             num_warps=1,
             num_stages=1,
         )
