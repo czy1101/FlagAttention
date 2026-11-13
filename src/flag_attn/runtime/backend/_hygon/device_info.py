@@ -26,6 +26,7 @@ class DeviceInfo:
     device_id: int
     l2_cache_size: int
     sm_count: int
+    max_shared_mem: int
 
 
 @lru_cache(maxsize=1)
@@ -94,6 +95,24 @@ def get_device_info() -> DeviceInfo:
         sm_count = getattr(props, "multi_processor_count", None) or getattr(
             props, "multiProcessorCount", None
         )
+    max_shared_mem = None
+    if props is not None:
+        max_shared_mem = (
+            getattr(props, "max_shared_mem", None)
+            or getattr(props, "shared_memory_per_block_optin", None)
+            or getattr(props, "shared_memory_per_block", None)
+        )
+    if max_shared_mem is None:
+        try:
+            import triton
+
+            triton_props = triton.runtime.driver.active.utils.get_device_properties(
+                get_device_id()
+            )
+            if hasattr(triton_props, "get"):
+                max_shared_mem = triton_props.get("max_shared_mem")
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            pass
     if l2_cache_size is None:
         warnings.warn(
             "[device_info] Failed to get"
@@ -108,10 +127,16 @@ def get_device_info() -> DeviceInfo:
         )
         # default sm_count to 108 for A100
         sm_count = 108
+    if max_shared_mem is None:
+        warnings.warn(
+            "[device_info] Failed to get max_shared_mem, fallback to 0."
+        )
+        max_shared_mem = 0
     return DeviceInfo(
         device_id=get_device_id(),
         l2_cache_size=l2_cache_size,
         sm_count=sm_count,
+        max_shared_mem=max_shared_mem,
     )
 
 
@@ -121,3 +146,7 @@ def get_l2_cache_size() -> int:
 
 def get_sm_count() -> int:
     return get_device_info().sm_count
+
+
+def get_max_shared_memory() -> int:
+    return get_device_info().max_shared_mem
