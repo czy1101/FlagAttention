@@ -40,7 +40,6 @@ _OPERATOR_EXPORTS = {
     "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
     "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
     "chunk_gla": (".FLA.gla", "chunk_gla"),
-    "parallel_forgetting_attn": (".forgetting_attention", "parallel_forgetting_attn"),
     "fused_attnres": (".FLA.attnres", "fused_attnres"),
     "minimax_m3_index_decode": (".msa", "minimax_m3_index_decode"),
     "minimax_m3_index_decode_score": (".msa", "minimax_m3_index_decode_score"),
