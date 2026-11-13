@@ -35,6 +35,7 @@ error = _Error()
 _OPERATOR_EXPORTS = {
     "sage_attention": (".sage_attention.attn_qk_int8_per_block", "forward"),
     "sage_attention_forward": (".sage_attention.attn_qk_int8_per_block", "forward"),
+    "inkling_fa4_rel_attention": (".inkling_fa4", "inkling_fa4_rel_attention"),
     "SPARSE_BLOCK_SIZE": (".msa.index_topk", "SPARSE_BLOCK_SIZE"),
     "chunk_kda_fwd_infer": (".FLA.kda.chunk_kda", "chunk_kda_fwd_infer"),
     "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
