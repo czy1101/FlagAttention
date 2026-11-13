@@ -60,7 +60,15 @@ _PARALLAX_DQR_TILES = (
     (256, 128),
 )
 
-_PARALLAX_FWD_TILES = tuple(tile for tile in _PARALLAX_DQR_TILES if tile != (64, 16))
+_PARALLAX_FWD_TILES = tuple(tile for tile in _PARALLAX_DQR_TILES if tile != (64, 16)) + (
+    # D=64 forward on S60: the key/value loop is bound by per-block DTE waits,
+    # masks and barriers rather than arithmetic or HBM bandwidth, so wider
+    # column tiles amortize that overhead.  B2/T2048/H2/HQ8/D64 bf16 measures
+    # 2.55 ms (BS=128) -> 2.05 ms (BS=512); BS=1024 exceeds the 1.5 MiB local
+    # memory limit.  The BK pruner keeps these candidates only for K<=64.
+    (64, 256),
+    (64, 512),
+)
 
 _PARALLAX_DKV_TILES = (
     (16, 64),
