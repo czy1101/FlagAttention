@@ -14,13 +14,14 @@
 
 """Routing, metadata, and sparse data-movement kernels for Triton MoBA."""
 
+import os
 from functools import lru_cache
 
 import torch
 import triton
 import triton.language as tl
 
-from . import routes_raw
+from . import routes_raw, topk_raw
 
 _PREFIX_SCAN_BLOCK = 1024
 
@@ -34,15 +35,8 @@ def cdiv(x, y):
     return (x + y - 1) // y
 
 
-# Ascend limits the 1D launch extent.  The hard ``coreDim`` limit is 65535, but
-# for non-trivial kernels a single launch silently hangs above 32768 programs
-# (lead's measurement: desc=32768 -> 865 ms, desc=36864 -> hang with no plog
-# error, while the same work split at 16384 completes in 42.7 ms).  Every
-# "complex" kernel therefore caps its 1D grid at 32768 and strides over the
-# remaining items inside the program (``pid, pid + num_programs, ...``);
-# ``tl.num_programs(0)`` is verified to work on this backend, and a grid at or
-# below the cap behaves exactly like the old one-item-per-program launch.
-# Trivial elementwise kernels (fill/cast/copy) keep the 65535 cap.
+# Cap complex launches at 32768 programs and stride over remaining work.
+# Simple elementwise kernels can use the runtime limit of 65535 programs.
 _MAX_CORE_DIM0 = 32768
 _MAX_CORE_DIM0_SIMPLE = 65535
 # Token block used by the blocked route builders.
@@ -742,14 +736,9 @@ def _chunk_mean_kernel(
     EXACT_HD: tl.constexpr,
     EXACT_T: tl.constexpr,
 ):
-    """Chunk means with coalesced token-row reads (one program per chunk).
+    """Compute chunk means from contiguous token rows.
 
-    A chunk is a contiguous run of ``CHUNK_SIZE`` tokens, so a tile of
-    ``[BLOCK_TOK, num_heads * HEAD_DIM]`` covers whole token rows (4 KB per row
-    for H=16/D=128) and the load is contiguous, unlike the old ``(chunk, head)``
-    programs that walked tokens with a ``num_heads*HEAD_DIM`` stride and fetched
-    only 256 B per row.  The token reduction runs on ``axis=0`` of the wide
-    tile, which is the fast reduction direction on this backend.
+    Each program reduces a [BLOCK_TOK, heads * HEAD_DIM] tile along axis 0.
     """
     pid = tl.program_id(0)
     stride = tl.num_programs(0)
@@ -831,8 +820,7 @@ def _dense_chunk_mean_kernel(
 ):
     """Dense-slot variant of ``_chunk_mean_kernel`` (one program per slot).
 
-    Non-historical slots keep the previous behaviour: their token mask is empty
-    so they are written as zeros.
+    Non-historical slots have an empty token mask and are written as zeros.
     """
     pid = tl.program_id(0)
     stride = tl.num_programs(0)
@@ -931,8 +919,6 @@ def _compute_dense_chunk_means_triton(
     return chunk_means
 
 
-MOBA_TOPK_TOKENS = 128
-MOBA_TOPK_CHUNKS = 128
 MOBA_TOPK_MAX_PROGRAMS = 4096
 
 
@@ -968,16 +954,7 @@ def _chunk_topk_masked_kernel(
     BLOCK_D: tl.constexpr,
     USE_LIMITS: tl.constexpr,
 ):
-    """Per-token top-k chunk gate, transposed for the Ascend vector unit.
-
-    Same two-level (tile top-k then merge) exact algorithm as before, but the
-    gate is computed as ``chunk_means_tile [BC, D] @ q^T [D, BT]`` and the
-    chunk dimension reductions run along ``axis=0`` (one lane per token).  On
-    this backend ``tl.max/min(axis=1)`` on a ``[BT, BC]`` tile is a scalarized
-    slow path; the transposed form is ~14x faster and reaches ~24x once BT is
-    raised to 128 (measured by the lead: S=8192/K=7 61.7ms -> 2.57ms).
-    Ties keep the smaller chunk index, matching the torch reference.
-    """
+    """Exact chunk top-k with chunk-major reductions and stable index ties."""
     pid = tl.program_id(0)
     ph = tl.program_id(1)
     ot = i_tok_lo + pid * BLOCK_TOK + tl.arange(0, BLOCK_TOK)
@@ -996,11 +973,13 @@ def _chunk_topk_masked_kernel(
     best_i = tl.zeros([TOPK, BLOCK_TOK], tl.int32)
     neg_inf = float("-inf")
     if USE_LIMITS:
-        tile_limit = tl.load(limits_ptr + limit_off + pid)
+        tile_limit = tl.load(limits_ptr + (limit_off + pid) * 2)
+        tile_start = tl.load(limits_ptr + (limit_off + pid) * 2 + 1) // BLOCK_CHUNK
         num_tiles_eff = (tile_limit + BLOCK_CHUNK - 1) // BLOCK_CHUNK
     else:
         num_tiles_eff = num_tiles
-    for tile in range(0, num_tiles_eff):
+        tile_start = 0
+    for tile in range(tile_start, num_tiles_eff):
         oc = tile * BLOCK_CHUNK + cc
         cml = oc < num_chunks
         # [BC, D] keeps the chunk axis first so the reductions below run on
@@ -1037,45 +1016,50 @@ def _chunk_topk_masked_kernel(
             )
             work = tl.where(cc[:, None] == col_idx[None, :], neg_inf, work)
 
-        merged_s = tl.full([TOPK, BLOCK_TOK], neg_inf, tl.float32)
-        merged_i = tl.zeros([TOPK, BLOCK_TOK], tl.int32)
-        for rank in tl.static_range(TOPK):
-            best_max = tl.max(best_s, axis=0)
-            tile_max = tl.max(tile_s, axis=0)
-            take_best = best_max >= tile_max
-            cur_s = tl.where(take_best, best_max, tile_max)
-            best_pos = tl.min(
-                tl.where(best_s >= best_max[None, :], ranks[:, None], TOPK),
-                axis=0,
-            )
-            tile_pos = tl.min(
-                tl.where(tile_s >= tile_max[None, :], ranks[:, None], TOPK),
-                axis=0,
-            )
-            best_val = tl.sum(
-                tl.where(ranks[:, None] == best_pos[None, :], best_i, 0), axis=0
-            )
-            tile_val = tl.sum(
-                tl.where(ranks[:, None] == tile_pos[None, :], tile_i, 0), axis=0
-            )
-            merged_s = tl.where(ranks[:, None] == rank, cur_s[None, :], merged_s)
-            merged_i = tl.where(
-                ranks[:, None] == rank,
-                tl.where(take_best, best_val, tile_val)[None, :],
-                merged_i,
-            )
-            best_s = tl.where(
-                (ranks[:, None] == best_pos[None, :]) & take_best[None, :],
-                neg_inf,
-                best_s,
-            )
-            tile_s = tl.where(
-                (ranks[:, None] == tile_pos[None, :]) & (~take_best)[None, :],
-                neg_inf,
-                tile_s,
-            )
-        best_s = merged_s
-        best_i = merged_i
+        if not USE_LIMITS:
+            # The host omits limits only when all chunks fit in one tile.
+            best_s = tile_s
+            best_i = tile_i
+        else:
+            merged_s = tl.full([TOPK, BLOCK_TOK], neg_inf, tl.float32)
+            merged_i = tl.zeros([TOPK, BLOCK_TOK], tl.int32)
+            for rank in tl.static_range(TOPK):
+                best_max = tl.max(best_s, axis=0)
+                tile_max = tl.max(tile_s, axis=0)
+                take_best = best_max >= tile_max
+                cur_s = tl.where(take_best, best_max, tile_max)
+                best_pos = tl.min(
+                    tl.where(best_s >= best_max[None, :], ranks[:, None], TOPK),
+                    axis=0,
+                )
+                tile_pos = tl.min(
+                    tl.where(tile_s >= tile_max[None, :], ranks[:, None], TOPK),
+                    axis=0,
+                )
+                best_val = tl.sum(
+                    tl.where(ranks[:, None] == best_pos[None, :], best_i, 0), axis=0
+                )
+                tile_val = tl.sum(
+                    tl.where(ranks[:, None] == tile_pos[None, :], tile_i, 0), axis=0
+                )
+                merged_s = tl.where(ranks[:, None] == rank, cur_s[None, :], merged_s)
+                merged_i = tl.where(
+                    ranks[:, None] == rank,
+                    tl.where(take_best, best_val, tile_val)[None, :],
+                    merged_i,
+                )
+                best_s = tl.where(
+                    (ranks[:, None] == best_pos[None, :]) & take_best[None, :],
+                    neg_inf,
+                    best_s,
+                )
+                tile_s = tl.where(
+                    (ranks[:, None] == tile_pos[None, :]) & (~take_best)[None, :],
+                    neg_inf,
+                    tile_s,
+                )
+            best_s = merged_s
+            best_i = merged_i
 
     tl.store(
         selected_ptr
@@ -1144,44 +1128,30 @@ def _compute_chunk_means_triton(
     return chunk_means
 
 
-# The [BLOCK_CHUNK, BLOCK_TOK] gate tile is the UB budget driver.  BLOCK_TOK=128
-# / BLOCK_CHUNK=128 is the fastest measured tile (lead: S=8192/K=7 2.57 ms) but
-# overflows UB once TOPK reaches 8 (the per-rank selection buffers are
-# [TOPK, BLOCK_TOK]); the smaller configurations below are exact fallbacks.
-_TOPK_TILES = ((128, 128), (128, 64), (64, 64))
-_TOPK_TILE_CACHE: dict = {}
-
-
-def _topk_tile_config(routed_topk: int, head_dim: int):
-    key = (routed_topk, head_dim)
-    cached = _TOPK_TILE_CACHE.get(key)
-    if cached is None:
-        if routed_topk <= 7:
-            cached = (128, 128)
-        elif routed_topk <= 16:
-            cached = (128, 64)
-        else:
-            cached = (64, 64)
-        _TOPK_TILE_CACHE[key] = cached
-    return cached
+# Larger rank counts need smaller tiles to keep the selection buffers in UB.
+def _topk_tile_config(routed_topk: int) -> tuple[int, int]:
+    if routed_topk <= 7:
+        return 128, 128
+    if routed_topk <= 16:
+        return 128, 64
+    return 64, 64
 
 
 @triton.jit
 def _topk_tile_limits_kernel(
     chunk_end_ptr,
+    batch_end_ptr,
     limits_ptr,
     num_chunks,
     seqlen,
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    """Per token-block causal upper bound on the chunk tiles the top-k needs.
+    """Conservative chunk range for each token block.
 
-    A token can only select chunks with ``chunk_end <= token``.  For the token
-    block ``[pid*BLOCK_T, (pid+1)*BLOCK_T)`` the largest such chunk index is
-    ``max{i : chunk_end[i] <= tmax} + 1`` (0 when none), so every later chunk
-    tile is entirely invalid and can be skipped.  Non-historical dense slots
-    carry ``chunk_end == INT_MAX`` and are ignored by the bound.
+    Skip chunks ending after the last token and sequences ending at or before
+    the first token. Blocks crossing a packed boundary retain both sequences.
+    Each output pair is (exclusive chunk end, first possible chunk index).
     """
     pid = tl.program_id(0)
     stride = tl.num_programs(0)
@@ -1191,27 +1161,36 @@ def _topk_tile_limits_kernel(
         blk = pid + i * stride
         tmax = tl.minimum((blk + 1) * BLOCK_T - 1, seqlen - 1)
         limit = 0
+        first = num_chunks
+        tmin = blk * BLOCK_T
         cc = tl.arange(0, BLOCK_C)
         for tc in range(0, num_c_tiles):
             cols = tc * BLOCK_C + cc
             mask = cols < num_chunks
             ce = tl.load(chunk_end_ptr + cols, mask=mask, other=2147483647)
+            be = tl.load(batch_end_ptr + cols, mask=mask, other=0)
+            first = tl.minimum(
+                first, tl.min(tl.where(mask & (be > tmin), cols, num_chunks), axis=0)
+            )
             ok = mask & (ce <= tmax)
             m = tl.max(tl.where(ok, cols + 1, 0), axis=0)
             limit = tl.maximum(limit, m)
-        tl.store(limits_ptr + blk, limit)
+        tl.store(limits_ptr + blk * 2, limit)
+        tl.store(limits_ptr + blk * 2 + 1, first)
 
 
 def _topk_tile_limits(
     chunk_end: torch.Tensor,
+    batch_end: torch.Tensor,
     num_chunks: int,
     seqlen: int,
     num_tok_blocks: int,
     block_t: int,
 ):
-    limits = torch.empty((num_tok_blocks,), device=chunk_end.device, dtype=torch.int32)
+    limits = torch.empty((num_tok_blocks * 2,), device=chunk_end.device, dtype=torch.int32)
     _topk_tile_limits_kernel[_capped_grid(num_tok_blocks)](
         chunk_end,
+        batch_end,
         limits,
         num_chunks,
         seqlen,
@@ -1241,23 +1220,27 @@ def _compute_selected_chunks_streaming_triton(
     if num_chunks == 0 or routed_topk == 0 or seqlen == 0:
         return selected
 
-    num_tiles = cdiv(num_chunks, MOBA_TOPK_CHUNKS)
-    block_tok, block_chunk = _topk_tile_config(routed_topk, head_dim)
+    block_tok, block_chunk = _topk_tile_config(routed_topk)
     block_chunk = min(block_chunk, max(32, triton.next_power_of_2(num_chunks)))
+    kernel = _chunk_topk_masked_kernel
+    if topk_raw.is_supported(q, routed_topk) and num_chunks > topk_raw.BLOCK_CHUNKS:
+        block_tok, block_chunk = topk_raw.BLOCK_TOKENS, topk_raw.BLOCK_CHUNKS
+        kernel = topk_raw.chunk_topk_raw_kernel
+    num_tiles = cdiv(num_chunks, block_chunk)
     block_d = triton.next_power_of_2(head_dim)
     tok_tiles = cdiv(seqlen, block_tok)
     # A single chunk tile needs no causal bound: skip both the pre-pass launch
     # and the per-program limit load (pass an arbitrary pointer, never read).
     use_limits = num_tiles > 1
     limits = (
-        _topk_tile_limits(chunk_end, num_chunks, seqlen, tok_tiles, block_tok)
+        _topk_tile_limits(chunk_end, batch_end, num_chunks, seqlen, tok_tiles, block_tok)
         if use_limits
         else chunk_end
     )
     programs_per_launch = max(1, MOBA_TOPK_MAX_PROGRAMS // num_heads)
     for tok_lo in range(0, tok_tiles, programs_per_launch):
         n_tok = min(programs_per_launch, tok_tiles - tok_lo)
-        _chunk_topk_masked_kernel[(n_tok, num_heads)](
+        kernel[(n_tok, num_heads)](
             q,
             chunk_means,
             chunk_end,
@@ -1349,17 +1332,10 @@ def _compute_selected_chunks_batched_streaming_triton(
     max_chunks_per_sequence: int,
     topk: int,
 ) -> torch.Tensor:
-    """Dense-slot inference top-k, delegated to the Ascend masked-argmax kernel.
+    """Select dense historical slots through the shared chunk top-k path.
 
-    This backend cannot lower ``tl.topk`` / ``tl.sort`` / ``tl.bitonic_merge``
-    or the uint64 packed keys the generic dense-slot kernel used, so the dense
-    slots (including the non-historical ones) are fed straight into the same
-    masked-argmax top-k kernel as the compact training path, together with the
-    per-slot ``batch_end`` table built above.  The dropped slots are masked out
-    by ``batch_end == 0`` and the returned ids are dense slot ids, which is
-    exactly what the inference route builder consumes.  The output contract is
-    unchanged: ``[topk, num_heads, total_tokens]`` int32, sorted by score
-    descending, ``-1`` for missing entries.
+    Non-historical slots have ``batch_end == 0``. Results are int32 indices in
+    ``[topk, num_heads, total_tokens]`` order, with -1 for missing entries.
     """
     del max_seqlen  # dense-slot path does not need the per-sequence maximum
     num_chunk_slots, num_kv_heads, head_dim = chunk_means.shape
@@ -1672,23 +1648,16 @@ def _routes_scatter_kernel(
             tl.store(route_positions_ptr + route_slot, positions, mask=keep)
 
 
-import os
-
-
 def _compact_routes_fast(selected_chunks, num_experts, num_heads, seqlen, chunk_ends=None):
     """Return (query_indices, route_positions, expert_counts, expert_offsets).
 
-    ``chunk_ends[k]`` is the last token of chunk ``k``; a chunk can only be
-    selected by later tokens, so token blocks fully inside it are skipped.  That
-    removes about half of the (expert, token block) cells, which dominate the
-    cost at the benchmark shapes.
+    ``chunk_ends[k]`` is the exclusive token end of chunk ``k``. Only tokens
+    at or after that end can select the chunk; earlier token blocks are skipped.
     """
     topk = selected_chunks.shape[0]
     if topk == 1:
-        # Known Ascend codegen issue: with a single rank the scatter kernel drops
-        # lanes of the ``route_positions`` store (query_indices stays correct).
-        # topk==1 only appears for small shapes (moba_topk == 2), so use the
-        # torch reference there; the benchmark path uses topk >= 2.
+        # Use the reference path to avoid incomplete single-rank position stores
+        # in the Ascend scatter kernel.
         return _compact_routes_torch(
             selected_chunks, num_experts, num_heads, seqlen
         )
@@ -1731,12 +1700,9 @@ def _compact_routes_torch(
     num_heads: int,
     seqlen: int,
 ):
-    """Reference/fallback route compaction (deterministic, correct, but slow).
+    """Deterministically compact route slots by expert using a stable slot key.
 
-    Kept as the correctness fallback while the expert-major Triton builder is
-    being rewritten: Triton cannot consume a ``tl.atomic_add`` result in a store
-    without falling into the scalarized path on this backend, and the
-    expert-major scatter is still under development.
+    Return query rows, route positions, per-expert counts, and prefix offsets.
     """
     device = selected_chunks.device
     topk, heads_dim, tokens_dim = selected_chunks.shape
@@ -1789,38 +1755,15 @@ def _compact_routes_torch(
 # ---------------------------------------------------------------------------
 # Linear-time route compaction
 # ---------------------------------------------------------------------------
-# The blocked builder above is O(num_experts * seqlen): every token block is
-# rescanned once per expert, so its cost grows quadratically with the sequence
-# (measured: 18.6 ms at S=4096, 91 s at S=262144, i.e. 52%-98% of end-to-end).
-#
-# The builder below touches every route slot exactly once.  Route slots are
-# grouped into (token tile, head, chunk) cells, where a tile is
-# `_route_tile_size()` tokens:
-#
-#   1. `counts[b, h, c]` - route slots of tile `b` of head `h` that select `c`;
-#   2. prefix sums       - per-cell tile-local run start `start`,
-#                          global compact base `base`, expert offsets;
-#   3. out_ids / pos     - per (tile, head) the slots reordered by chunk (one
-#                          contiguous run per cell) and the compact position of
-#                          every slot;
-#   4. inverse kernel    - expand the runs into `query_indices` with
-#                          uniform-base contiguous loads and stores only.
-#
-# The result keeps the exact meaning of the blocked builder, so the attention
-# and merge kernels are untouched:
-#   `query_indices[p]` = packed query row `t * num_heads + h` of compact
-#   position `p`, `route_positions[r, t * num_heads + h]` = `p`.
-import os as _os
-
-_ROUTE_LINEAR = _os.environ.get("MOBA_ROUTES_LINEAR", "1") != "0"
-_ROUTE_RAW = _os.environ.get("MOBA_ROUTES_RAW", "1") != "0"
+# Group route slots into (token tile, head, chunk) cells. Histograms and
+# prefix sums give each cell a contiguous compact run; the inverse pass maps
+# those runs to packed query rows and records each route slot's position.
+_ROUTE_LINEAR = os.environ.get("MOBA_ROUTES_LINEAR", "1") != "0"
+_ROUTE_RAW = os.environ.get("MOBA_ROUTES_RAW", "1") != "0"
 _ROUTE_TILE_TOKENS = 1024
 _ROUTE_TILE_TOKENS_MAX = 4096
 _ROUTE_INVERSE_BLOCK = 32
-# Cells expanded per program (static unroll).  S=4096 measured 32 -> 2.99 ms vs
-# 64 -> 2.88 ms for the whole route builder, but the largest shape measured
-# 2336 ms at 32 against 2489 ms at 64 within run-to-run spread, so the original
-# value is kept.
+# Cells expanded per program by the inverse pass.
 _ROUTE_INVERSE_CELLS = 32
 _ROUTE_LINEAR_MIN_SEQLEN = 0
 
@@ -1908,13 +1851,10 @@ def _route_inverse_kernel(
     BLOCK: tl.constexpr,
     CELLS: tl.constexpr,
 ):
-    """`query_indices[base + j] = row` for every cell run (contiguous copies).
+    """Copy each cell's packed query rows to its compact output run.
 
-    `out_ids` already holds the packed query row (`t * num_heads + h`) of every
-    bucketed slot, so expanding a cell is a masked 1-D copy at two uniform
-    runtime bases.  The cell loop is a *static* unroll: on this backend that is
-    what hides the DMA latency (measured 6.96 -> 4.37 ns/cell at S=65536, and
-    73.6 -> 7.95 ns/cell at S=4096, where per-cell launch/latency dominates).
+    Each cell uses uniform source and destination bases with contiguous offsets.
+    The cell loop is statically unrolled.
     """
     pid = tl.program_id(0)
     stride = tl.num_programs(0)
@@ -2211,7 +2151,7 @@ def _build_sparse_routes_triton(
     seqlen: int,
     chunk_ends: torch.Tensor | None = None,
 ):
-    """Group selected queries by (target chunk, head).  Contract unchanged."""
+    """Group selected queries by (target chunk, head)."""
     num_experts = num_chunks * num_heads
     (
         query_indices,

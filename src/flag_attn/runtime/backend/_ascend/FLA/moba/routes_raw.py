@@ -1,23 +1,11 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""TLE-Raw route compaction kernels (AscendC on the vector core).
+"""TLE-Raw route compaction using contiguous UB buffers.
 
-The Triton route builder needs, per route slot, a cursor update inside its
-(``token tile, head, chunk``) cell.  Triton has no scalar top-level loop over UB
-here and no GM scatter at all -- measured, a scalarized GM scatter costs
-2.6 ns/element and `tle.atomic_add` with a consumed result hangs the vector
-core -- so the compact layout is built by AscendC kernels that only exchange
-*contiguous* buffers with Triton:
-
-  * :func:`route_cell_hist` fills ``counts[b, h, c]`` (slots of tile ``b`` of
-    head ``h`` routed to chunk ``c``);
-  * :func:`route_cell_bucket` turns one (tile, head) into runs in chunk order
-    (``out_rows``, the packed query row ``t * num_heads + h``) plus the compact
-    position of every slot (``positions``).
-
-Both are exported as ``@dialect(name="cann")`` custom ops, see
-``_moba_routes_raw.cpp``.
+Histogram kernels count routes per (token tile, head, chunk) cell. Bucket
+kernels reorder each cell's query rows and record compact route positions.
+The AscendC implementations are in ``_moba_routes_raw.cpp``.
 """
 
 from __future__ import annotations
@@ -224,8 +212,7 @@ if _HAS_TLE_RAW:
         _stage_ids(sel_ptr, head, num_tokens, first, rank_stride,
                    TOPK=TOPK, CALL=CALL, u0=u0, u1=u1, u2=u2, u3=u3,
                    u4=u4, u5=u5, u6=u6, u7=u7)
-        # 18 operands exactly: the raw channel silently drops the custom op at 19
-        # (measured with an unconditional marker write that never landed).
+        # Keep this call within the backend's 18-operand limit.
         out_t, pos_t = tle_raw.call(
             _bucket_op,
             [
@@ -284,9 +271,7 @@ if _HAS_TLE_RAW:
         )
 
 
-#: Below this many packed tokens a single 1024-token call is faster than the
-#: streamed 2048-token tile (two raw calls plus a second position buffer), so the
-#: larger tile is only worth its extra complexity on the big benchmark shapes.
+#: Use a single-call tile for short inputs and stream larger token tiles.
 _SMALL_SEQLEN = 32768
 
 

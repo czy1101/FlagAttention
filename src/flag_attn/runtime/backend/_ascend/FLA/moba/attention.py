@@ -23,19 +23,9 @@ from .routing import _copy_triton, cdiv
 
 _LOG2E = tl.constexpr(1.4426950408889634)
 
-# Ascend rejects any launch whose total program count (``coreDim``) exceeds
-# 65535 with Invalid_Argument(EE1003). A 2-D grid does not lift that limit: the
-# runtime flattens the grid and checks the product of its dimensions, so
-# ``(1024, 64)`` (65536 programs) already fails.
-#
-# Splitting into launches of up to 65535 programs is not enough for these
-# kernels though: a single launch with more than 32768 programs hangs the
-# device (no plog error, the call never returns). Measured with the routed
-# attention kernel on synthetic data with no route anomalies: 32768 programs
-# complete, 36864 programs with one launch hang, while the same 36864
-# descriptors split into 2 launches of 32768/4096 complete. The launch cap is
-# therefore 32768; large program counts are split into consecutive launches
-# with the offset handed to the kernel as a runtime argument.
+# The runtime checks the product of grid dimensions against 65535 programs.
+# Keep complex attention launches within 32768 programs and pass an offset
+# to kernels for subsequent slices.
 _PROGRAM_LIMIT = 32768
 
 
@@ -383,11 +373,8 @@ def _attention_launch_config(
     # tl.dot requires a reduction dimension of at least 16. Padding also lets
     # the same kernels support every head dimension up to FlashMoBA's D=256.
     block_d = max(16, triton.next_power_of_2(head_dim))
-    # Ascend tiles: the cube prefers wide N and at least 64 rows.  The routed
-    # kernel keeps a 64-row tile: its float32 [BLOCK_M, BLOCK_D] accumulator
-    # plus scores/probabilities exceed the UB budget at 128 rows (verified
-    # "ub overflow, requires 272 KiB"), and the routed route-bucket size is
-    # derived from this same function, so the tile cannot be widened here.
+    # Bound the FP32 accumulators and score tiles by the UB budget. Route
+    # descriptor sizes are derived from the same query tile configuration.
     if head_dim <= 128:
         return 64, 64, block_d, 4, 2
     return 32, 64, block_d, 4, 2
@@ -413,12 +400,9 @@ def _triton_varlen_forward(
     out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     lse = torch.empty((num_heads, total_q), device=q.device, dtype=torch.float32)
     block_m, block_n, block_d, num_warps, num_stages = _attention_launch_config(head_dim, q.device)
-    # The causal chunk-local attention covers exactly one 128-token chunk, so a
-    # 128-row query tile reads each K/V tile once instead of twice and measured
-    # 1.4x faster than 64x64.  The non-causal materialized MoBA call keeps the
-    # 64x64 tile: the routed inference kernel (which the training path is
-    # compared against) is a 64-row kernel, and keeping both at 64 rows keeps
-    # the two paths within the strict inference-vs-autograd tolerance.
+    # Chunk-local causal attention reuses K/V across a 128-row query tile.
+    # Non-causal materialized attention uses the routed kernel's 64-row tile
+    # to keep the two paths numerically consistent.
     if head_dim <= 128 and causal:
         block_m = 128
         block_n = 128
@@ -484,13 +468,10 @@ def _triton_varlen_backward(
     _, num_heads, head_dim = q.shape
     num_sequences = cu_seqlens_q.numel() - 1
     block_m, block_n, block_d, num_warps, num_stages = _attention_launch_config(head_dim, q.device)
-    # 128-wide backward tiles exceed the H100 shared-memory budget for D=128.
-    # Forward benefits from them, while backward is feasible at 64x64.
+    # Bound backward query/key tiles to fit the gradient accumulators.
     block_m = min(block_m, 64)
     block_n = min(block_n, 64)
-    # The dk/dv accumulators are [BLOCK_N, BLOCK_D] float32 tiles, so the key
-    # tile has to shrink at D=256: BLOCK_N=64 already needs 128 KiB of UB for
-    # dk and dv alone and fails to compile ("Cc overflow").
+    # D=256 needs smaller tiles for the FP32 dk/dv accumulators.
     kv_block_m = block_m
     kv_block_n = block_n
     if head_dim > 128:
@@ -662,9 +643,6 @@ def _routed_gqa_attn_fwd_kernel(
 
     Each descriptor covers route rows of a *single* (chunk, head) expert, so the
     K/V tile of that chunk is loaded once and reused by all ``TILES`` row tiles.
-    That cuts the routed-attention K/V traffic by ``TILES`` (the previous
-    one-descriptor-per-64-rows form reloaded the same 128x128 K/V once per 64
-    rows: ~1.07 GB at S=4096, i.e. 32x the expert-major minimum).
     """
     descriptor = tl.program_id(0) + DESCRIPTOR_OFFSET
     expert = tl.load(descriptor_experts_ptr + descriptor)
@@ -861,11 +839,8 @@ def _fused_merge_softmax_kernel(
     tokens = token_block * ROWS_PER_PROGRAM + tl.arange(0, ROWS_PER_PROGRAM)
     mask_t = tokens < num_tokens
     rows = tokens * num_heads + head
-    # The routed row ids are indexed by ``topk * tokens * heads`` (up to 5.9e7
-    # at the largest benchmark shape); multiplying them by head_dim overflows
-    # int32 past ~2^31 elements, so every element-level row offset is computed
-    # in int64. The self-attention/output row ids stay below that bound today
-    # but use the same widened arithmetic for safety.
+    # Widen row ids before multiplying by head_dim: routed element offsets
+    # can exceed the int32 range.
     rows_i64 = rows.to(tl.int64)
 
     token_lse = tl.load(
@@ -954,11 +929,8 @@ def _fused_merge_softmax_triton(
     num_tokens = num_rows // num_heads
     block_d = min(128, triton.next_power_of_2(head_dim))
     num_d_blocks = cdiv(head_dim, block_d)
-    # Head-major row tiling: one program merges `_MERGE_ROWS_PER_PROGRAM` tokens
-    # of one head.  It both keeps the launch under the Ascend 65535-program
-    # limit for benchmark shapes (one token row per program would need
-    # num_tokens * num_heads) and turns the routed row gather into a nearly
-    # sequential access pattern.
+    # Merge consecutive tokens of one head per program, making route gathers
+    # nearly sequential and reducing the number of programs.
     rows_per_program = _MERGE_ROWS_PER_PROGRAM
     num_token_blocks = cdiv(num_tokens, rows_per_program)
     num_programs = num_token_blocks * num_heads
