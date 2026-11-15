@@ -85,7 +85,11 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
         stride_bz_qo, stride_h_qo, stride_seq_qo,
         q_scale.stride(0), q_scale.stride(1),
         sm_scale=(sm_scale * 1.44269504),
-        C=head_dim, BLK=BLKQ
+        C=head_dim, BLK=BLKQ,
+        # One warp per block-wide reduction: the 4-warp default adds a
+        # cross-warp reduction barrier and measured 5.5x slower on S60 for
+        # the (4,32,1024,128) workload.
+        num_warps=1,
     )
 
     grid = ((kv_len + BLKK - 1) // BLKK, h_kv, b)
@@ -95,7 +99,9 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
         stride_bz_ko, stride_h_ko, stride_seq_ko,
         k_scale.stride(0), k_scale.stride(1),
         sm_scale=1.0,
-        C=head_dim, BLK=BLKK
+        C=head_dim, BLK=BLKK,
+        # Same single-warp block reduction as the Q launch above.
+        num_warps=1,
     )
 
     return q_int8, q_scale, k_int8, k_scale
