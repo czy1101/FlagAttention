@@ -156,3 +156,47 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len):
 
     torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(actual_lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.sage_attention
+@pytest.mark.parametrize("predequantize_k", [False, True])
+@pytest.mark.parametrize("tile_major", [False, True])
+def test_forward_predequant_k_matches_reference(predequantize_k, tile_major):
+    """D128 long-sequence path: inline K conversion vs the pre-dequantized copy."""
+    torch.manual_seed(2026)
+    batch_size, num_query_heads, num_kv_heads = 1, 4, 2
+    seq_len, head_dim = 1024, 128
+    q = torch.randn(
+        (batch_size, num_query_heads, seq_len, head_dim),
+        device=test_backend.device,
+        dtype=torch.float16,
+    )
+    k = torch.randn(
+        (batch_size, num_kv_heads, seq_len, head_dim),
+        device=test_backend.device,
+        dtype=torch.float16,
+    )
+    v = torch.randn_like(k)
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
+
+    actual, actual_lse = sage_attention(
+        q_int8,
+        k_int8,
+        v,
+        q_scale,
+        k_scale,
+        return_lse=True,
+        predequantize_k=predequantize_k,
+        tile_major_predequant_k=tile_major,
+    )
+    expected, expected_lse = _reference(
+        q_int8,
+        k_int8,
+        v,
+        q_scale,
+        k_scale,
+        "HND",
+    )
+
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_lse, expected_lse, atol=2e-2, rtol=2e-2)
