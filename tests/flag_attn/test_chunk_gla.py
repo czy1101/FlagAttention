@@ -1004,7 +1004,11 @@ def test_chunk(B, T, H, D, dtype, gate_logit_normalizer):
 @pytest.mark.chunk_gla
 @pytest.mark.parametrize(
     ("K", "V"),
-    [(32, 32), (64, 128), (96, 128), (128, 64), (128, 128), (256, 64)],
+    [
+        (32, 32), (32, 64), (48, 80), (64, 32), (64, 128),
+        (64, 256), (96, 128), (128, 64), (128, 128), (256, 64),
+        (64, 320), (320, 64),
+    ],
 )
 def test_chunk_fp16_parallel_state_shapes(K, V, monkeypatch):
     """Check output, final state, and every gradient at the admitted shapes."""

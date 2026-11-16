@@ -36,19 +36,6 @@ PARALLEL_STATE_ENABLED = (
 PARALLEL_BWD_STATE_ENABLED = (
     os.environ.get("FLAGGEMS_ENFLAME_GLA_PARALLEL_BWD_STATE", "1") != "0"
 )
-PARALLEL_FP16_STATE_SHAPES = frozenset(
-    {
-        (32, 32),
-        (64, 64),
-        (64, 128),
-        (96, 128),
-        (128, 64),
-        (128, 128),
-        (256, 64),
-    }
-)
-
-
 @triton.jit(do_not_specialize=["N"])
 def _prepare_chunk_offsets_kernel(
     cu_seqlens,
@@ -1167,11 +1154,8 @@ def chunk_fwd_h(
         # with the independently controlled parallel backward-state path.
         and (not states_in_fp32 or PARALLEL_BWD_STATE_ENABLED)
         and not state_v_first
-        # Admit only FP16 shapes validated for both parallel state passes.
-        and (
-            k.dtype == torch.bfloat16
-            or (k.dtype == torch.float16 and (K, V) in PARALLEL_FP16_STATE_SHAPES)
-        )
+        # FP16 and BF16 use the same local-state kernels when semantic guards hold.
+        and k.dtype in (torch.bfloat16, torch.float16)
         and v.dtype == k.dtype
         and g is None
         and g_gamma is None
@@ -1401,12 +1385,8 @@ def chunk_bwd_dh(
         and BT == 64
         and HQ == H
         and not state_v_first
-        # BF16 keeps the original unrestricted parallel path.  FP16 uses the
-        # same validated shape set as forward.
-        and (
-            k.dtype == torch.bfloat16
-            or (k.dtype == torch.float16 and (K, V) in PARALLEL_FP16_STATE_SHAPES)
-        )
+        # Match the forward dtype admission for the backward state pass.
+        and k.dtype in (torch.bfloat16, torch.float16)
         and q.dtype == k.dtype
         and do.dtype == k.dtype
         and g is None
