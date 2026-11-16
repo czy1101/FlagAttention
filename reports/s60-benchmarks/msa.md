@@ -72,6 +72,31 @@ not claim a reference latency.
 - Logs: `bench_logs/msa_{base,opt}.log`.
 
 
+## Optimization summary (what changed and why)
+
+- Commit `262377f` (`perf(enflame): batch dense MSA TopK rows per program`) plus
+  the dispatch helper from `2f3abd1`, `_enflame/msa/index_topk.py`:
+  for dense prefill with `0 < topk <= 4`, `max_blocks <= 512`, `batch <= 255`
+  and `heads <= 255`, the reduction TopK reuses the repository's existing
+  multi-row kernel `_prefill_topk_rows_enflame` with `BLOCK_SIZE_Q = 8` instead
+  of launching one program per query row.
+- Why it can help: the reduction path is a tiny per-row scan (16 fp32 scores,
+  four max/tie-break rounds). One program per row produced 2048 single-warp
+  programs for the target shape; batching 8 rows per program cuts that to 256
+  programs and amortises the per-program cost. It is a work-decomposition
+  change, not a new selection algorithm, and the selection/tie/`-1` padding
+  semantics are unchanged (verified with exact-equality replay on 10 boundary
+  cases, including ties, NaN, all `-inf`, tail rows, `blocks == topk`,
+  non-contiguous strides and `topk` 1..3).
+- Measured effect: TopK kernel 1.0057 → 0.8609 ms in this benchmark (−14.4%);
+  the earlier in-context profiler showed 948 → 810 µs for the kernel and
+  1780 → 1642 µs for the three-kernel span. The public-call gain here (27.5%)
+  is larger than the device-time gain; the extra part is **not attributed**
+  (baseline public-call samples were bimodal at this shape).
+- Scope: `topk > 4` keeps the existing streaming path (already multi-row),
+  `max_blocks > 512` and oversized grids keep the one-row fallback; packed
+  varlen bypasses the autotuner by design.
+
 ## Correctness and caveats
 
 - Only the benchmark's own provider checks apply; no additional numerical gate
