@@ -81,6 +81,35 @@ not claim a reference latency.
   `sage_logs/ab_*.json`.
 
 
+## Optimization summary (what changed and why)
+
+Two commits on this branch:
+
+1. `428a9bc` — `_enflame/sage_attention/quant_per_block.py` now launches both
+   Q/K quantisation kernels with `num_warps=1` instead of the default 4.
+   Mechanism: each program performs a **block-wide max** over the whole
+   `[BLK, D]` tile to derive the per-block scale. With 4 warps the compiled
+   module gains a cross-warp reduction barrier and 512 B more shared memory
+   (`syncthreads` 2 vs 1, 66048 vs 65536 B); measured 8.23 → 1.49 ms (5.5×) at
+   T=1024, and the INT8 tensors plus both scale tensors are **bitwise identical**
+   (SHA-256 checked), so the quantisation semantics do not change.
+   Rejected in the same round: chunked two-pass tiles (slower at 1 warp),
+   reciprocal-multiply (no gain, 773/4670 INT8 values changed by 1 LSB), and
+   INT8 `tl.dot` (compiles and is exact, but emits **no `convgen` matrix
+   intrinsic** on this backend, so it is not a faster matrix path).
+2. `eba192c` — `_enflame/sage_attention/attn_qk_int8_per_block.py` lowers the
+   D128 K pre-dequantisation threshold from 64 to 8 reuse blocks. The kernel
+   otherwise re-converts every K tile from INT8 to FP16 once per query program;
+   pre-dequantising once turns that into one linear pass plus a cheaper QK loop.
+   Measured attention-only: −11.3% / −18.6% / −22.4% at T=1024/2048/4096. This
+   extends the repository's existing mechanism (D64 keeps threshold 32) and adds
+   an FP16 K temporary of 2 B/element.
+
+Evidence level: both effects are measured on card 7 with the same inputs; the
+warp-count explanation is supported by the compiled metadata/IR but not by
+hardware counters. Scope: quantisation change applies to all shapes; the
+pre-dequantisation change needs `attn_mask is None` and D128.
+
 ## Correctness and caveats
 
 - Only the benchmark's own provider checks apply; no additional numerical gate
