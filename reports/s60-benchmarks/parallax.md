@@ -67,6 +67,26 @@ not claim a reference latency.
 - Logs: `bench_logs/parallax_{base,opt}.log`.
 
 
+## Optimization summary (what changed and why)
+
+Two commits on this branch, both in `_enflame/FLA/parallax/parallel.py`:
+
+1. `8eda243` — for dense BF16 `D=64`, no window and `T >= 512`, the query-row
+   tile `BT` is raised from 64 to 128. Each program then serves twice as many
+   query rows, so every K/V tile fetched from HBM/Paged memory is reused across
+   more query rows (half as many query tiles, same K/V working set).
+2. `8dd9b0f` — the forward autotune space gains `(BK,BS) = (64,256)` and
+   `(64,512)`; the pruner keeps them only when `BK == next_power_of_2(D)`, i.e.
+   `D <= 64`. On the target shape the tuner moves from `BS=128` to `BS=512`,
+   which cuts the KV column-block loop from 136 to 40 blocks per
+   (batch, query-head) and amortises the per-block staging/wait cost.
+
+Evidence level: the `BS` change is validated by the earlier paired A/B
+(3.8493 → 2.1008 ms with explicit per-call events) and the repository benchmark
+above reproduces it; the per-block wait/DMA explanation remains a hypothesis —
+no hardware counters were collected. Scope: dense forward only; packed/varlen
+forces `BS=BT`, and the backward tile lists are untouched.
+
 ## Correctness and caveats
 
 - Only the benchmark's own provider checks apply; no additional numerical gate
