@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -55,6 +57,30 @@ _S60_STATE_BV = 256
 _S60_STATE_NUM_WARPS = 1
 _S60_STATE_NUM_STAGES = 2
 _S60_FUSED_BT = 64
+
+# The values above are upper bounds, not per-call tiles: a 256-wide tile over
+# a K=64 or V=64 extent still issues a 256-lane dot whose lanes 64..255 are
+# masked, burning shared memory and matrix-pipe work for nothing.  Both fused
+# kernels access their tiles through boundary-checked block pointers, so
+# clamping a tile to the logical extent of the tensor is numerically neutral.
+# FLAG_ATTN_GDN2_FIXED_TILES=1 restores the legacy always-256 tiles.
+_S60_TILE_MIN = 64
+_S60_TILE_MAX = 256
+_S60_TILES_ADAPT = os.environ.get("FLAG_ATTN_GDN2_FIXED_TILES", "0") != "1"
+
+
+def _s60_tile(extent: int, limit: int) -> int:
+    """Largest power-of-two tile <= limit that covers ``extent``, clamped.
+
+    Rounding up to a power of two keeps the S60 dot shape aligned; clamping to
+    the real K/V extent removes the masked lanes of an oversized tile.
+    """
+    if not _S60_TILES_ADAPT:
+        return limit
+    tile = _S60_TILE_MIN
+    while tile < extent and tile < limit:
+        tile *= 2
+    return min(limit, max(_S60_TILE_MIN, tile))
 
 # Retained as capability metadata for existing benchmark/test imports. Runtime
 # dispatch does not depend on it: the fused Triton kernels are always defined.
@@ -418,6 +444,9 @@ def chunk_gdn2_fwd_intra_infer(
 
     NT = triton.cdiv(T_len, BT) if cu_seqlens is None else len(chunk_indices)
 
+    intra_bk = _s60_tile(K, _S60_INTRA_BK)
+    intra_bv = _s60_tile(V, _S60_INTRA_BV)
+
     grid_mode = _GRID_MODE_ORIGINAL
     bh = B * H
     if bh > _ENFLAME_GRID_YZ_LIMIT:
@@ -468,8 +497,8 @@ def chunk_gdn2_fwd_intra_infer(
         K=K,
         V=V,
         BT=BT,
-        BK=_S60_INTRA_BK,
-        BV=_S60_INTRA_BV,
+        BK=intra_bk,
+        BV=intra_bv,
         GRID_MODE=grid_mode,
         num_warps=_S60_INTRA_NUM_WARPS,
         num_stages=_S60_INTRA_NUM_STAGES,
@@ -1096,6 +1125,7 @@ def chunk_gdn2_fwd_h_o_infer(
         state_bk = _S60_STATE_BK_MEDIUM
     else:
         state_bk = _S60_STATE_BK_LARGE
+    state_bv = _s60_tile(V, _S60_STATE_BV)
 
     if BT != _S60_FUSED_BT:
         raise ValueError(
@@ -1164,7 +1194,7 @@ def chunk_gdn2_fwd_h_o_infer(
         V=V,
         BT=BT,
         BK=state_bk,
-        BV=_S60_STATE_BV,
+        BV=state_bv,
         STATE_V_FIRST=state_v_first,
         GRID_MODE=grid_mode,
         num_warps=_S60_STATE_NUM_WARPS,
