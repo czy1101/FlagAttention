@@ -1006,8 +1006,37 @@ def test_chunk(B, T, H, D, dtype, gate_logit_normalizer):
     ("K", "V"),
     [(32, 32), (64, 128), (96, 128), (128, 64), (128, 128), (256, 64)],
 )
-def test_chunk_fp16_parallel_state_shapes(K, V):
+def test_chunk_fp16_parallel_state_shapes(K, V, monkeypatch):
     """Check output, final state, and every gradient at the admitted shapes."""
+    import importlib
+
+    state_module = importlib.import_module(
+        "flag_attn.runtime.backend._enflame.FLA.chunk_h"
+    )
+    launches = {}
+
+    class LaunchProbe:
+        def __init__(self, name, kernel):
+            self.name = name
+            self.kernel = kernel
+
+        def __getitem__(self, grid):
+            launch = self.kernel[grid]
+
+            def counted_launch(*args, **kwargs):
+                launches[self.name] = launches.get(self.name, 0) + 1
+                return launch(*args, **kwargs)
+
+            return counted_launch
+
+    for name in (
+        "_chunk_fwd_local_state_kernel", "_chunk_bwd_local_state_kernel",
+        "chunk_fwd_kernel_h", "chunk_bwd_kernel_dh",
+    ):
+        monkeypatch.setattr(
+            state_module, name, LaunchProbe(name, getattr(state_module, name))
+        )
+
     torch.manual_seed(42)
     os.environ["TRITON_F32_DEFAULT"] = "ieee"
     device = torch.device(test_backend.device)
@@ -1044,6 +1073,10 @@ def test_chunk_fp16_parallel_state_shapes(K, V):
         ("dq", "dk", "dv", "dg", "dh0"), actual_grads, expected_grads
     ):
         _assert_close(name, actual_grad, expected_grad, 0.005)
+    assert launches.get("_chunk_fwd_local_state_kernel", 0) > 0
+    assert launches.get("_chunk_bwd_local_state_kernel", 0) > 0
+    assert launches.get("chunk_fwd_kernel_h", 0) == 0
+    assert launches.get("chunk_bwd_kernel_dh", 0) == 0
 
 
 @pytest.mark.chunk_gla
