@@ -32,13 +32,7 @@ import triton
 
 DiffKVMode = Literal["full", "swa"]
 DiffKVPath = Literal["2d", "3d"]
-
-# Stable operator identifier shared by the public API, pytest marker,
-# benchmark adapter, and ``conf/operators.yaml`` inventory.  Keep this
-# separate from Triton kernel function names so callers do not depend on
-# implementation details.
 OP_NAME: Final = "diffkv_attention"
-
 
 @dataclass(frozen=True)
 class DiffKVLayout:
@@ -67,7 +61,6 @@ def num_kv_heads_for_mode(
         return layout.swa_num_kv_heads
     raise ValueError(f"mode must be 'full' or 'swa', got {mode!r}")
 
-
 # -----------------------------------------------------------------------------
 # Shared launch defaults and policy constants
 # -----------------------------------------------------------------------------
@@ -78,14 +71,12 @@ HEAD_SIZE_V: Final = DEFAULT_LAYOUT.head_size_v
 QK_TILE_LO: Final = 128
 QK_TILE_HI: Final = 64
 
-
 @dataclass(frozen=True)
 class LaunchDefaults:
-    """Small stable defaults shared by the launch heuristics and kernels.
+    """Base defaults for kernel launch configuration.
 
-    Shape-specific values are derived properties rather than independent
-    configuration knobs.  This keeps the launch policy from accumulating a
-    separate constant for every historical benchmark shape.
+    Specialized launch parameters are derived from these defaults
+    instead of being stored as independent constants.
     """
 
     warps: int = 4
@@ -138,7 +129,6 @@ class LaunchDefaults:
     def fused_stages(self) -> int:
         return max(self.stages - 1, 1)
 
-
 @dataclass(frozen=True)
 class WorkloadPolicy:
     """KV-length boundaries used to classify launch workloads."""
@@ -148,7 +138,6 @@ class WorkloadPolicy:
     short_2d_max_k: int = 1536
     short_2d_wide_tile_k: int = 512
 
-
 @dataclass(frozen=True)
 class ResourcePolicy:
     """Small geometry targets shared by launch heuristics."""
@@ -156,11 +145,9 @@ class ResourcePolicy:
     target_cta_waves_per_sm: int = 2
     dedup_programs_per_sm_limit: int = 8
 
-
 LAUNCH = LaunchDefaults()
 WORKLOAD = WorkloadPolicy()
 RESOURCE = ResourcePolicy()
-
 
 # -----------------------------------------------------------------------------
 # Implementation loading and compatibility exports
@@ -170,9 +157,7 @@ RESOURCE = ResourcePolicy()
 def _implementation():
     """Load the kernel module lazily to keep API/config imports acyclic."""
     from . import diffkv
-
     return diffkv
-
 
 _IMPLEMENTATION_EXPORTS = frozenset(
     {
@@ -181,13 +166,11 @@ _IMPLEMENTATION_EXPORTS = frozenset(
     }
 )
 
-
 def __getattr__(name: str):
     """Lazily expose scheduling utilities without an import cycle."""
     if name in _IMPLEMENTATION_EXPORTS:
         return getattr(_implementation(), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 
 # -----------------------------------------------------------------------------
 # Public input validation
@@ -198,7 +181,6 @@ def _validate_backend_argument(backend: str | None) -> None:
     if backend not in (None, "auto", "triton"):
         raise ValueError("MetaX DiffKV has one Triton implementation; omit backend or use triton")
 
-
 def _validate_public_inputs(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -207,12 +189,12 @@ def _validate_public_inputs(
     block_tables: torch.Tensor,
     window_size: int,
 ) -> tuple[int, int, int, int]:
-    """Validate the lightweight public paged-cache contract.
+    """Validate tensor metadata and the window-size argument.
 
-    Like the reference FlagAttention operators, this checks only structural
-    constraints needed to select a kernel.  The caller owns the paged-cache
-    contract; scanning ``context_lens`` or ``block_tables`` here would add a
-    GPU-to-host synchronization to every public call.
+    The caller must ensure that context lengths and referenced block
+    indices satisfy the paged-cache contract. Their values are not
+    validated here to avoid synchronizing device-side validation results
+    back to the host on every call.
     """
     if query.ndim != 3 or key_cache.ndim != 4 or value_cache.ndim != 4:
         raise ValueError(
@@ -247,7 +229,6 @@ def _validate_public_inputs(
         raise ValueError("window_size must be -1 or a positive token count")
     return batch, num_query_heads, head_size_qk, value_cache.shape[3]
 
-
 # -----------------------------------------------------------------------------
 # Low-level dispatch and compatibility entry points
 # -----------------------------------------------------------------------------
@@ -262,7 +243,6 @@ def unified_attention_diffkv(
     _validate_backend_argument(backend)
     kwargs.pop("seq_threshold_3D", None)
     return _implementation()._unified_attention_diffkv(*args, path=path, **kwargs)
-
 
 # -----------------------------------------------------------------------------
 # Public decode interface and workspace preparation
@@ -281,23 +261,31 @@ def diffkv_attention(
     num_segments: int | None = None,
     backend: str | None = None,
 ) -> torch.Tensor:
-    """Run paged DiffKV attention for decode workloads.
+    """Run paged DiffKV attention with one decode query per sequence.
+
+    Each query corresponds to the last position in its valid KV sequence.
+    The KV caches must already contain the tokens to attend to; this
+    function does not update them.
 
     Args:
-        query: Query tensor with shape ``[B, Hq, Dqk]``.
-        key_cache: Paged key cache ``[NB, BS, Hkv, Dqk]``.
-        value_cache: Paged value cache ``[NB, BS, Hkv, Dv]``.
-        context_lens: Cached token count for each sequence, shape ``[B]``.
-        block_tables: Physical KV block indices, shape ``[B, max_blocks]``.
-        attn_scale: Optional softmax scale; defaults to ``Dqk ** -0.5``.
-        window_size: Number of recent KV tokens, or ``-1`` for full context.
+        query: Query tensor of shape ``[B, Hq, Dqk]``.
+        key_cache: Paged key cache of shape ``[NB, BS, Hkv, Dqk]``.
+        value_cache: Paged value cache of shape ``[NB, BS, Hkv, Dv]``.
+        context_lens: Valid KV token count per sequence, shape ``[B]``.
+        block_tables: Logical-to-physical KV block mapping, shape
+            ``[B, max_blocks]``.
+        attn_scale: Attention score scale; defaults to ``Dqk ** -0.5``.
+        window_size: Maximum number of recent KV tokens to attend to,
+            including the query's position; ``-1`` uses the full context.
         path: Launch path, either ``"2d"`` or ``"3d"``.
-        num_segments: Optional split-KV segment count for the 3D path.
-        backend: Legacy compatibility argument. None, "auto", and "triton"
-            all use the same MetaX Triton implementation.
+        num_segments: Split-KV segment count for the 3D path.
+            ``None`` selects it automatically. Ignored by the 2D path.
+        backend: Compatibility selector. ``None``, ``"auto"``, and
+            ``"triton"`` all use the MetaX Triton implementation.
 
     Returns:
-        Attention output with shape ``[B, Hq, Dv]``.
+        Attention output of shape ``[B, Hq, Dv]``, with the same
+        dtype and device as ``query``.
     """
     _validate_backend_argument(backend)
     batch, num_query_heads, head_size_qk, head_size_v = _validate_public_inputs(
@@ -319,8 +307,6 @@ def diffkv_attention(
         device=query.device,
         dtype=query.dtype,
     )
-    # Public decode always has one query per sequence. The launcher marks
-    # IS_DECODE=True, so this compatibility pointer is never dereferenced.
     cu_seqlens_q = context_lens
     max_seqlen_k = block_tables.shape[1] * key_cache.shape[1]
     path = _implementation()._normalize_path(path)
@@ -369,8 +355,6 @@ def diffkv_attention(
         num_segments = None
         segm_output = segm_max = segm_expsum = None
         seq_threshold = None
-    # C550 measurements favor the existing parallel reducer over the
-    # last-CTA serial head reduction. The low-level fused path is retained.
     fused_reducer_counter = None
     triton_window = (
         (window_size - 1, 0) if window_size > 0 else (-1, -1)
