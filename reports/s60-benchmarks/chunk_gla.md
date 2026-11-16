@@ -65,6 +65,25 @@ not claim a reference latency.
   `/data/hjq/bench_logs/`).
 
 
+## Optimization summary (what changed and why)
+
+- Commit `ec9942a` (`perf(enflame): pack two heads per GLA gate scan tile`),
+  `_enflame/FLA/gla/chunk_gla.py`, +15/−? lines plus tests:
+  when the call is dense (`cu_seqlens is None`), `chunk_size == 64`, BF16,
+  `head_dim == 128`, `H > 1` and contiguous, the gate tensor is flattened so one
+  256-feature tile covers **two adjacent 128-wide heads**, the local cumulative
+  sum is computed once on that tile, and the result is viewed back.
+- Why it can help: the gate prefix scan is a per-head tile operation; packing two
+  heads doubles the useful width of each scan tile and halves the number of scan
+  tiles launched for the same token range.
+- Evidence level: the mechanism follows directly from the diff; this round did
+  **not** re-profile the scan kernel, so "fewer/better-utilised scan tiles" is
+  an inference from the code change, while the 22.9% forward gain above is
+  measured on card 7.
+- Scope: guarded by dtype/layout/`chunk_size`/dense conditions; other shapes fall
+  back to the previous per-head scan. The forward+backward table shows the
+  end-to-end effect including the extra test coverage added with the same commit.
+
 ## Correctness and caveats
 
 - Only the benchmark's own provider checks apply; no additional numerical gate
