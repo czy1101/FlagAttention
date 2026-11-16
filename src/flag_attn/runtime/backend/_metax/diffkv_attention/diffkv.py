@@ -19,7 +19,6 @@
 selects launch configurations and implements paged QK, online softmax, PV, and
 split-KV reduction using standard Triton.
 
-
 """
 
 from __future__ import annotations
@@ -77,17 +76,11 @@ def cast_indices(source):
     _cast[(triton.cdiv(source.numel(), 256),)](source, out, source.numel(), columns, s0, s1, 256)
     return out
 
-
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-
 DiffKVPath = Literal["2d", "3d"]
 
 _AUTOTUNE_ENV: Final = "FLAG_ATTN_DIFFKV_AUTOTUNE"
 _FALSE_VALUES: Final = frozenset(("0", "false", "off", "no"))
 _TRUE_VALUES: Final = frozenset(("1", "true", "on", "yes"))
-
-
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -125,8 +118,7 @@ def _device_num_sms(device: torch.device) -> int:
     return _get_num_sms(device_index)
 
 
-# Autotune is opt-in because these decode kernels are short enough that the
-# Autotuner wrapper's dispatch overhead is visible in end-to-end timings.
+
 _DIFFKV_AUTOTUNE = _env_flag(_AUTOTUNE_ENV)
 _MAIN_AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=2, num_stages=2),
@@ -145,7 +137,6 @@ def _reset_autotune_state(kwargs, reset_only=False):
     del reset_only
     if kwargs.get("FUSED_REDUCER", False):
         zero_buffer(kwargs["completion_counter_ptr"])
-
 
 # ---------------------------------------------------------------------------
 # Triton helper functions
@@ -248,7 +239,6 @@ def _segment_pointers(
     if use_3d:
         return segm_output, segm_max, segm_expsum
     return out, out, out
-
 
 # -----------------------------------------------------------------------------
 # Shared attention kernel helpers
@@ -436,7 +426,6 @@ def softmax_step(S, M, L):
     alpha = tl.exp(M - m_j)
     return m_j, L * alpha + l_j, P, alpha
 
-
 # -----------------------------------------------------------------------------
 # Triton scheduling policies
 # -----------------------------------------------------------------------------
@@ -461,12 +450,6 @@ def should_use_fused_reducer(
     ):
         return False
 
-    # The fused path uses a completion counter whose terminal CTA is
-    # responsible for publishing the final output.  A tail sequence can leave
-    # some of the nominal segment CTAs empty (for example, 513 tokens with a
-    # 32-way split and 16-token tiles).  Those CTAs return before incrementing
-    # the counter, so enabling fusion would leave the output unfinalized.  The
-    # regular reducer handles this case through its active-segment mask.
     fused_segments = _LAUNCH.fused_segments
     tile_size = get_tile_size(use_3d, num_seqs, max_seqlen_k)
     if (
@@ -484,11 +467,6 @@ def should_use_fused_reducer(
     if active_segments != fused_segments:
         return False
 
-    # The fused path uses one completion counter per sequence/head group.  A
-    # single sequence can use it across short and medium KV lengths.  For a
-    # small batch, keep fusion in the lower medium range where the regular
-    # launch would use the same compact split; longer medium contexts retain
-    # the parallel reducer to avoid doubling partial-buffer traffic.
     if num_seqs == 1:
         return workload in {"short", "medium"}
     return num_seqs <= 4 and _medium_work_is_compact(max_seqlen_k, tile_size)
@@ -529,12 +507,6 @@ def should_split_decode_heads(
     if not use_3d:
         if workload != "short" or num_sms is None or num_sms <= 0:
             return False
-        # Splitting a GQA group multiplies the query-head grid, but it also
-        # keeps the full Q/K/V state live in every split program.  Once the
-        # projected split grid already covers roughly half the device, the
-        # extra register pressure costs more than the additional CTAs.  Base
-        # this decision on projected geometry rather than a batch/KV table so
-        # it transfers to other SM counts and nearby workloads.
         split_block_m = _LAUNCH.split_head_block_m_3d
         split_factor = max(num_queries_per_kv // split_block_m, 1)
         projected_programs = num_seqs * num_kv_heads * split_factor
@@ -612,9 +584,6 @@ def get_decode_split_block_m(
         else 0
     )
 
-    # Try the largest tile first.  Keeping at most half of the normal query
-    # tile's KV work per segment prevents a split from duplicating a long
-    # scan merely to add CTAs.
     candidate = max(_LAUNCH.query_block_m // 2, 1)
     while candidate >= 1:
         split_factor = max(math.ceil(num_queries_per_kv / candidate), 1)
@@ -672,10 +641,6 @@ def should_use_async_reducer(
     num_sms: int,
 ) -> bool:
     """Prefetch reducer partials only for a sub-wave long-context grid."""
-    # Triton 3.6 + the CUDA 12.8 ptxas combination used by the deployment
-    # image rejects the async reducer's ``.cg``/``evict_first`` lowering for
-    # this narrow 64Q/32K launch.  Keep the synchronous reducer there; this
-    # is a toolchain guard, not a workload-specific performance exception.
     if (
         max_seqlen_k == 32768
         and num_query_tokens == 1
@@ -722,8 +687,6 @@ def _geometry_split_segments(
     return min(segments, max_useful_segments)
 
 
-# Segment selection is a pure function of scalar launch descriptors.  Cache
-# repeated decode shapes so the host does not redo the policy on every token.
 @lru_cache(maxsize=128)
 def get_num_par_softmax_segments(
     max_seqlen_k: int | None,
@@ -745,9 +708,6 @@ def get_num_par_softmax_segments(
         num_kv_heads,
         num_sms,
     )
-    # Use one geometry rule for canonical and dynamic request lengths.  The
-    # fused last-CTA reducer is selected independently by the launcher; normal
-    # split-KV work must not depend on a hand-written length table.
     if (
         max_seqlen_k is not None
         and total_num_q_blocks is not None
@@ -762,8 +722,6 @@ def get_num_par_softmax_segments(
             num_sms,
             tile_size,
         )
-    # Generic callers without full geometry receive a conservative single
-    # split; the public decode API supplies all descriptors above.
     return 1
 
 
@@ -793,9 +751,6 @@ def get_num_stages(
         and math.ceil(max_seqlen_k / (num_segments * tile_size))
         <= _LAUNCH.stages + 1
     ):
-        # A one-stage pipeline avoids setup/retirement overhead when a CTA
-        # only visits a few KV tiles.  Longer loops keep the normal
-        # overlap-oriented stage count below.
         return 1
     if (
         not use_3d
@@ -911,9 +866,6 @@ def get_tile_size(
             or (not has_geometry and num_seqs >= 16)
         )
     ):
-        # Larger decode batches already provide sequence parallelism.  A
-        # wider tile reduces the serial KV loop while the segment policy
-        # supplies enough CTAs to keep the device occupied.
         return _LAUNCH.wide_3d_tile
     if num_seqs >= 8:
         return _LAUNCH.default_tile
@@ -950,13 +902,7 @@ def should_dedup_block_table(
         return False
 
 
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# These values are pure functions of compile-time launch arguments.  The
-# pattern as the GLA/MSA kernels: callers provide the real head dimensions and
-# the compiler receives the padded/vectorized dimensions as constexpr values.
-# intentionally retain explicit constexpr arguments: with the current Triton
-# generated code and regresses several short 3D decode shapes.
+
 _HEAD_SIZE_HEURISTICS = {
     "HEAD_SIZE_QK_PADDED": lambda args: triton.next_power_of_2(
         args["HEAD_SIZE_QK"]
@@ -981,26 +927,20 @@ _REDUCER_HEURISTICS = {
 
 @triton.jit
 def kernel_unified_attention_diffkv(
-    # Output and synchronization pointers.  In 2D mode we write the final
-    # result into ``output_ptr``; in 3D mode we write per-segment partials
-    # into ``segm_*``.  ``completion_counter_ptr`` is only used by the fused
-    # reducer path; callers pass a valid placeholder for other paths.
     output_ptr,
     segm_output_ptr,
     segm_max_ptr,
     segm_expsum_ptr,
     completion_counter_ptr,
-    # Query/cache inputs and optional metadata.
     query_ptr,
-    key_cache_ptr,  # view of packed cache: [..., :head_size_qk]
-    value_cache_ptr,  # view of packed cache: [..., head_size_qk:hqk+hv]
+    key_cache_ptr,
+    value_cache_ptr,
     sink_ptr,
     block_tables_ptr,
     seq_lens_ptr,
     alibi_slopes_ptr,
     scale,
     softcap,
-    # Compile-time dimensions and feature switches.
     num_query_heads: tl.constexpr,
     num_queries_per_kv: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -1017,14 +957,11 @@ def kernel_unified_attention_diffkv(
     USE_SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
-    # Tensor strides and query metadata.
     block_table_stride: tl.int64,
     query_stride_0: tl.int64,
-    query_stride_1: tl.int64,  # == HEAD_SIZE_QK
+    query_stride_1: tl.int64,
     output_stride_0: tl.int64,
-    output_stride_1: tl.int64,  # == HEAD_SIZE_V
-    # Strides for both cache views (they share the same packed buffer, so
-    # dims 0/1/2 strides match; only the per-head extent differs).
+    output_stride_1: tl.int64,
     stride_k_cache_0: tl.int64,
     stride_k_cache_1: tl.int64,
     stride_k_cache_2: tl.int64,
@@ -1041,18 +978,11 @@ def kernel_unified_attention_diffkv(
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,
     SPLIT_HEADS: tl.constexpr,
     FUSED_REDUCER: tl.constexpr,
-    # ``IS_3D`` toggles between 2D layout (one program walks the full KV
-    # sequence) and 3D layout (split-KV / FlashDecoding-style: per-segm
-    # programs write partials, finalized by ``kernel_reduce_segments_diffkv``).
     IS_3D: tl.constexpr,
-    # Decode-only batches have exactly one query token per sequence.  Their
-    # q-block index is therefore the sequence index, avoiding the generic
-    # packed-query block lookup and its conservative extra grid entries.
     IS_DECODE: tl.constexpr,
 ):
     q_block_global_idx = tl.program_id(0)
     head_program_idx = tl.program_id(1)
-    # Each program owns a contiguous BLOCK_M slice of its query-head group.
     split_factor = num_queries_per_kv // BLOCK_M if SPLIT_HEADS else 1
     kv_head_idx = head_program_idx // split_factor
     segm_idx = tl.program_id(2) if IS_3D else 0
@@ -1116,8 +1046,6 @@ def kernel_unified_attention_diffkv(
     query_mask = query_mask_0[:, None] & query_mask_1[:, None]
 
     if USE_SPLIT_QK:
-        # Keep these bounds as literals: Triton requires values referenced
-        # directly inside a JIT function to be Triton constexpr globals.
         offs_d_qk_lo = tl.arange(0, 128)
         offs_d_qk_hi = 128 + tl.arange(0, 64)
         Q_lo = tl.load(
@@ -1180,8 +1108,6 @@ def kernel_unified_attention_diffkv(
         tile_mask = seq_offset < max_seq_prefix_len
 
         if DEDUP_BLOCK_TABLE and TILE_SIZE == BLOCK_SIZE:
-            # Every token in this tile belongs to one logical page.  Load the
-            # physical page id once and broadcast it to K/V address lanes.
             physical_block_idx = tl.load(
                 block_tables_ptr + block_table_offset + j,
                 mask=j * TILE_SIZE < max_seq_prefix_len,
@@ -1279,9 +1205,7 @@ def kernel_unified_attention_diffkv(
                 other=0.0,
 
             ).to(Q.dtype)
-        # Larger split-KV tiles benefit from shorter V live ranges.
         if not (IS_3D and TILE_SIZE >= 32 and SLIDING_WINDOW == 0):
-            # V : (TILE_SIZE, HEAD_SIZE_V_PADDED), loaded with standard Triton.
             V_load = tl.load(
                 value_cache_ptr + v_offset,
                 mask=dim_mask_v[None, :] & tile_mask[:, None],
@@ -1294,10 +1218,6 @@ def kernel_unified_attention_diffkv(
                 V = V_load.to(Q.dtype)
 
         if IS_DECODE:
-            # Decode queries are always the final token of their sequence.
-            # ``tile_mask`` already clips the loop to ``seq_len`` and the
-            # causal upper bound is redundant. The sliding-window lower
-            # bound must also mask logits, not only the V contribution.
             seq_mask = tile_mask[None, :]
             if SLIDING_WINDOW:
                 seq_mask &= (seq_len - 1 - seq_offset[None, :]) < SLIDING_WINDOW
@@ -1339,14 +1259,13 @@ def kernel_unified_attention_diffkv(
         M, L, P, alpha = softmax_step(S, M, L)
         acc = acc * alpha[None, :]
         if IS_3D and TILE_SIZE >= 32 and SLIDING_WINDOW == 0:
-            # V : (TILE_SIZE, HEAD_SIZE_V_PADDED), loaded with standard Triton.
             V_load = tl.load(
                 value_cache_ptr + v_offset,
                 mask=dim_mask_v[None, :] & tile_mask[:, None],
                 other=0.0,
 
             )
-            if USE_SPLIT_QK:  # noqa: SIM108
+            if USE_SPLIT_QK:
                 V = V_load.to(Q_lo.dtype)
             else:
                 V = V_load.to(Q.dtype)
@@ -1363,14 +1282,9 @@ def kernel_unified_attention_diffkv(
         else:
             acc = tl.dot(tl.trans(V), tl.trans(P.to(V.dtype)), acc)
 
-    # Restore output orientation only after the KV loop.
     acc = tl.trans(acc)
 
-    # A single short-window segment owns the complete output.
-    # Normalize in FP32 before the final output cast, without partial stores.
-    # ---- Epilogue --------------------------------------------------------
     if IS_3D and not (NUM_SEGMENTS_PER_SEQ == 1 and SLIDING_WINDOW > 0 and SLIDING_WINDOW <= 128):
-        # Store per-segment partials; the reducer accumulates in FP32.
         segm_output_offset = (
             query_offset_0[:, None].to(tl.int64)
             * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_V_PADDED)
@@ -1380,13 +1294,8 @@ def kernel_unified_attention_diffkv(
         )
         store_query_mask = query_mask_0 & query_mask_1
         if FUSED_REDUCER:
-            # BLOCK_M repeats each GQA row to form a tensor-core-compatible
-            # tile. One representative store per real query head is enough.
             store_query_mask &= offs_m < num_queries_per_kv
         if FUSED_REDUCER:
-            # Publish partials before the release atomic.  The write-through
-            # stores and CTA barrier ensure the last CTA observes all peers'
-            # partial output and scalar softmax values.
             tl.store(
                 segm_output_ptr + segm_output_offset,
                 acc,
@@ -1537,20 +1446,19 @@ def kernel_unified_attention_diffkv(
 
 @triton.jit
 def kernel_reduce_segments_diffkv(
-    output_ptr,  # [num_tokens, num_query_heads, head_size_v]
+    output_ptr,
     segm_output_ptr,
-    # [num_tokens, num_query_heads, max_num_segments, head_size_v]
-    segm_max_ptr,  # [num_tokens, num_query_heads, max_num_segments]
-    segm_expsum_ptr,  # [num_tokens, num_query_heads, max_num_segments]
-    seq_lens_ptr,  # [num_seqs]
+    segm_max_ptr,
+    segm_expsum_ptr,
+    seq_lens_ptr,
     num_seqs,
     num_query_heads: tl.constexpr,
     output_stride_0: tl.int64,
-    output_stride_1: tl.int64,  # == HEAD_SIZE_V
+    output_stride_1: tl.int64,
     TILE_SIZE: tl.constexpr,
     HEAD_SIZE_V: tl.constexpr,
     HEAD_SIZE_V_PADDED: tl.constexpr,
-    query_start_len_ptr,  # [num_seqs+1]
+    query_start_len_ptr,
     BLOCK_Q: tl.constexpr,
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,
     IS_DECODE: tl.constexpr,
@@ -1695,12 +1603,6 @@ def kernel_reduce_segments_diffkv_async(
     )
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
-
-
-
-
-
-
 if _DIFFKV_AUTOTUNE:
     _kernel_diffkv_autotuned = triton.autotune(
         configs=_MAIN_AUTOTUNE_CONFIGS,
@@ -1727,7 +1629,6 @@ else:
     _kernel_diffkv_autotuned = kernel_unified_attention_diffkv
     _kernel_reduce_autotuned = kernel_reduce_segments_diffkv
     _kernel_reduce_async_autotuned = kernel_reduce_segments_diffkv_async
-
 
 # -----------------------------------------------------------------------------
 # Host launch configuration and kernel launchers
@@ -1775,8 +1676,6 @@ class _DiffKVLaunchConfig:
     loop_num_stages: int
 
 
-# All inputs are scalar launch descriptors, so reuse the immutable result for
-# repeated decode calls instead of recomputing the policy on every invocation.
 @lru_cache(maxsize=128)
 def _select_launch_config(
     *,
@@ -1813,10 +1712,7 @@ def _select_launch_config(
         has_softmax_buffers=has_softmax_buffers,
     )
 
-    # Derive the medium-work split decision from the same base launch
-    # geometry used to select the final tile.  The head-split choice below
-    # changes BLOCK_M, so this provisional geometry deliberately describes
-    # the unsplit query grid and avoids a circular policy dependency.
+
     base_total_num_q_blocks = num_query_tokens // block_q + num_seqs
     base_launch_num_q_blocks = (
         num_seqs
@@ -1911,8 +1807,7 @@ def _select_launch_config(
         num_seqs,
         use_3d,
     )
-    # The dedup branches mask each page-id load against the valid token
-    # prefix, so a final partial page is safe as well as aligned requests.
+
     dedup_block_table = should_dedup_block_table(
         use_3d,
         tile_size,
@@ -1934,16 +1829,14 @@ def _select_launch_config(
             num_kv_heads=num_kv_heads,
         )
     )
-    # C550 measurements: 64/128-wide multistage tiles need 72--170 KiB.
-    # A 32-wide single-stage tile fits and was faster in all sampled paths.
+
     tile_size = min(tile_size, 32)
     loop_num_stages = 1
     dedup_block_table = should_dedup_block_table(
         use_3d, tile_size, block_size, total_num_q_blocks,
         num_kv_heads, num_segments, num_sms,
     )
-    # MACA matrix instructions reject the original 2/4/8-row dot tiles.
-    # Keep the attention algorithm, padding small GQA groups to 16 rows.
+
     if block_m < 16:
         block_m = 16
         block_q = max(block_m // num_queries_per_kv, 1)
@@ -1971,10 +1864,10 @@ def _select_launch_config(
 
 
 def _unified_attention_diffkv(
-    q,  # [num_tokens, num_query_heads, head_size_qk]
-    k,  # view: [num_blocks, block_size, num_kv_heads, head_size_qk]
-    v,  # view: [num_blocks, block_size, num_kv_heads, head_size_v]
-    out,  # [num_tokens, num_query_heads, head_size_v]
+    q,
+    k,
+    v,
+    out,
     cu_seqlens_q,
     seqused_k,
     softmax_scale,
@@ -1986,7 +1879,6 @@ def _unified_attention_diffkv(
     alibi_slopes=None,
     sinks=None,
     use_alibi_sqrt=False,
-    # 3D / split-KV softmax buffers.  They are required when ``path="3d"``.
     num_par_softmax_segments: int | None = None,
     softmax_segm_output: torch.Tensor | None = None,
     softmax_segm_max: torch.Tensor | None = None,
@@ -1997,7 +1889,6 @@ def _unified_attention_diffkv(
 ):
     _validate_attention_inputs(q, causal, sinks)
 
-    # Read invocation-local tensor metadata once; preserve arbitrary strides.
     q_shape, k_shape, v_shape = q.shape, k.shape, v.shape
     q_strides, k_strides, v_strides = q.stride(), k.stride(), v.stride()
     out_strides, block_table_strides = out.stride(), block_table.stride()
