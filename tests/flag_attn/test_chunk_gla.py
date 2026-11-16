@@ -1003,6 +1003,51 @@ def test_chunk(B, T, H, D, dtype, gate_logit_normalizer):
 
 @pytest.mark.chunk_gla
 @pytest.mark.parametrize(
+    ("K", "V"),
+    [(32, 32), (64, 128), (96, 128), (128, 64), (128, 128), (256, 64)],
+)
+def test_chunk_fp16_parallel_state_shapes(K, V):
+    """Check output, final state, and every gradient at the admitted shapes."""
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    device = torch.device(test_backend.device)
+    B, T, H = 2, 256, 2
+    dtype = torch.float16
+
+    q = torch.rand(B, T, H, K, dtype=dtype, device=device).requires_grad_()
+    k = torch.rand(B, T, H, K, dtype=dtype, device=device).requires_grad_()
+    v = torch.rand(B, T, H, V, dtype=dtype, device=device).requires_grad_()
+    g = F.logsigmoid(torch.rand_like(q)).requires_grad_()
+    h0 = torch.rand(B, H, K, V, dtype=torch.float32, device=device).requires_grad_()
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
+    actual, actual_ht = chunk_gla(
+        q=q, k=k, v=v, g=g, scale=K**-0.5,
+        initial_state=h0, output_final_state=True,
+    )
+    ((actual * do).sum() + (actual_ht * dht).sum()).backward()
+    actual_grads = [x.grad.clone() for x in (q, k, v, g, h0)]
+    for x in (q, k, v, g, h0):
+        x.grad = None
+
+    expected, expected_ht = fused_recurrent_gla(
+        q=q, k=k, v=v, gk=g, initial_state=h0,
+        output_final_state=True,
+    )
+    ((expected * do).sum() + (expected_ht * dht).sum()).backward()
+    expected_grads = [x.grad for x in (q, k, v, g, h0)]
+
+    _assert_close("o", actual, expected, 0.004)
+    _assert_close("ht", actual_ht, expected_ht, 0.005)
+    for name, actual_grad, expected_grad in zip(
+        ("dq", "dk", "dv", "dg", "dh0"), actual_grads, expected_grads
+    ):
+        _assert_close(name, actual_grad, expected_grad, 0.005)
+
+
+@pytest.mark.chunk_gla
+@pytest.mark.parametrize(
     ("B", "T", "H", "D", "dtype"),
     [
         pytest.param(*c, id="B{}-T{}-H{}-D{}-{}".format(*c))
