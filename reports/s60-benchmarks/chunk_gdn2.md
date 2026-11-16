@@ -75,6 +75,22 @@ not claim a reference latency.
 - Logs: `bench_logs/gdn2_{base,opt}*.log`, `bench_logs/gdn2_supp_*.json`.
 
 
+## Optimization summary (what changed and why)
+
+- Commit `808e3c1` (`perf(enflame): specialize GDN2 intra-chunk tile for K=64`),
+  `_enflame/FLA/gdn2/chunk_gdn2.py`, one line:
+  `BK = 64 if K == 64 else _S60_INTRA_BK` in `chunk_gdn2_fwd_intra_infer`.
+- Why it can help: for `K == 64` the intra-chunk kernel had been launched with the
+  generic S60 intra tile, which is wider than the head dimension and wastes lanes
+  / padding work; specialising `BK` to the actual `K` makes the tile match the
+  data. Other `K` values keep the previous tile, so the change is shape-guarded.
+- Evidence level: the measured effect is the table above (default state) and the
+  `initial_state=None` row (separate driver). This is a launch-tile
+  specialisation, not a new algorithm, and no counter-based attribution was made.
+- Caveat kept on purpose: the first optimized benchmark run (5.202 ms) was an
+  outlier; two immediate repeats and the supplementary driver agree on
+  ~3.46–3.57 ms, so the report uses the median and keeps the raw value in the log.
+
 ## Correctness and caveats
 
 - Only the benchmark's own provider checks apply; no additional numerical gate
