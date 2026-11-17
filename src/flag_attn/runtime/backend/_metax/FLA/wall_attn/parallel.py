@@ -22,12 +22,13 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_attn import runtime
 from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.index import prepare_chunk_indices
 
 
 @triton.jit
-def _copy_scale(
+def _copy_scale_kernel(
     x,
     y,
     N: tl.constexpr,
@@ -52,13 +53,13 @@ def _copy_scale(
     tl.store(y + i, value, i < N)
 
 
-def copy_tensor(x, dtype=None, scale=1.0):
+def _copy_tensor(x, dtype=None, scale=1.0):
     dtype = x.dtype if dtype is None else dtype
     if x.is_contiguous() and x.dtype == dtype and scale == 1.0:
         return x
     result = torch.empty(x.shape, device=x.device, dtype=dtype)
     if x.numel():
-        _copy_scale[(triton.cdiv(x.numel(), 256),)](
+        _copy_scale_kernel[(triton.cdiv(x.numel(), 256),)](
             x,
             result,
             x.numel(),
@@ -71,37 +72,37 @@ def copy_tensor(x, dtype=None, scale=1.0):
     return result
 
 
-def zero_flag(device):
+def _create_zero_flag(device):
     result = torch.empty((), device=device, dtype=torch.int32)
-    _copy_scale[(1,)](result, result, 1, (), (), 1.0, True, 1, num_warps=1)
+    _copy_scale_kernel[(1,)](result, result, 1, (), (), 1.0, True, 1, num_warps=1)
     return result
 
 
-def input_guard(fn):
+def _input_guard(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
         tensor = next((v for v in (*args, *kwargs.values()) if isinstance(v, torch.Tensor)), None)
         with torch.cuda.device(
             tensor.device if tensor is not None else torch.cuda.current_device()
         ):
-            args = tuple(copy_tensor(v) if isinstance(v, torch.Tensor) else v for v in args)
+            args = tuple(_copy_tensor(v) if isinstance(v, torch.Tensor) else v for v in args)
             kwargs = {
-                k: copy_tensor(v) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()
+                k: _copy_tensor(v) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()
             }
             return fn(*args, **kwargs)
 
     return wrapped
 
 
-# Preserve the existing tuning guard, not a queried hardware capacity.
+# Local-memory tuning budget per thread.
 # The current MetaX driver reports LOCAL_SIZE_BYTES / 4 in n_spills.
 _WALL_LOCAL_MEMORY_BUDGET_BYTES = 4096
 
 
-def resource_pruner(kernel_getter):
+def _make_config_pruner(kernel_getter):
     """Filter launch resource failures and the existing local-memory budget."""
 
-    def prune(configs, named_args, **kwargs):
+    def _prune_configs(configs, named_args, **kwargs):
         from triton.runtime.errors import OutOfResources
 
         valid = []
@@ -131,21 +132,21 @@ def resource_pruner(kernel_getter):
             )
         return valid
 
-    return prune
+    return _prune_configs
 
 
 @triton.jit
-def _add(x, y, N: tl.constexpr, BLOCK: tl.constexpr):
+def _add_inplace_kernel(x, y, N: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     tl.store(x + i, tl.load(x + i, i < N, 0) + tl.load(y + i, i < N, 0), i < N)
 
 
-def add_inplace(x, y):
-    _add[(triton.cdiv(x.numel(), 256),)](x, y, x.numel(), 256)
+def _add_inplace(x, y):
+    _add_inplace_kernel[(triton.cdiv(x.numel(), 256),)](x, y, x.numel(), 256)
 
 
 @triton.jit
-def _group_reduce(x, y, N: tl.constexpr, D: tl.constexpr, G: tl.constexpr, BLOCK: tl.constexpr):
+def _group_reduce_kernel(x, y, N: tl.constexpr, D: tl.constexpr, G: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     base = (i // D) * G * D + i % D
     value = tl.full((BLOCK,), 0, tl.float32)
@@ -154,17 +155,17 @@ def _group_reduce(x, y, N: tl.constexpr, D: tl.constexpr, G: tl.constexpr, BLOCK
     tl.store(y + i, value, i < N)
 
 
-def group_reduce(x, groups, dtype):
+def _group_reduce(x, groups, dtype):
     if groups == 1:
-        return copy_tensor(x, dtype)
+        return _copy_tensor(x, dtype)
     b, t, hq, d = x.shape
     result = torch.empty((b, t, hq // groups, d), device=x.device, dtype=dtype)
-    _group_reduce[(triton.cdiv(result.numel(), 256),)](x, result, result.numel(), d, groups, 256)
+    _group_reduce_kernel[(triton.cdiv(result.numel(), 256),)](x, result, result.numel(), d, groups, 256)
     return result
 
 
 @triton.jit
-def _sink_grad(sink, lse, delta, out, N: tl.constexpr, HQ: tl.constexpr, BLOCK: tl.constexpr):
+def _sink_gradient_kernel(sink, lse, delta, out, N: tl.constexpr, HQ: tl.constexpr, BLOCK: tl.constexpr):
     head = tl.program_id(0)
     off = tl.arange(0, BLOCK)
     s = tl.load(sink + head).to(tl.float32)
@@ -177,24 +178,24 @@ def _sink_grad(sink, lse, delta, out, N: tl.constexpr, HQ: tl.constexpr, BLOCK: 
     tl.store(out + head, tl.sum(total, 0))
 
 
-def sink_gradient(sink, lse, delta):
+def _sink_gradient(sink, lse, delta):
     result = torch.empty_like(sink)
-    _sink_grad[(sink.numel(),)](
+    _sink_gradient_kernel[(sink.numel(),)](
         sink, lse, delta, result, lse.numel() // sink.numel(), sink.numel(), 256
     )
     return result
 
 
 @triton.jit
-def parallel_attn_bwd_kernel_preprocess(
+def _wall_attn_bwd_preprocess_kernel(
     o,
     do,
     delta,
-    B: tl.constexpr,
+    BLOCK_V: tl.constexpr,
     V: tl.constexpr,
 ):
     i_n = tl.program_id(0)
-    o_d = tl.arange(0, B)
+    o_d = tl.arange(0, BLOCK_V)
     m_d = o_d < V
 
     b_o = tl.load(o + i_n * V + o_d, mask=m_d, other=0)
@@ -204,21 +205,20 @@ def parallel_attn_bwd_kernel_preprocess(
     tl.store(delta + i_n, b_delta.to(delta.dtype.element_ty))
 
 
-def parallel_attn_bwd_preprocess(o, do):
+def _wall_attn_bwd_preprocess(o, do):
     """Compute FP32 ``delta = sum(o * do, dim=-1)`` for attention backward."""
     V = o.shape[-1]
     delta = torch.empty_like(o[..., 0], dtype=torch.float)
-    parallel_attn_bwd_kernel_preprocess[(delta.numel(),)](
+    _wall_attn_bwd_preprocess_kernel[(delta.numel(),)](
         o=o,
         do=do,
         delta=delta,
-        B=triton.next_power_of_2(V),
+        BLOCK_V=triton.next_power_of_2(V),
         V=V,
     )
     return delta
 
 
-from flag_attn import runtime
 
 RCP_LN2 = 1.4426950216
 
@@ -252,7 +252,7 @@ WALL_FWD_AUTOTUNE_CONFIGS = [
     for nw in (2, 4, 8)
     for ns in (2, 3)
 ] + [
-    # The original multi-stage candidates exceed C550 resources at D128.
+    # Single-stage candidates reduce resource use at D128.
     triton.Config({"BT": bt, "BS": 32}, num_warps=nw, num_stages=1)
     for bt in (32, 64)
     for nw in (2, 4, 8)
@@ -278,18 +278,14 @@ WALL_DQ_AUTOTUNE_CONFIGS = [
 ]
 
 
-# Full-V BF16 D128 inference can reuse QK and softmax across all value
-# channels. Smaller KV tiles bound the live operands of that wider PV dot.
+# Smaller KV tiles reduce resource use in both standard and full-width PV modes.
 WALL_FWD_AUTOTUNE_CONFIGS += [
     triton.Config({"BT": 32, "BS": 16}, num_warps=nw, num_stages=1) for nw in (2, 4, 8)
 ]
 
 
-def _wall_fwd_config_prune(configs, named_args, **kwargs):
-    arguments = {**named_args, **kwargs}
-    if not arguments.get("REUSE_PV_ACC", False):
-        configs = [config for config in configs if config.kwargs["BS"] != 16]
-    return resource_pruner(lambda: parallel_wall_attn_fwd_kernel)(configs, named_args, **kwargs)
+def _prune_fwd_configs(configs, named_args, **kwargs):
+    return _make_config_pruner(lambda: parallel_wall_attn_fwd_kernel)(configs, named_args, **kwargs)
 
 
 @triton.jit
@@ -316,7 +312,7 @@ def _wall_qk_dot_split32(a, b):
 @triton.autotune(
     configs=WALL_FWD_AUTOTUNE_CONFIGS,
     key=["T", "K", "V", "HQ", "H", "REUSE_PV_ACC"],
-    prune_configs_by={"early_config_prune": _wall_fwd_config_prune},
+    prune_configs_by={"early_config_prune": _prune_fwd_configs},
 )
 @triton.heuristics(
     {
@@ -348,7 +344,6 @@ def parallel_wall_attn_fwd_kernel(
     chunk_indices,
     T,
     W: tl.constexpr,
-    B: tl.constexpr,
     H: tl.constexpr,
     HQ: tl.constexpr,
     G: tl.constexpr,
@@ -564,7 +559,7 @@ def parallel_wall_attn_fwd_kernel(
     configs=WALL_DQ_AUTOTUNE_CONFIGS,
     key=["T", "K", "V", "HQ", "H"],
     prune_configs_by={
-        "early_config_prune": resource_pruner(lambda: parallel_wall_attn_bwd_kernel_dq)
+        "early_config_prune": _make_config_pruner(lambda: parallel_wall_attn_bwd_kernel_dq)
     },
 )
 @triton.heuristics(
@@ -592,7 +587,6 @@ def parallel_wall_attn_bwd_kernel_dq(
     chunk_indices,
     T,
     W: tl.constexpr,
-    B: tl.constexpr,
     H: tl.constexpr,
     HQ: tl.constexpr,
     G: tl.constexpr,
@@ -786,7 +780,7 @@ def parallel_wall_attn_bwd_kernel_dq(
     configs=WALL_BWD_AUTOTUNE_CONFIGS,
     key=["T", "K", "V", "HQ", "H"],
     prune_configs_by={
-        "early_config_prune": resource_pruner(lambda: parallel_wall_attn_bwd_kernel_dkv)
+        "early_config_prune": _make_config_pruner(lambda: parallel_wall_attn_bwd_kernel_dkv)
     },
 )
 @triton.heuristics(
@@ -815,7 +809,6 @@ def parallel_wall_attn_bwd_kernel_dkv(
     scale,
     T,
     W: tl.constexpr,
-    B: tl.constexpr,
     H: tl.constexpr,
     HQ: tl.constexpr,
     G: tl.constexpr,
@@ -1047,7 +1040,7 @@ def parallel_wall_attn_fwd(
         )
     if g_cumsum.stride(-1) != 1:
         raise ValueError("`g_cumsum` must be contiguous in the last (K) dimension")
-    g_cumsum = copy_tensor(g_cumsum)
+    g_cumsum = _copy_tensor(g_cumsum)
 
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
@@ -1079,7 +1072,6 @@ def parallel_wall_attn_fwd(
             scale=scale,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
-            B=B,
             T=T,
             W=window_size,
             H=H,
@@ -1099,8 +1091,8 @@ def parallel_wall_attn_fwd(
     o = torch.empty(B, T, HQ, V, dtype=v.dtype, device=q.device)
     lse = torch.empty(B, T, HQ, dtype=torch.float, device=q.device)
 
-    # Validated for ordinary BF16 D128 inference. Keep training and optional
-    # features on the original accumulation path and tune the paths separately.
+    # Full-width PV accumulation is enabled for BF16 D128 inference
+    # without optional gates or windows.
     reuse_pv_acc = (
         reuse_pv_acc
         and K == 128
@@ -1132,7 +1124,6 @@ def parallel_wall_attn_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        B=B,
         T=T,
         W=window_size,
         H=H,
@@ -1164,7 +1155,7 @@ def parallel_wall_attn_bwd(
 ):
     if g_cumsum.dim() != 4 or g_cumsum.shape != (*q.shape[:-1], q.shape[-1]):
         raise ValueError("`g_cumsum` must be [B, T, HQ, K] matching `q`")
-    g_cumsum = copy_tensor(g_cumsum)
+    g_cumsum = _copy_tensor(g_cumsum)
 
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
@@ -1191,7 +1182,7 @@ def parallel_wall_attn_bwd(
         def grid(meta):
             return (NV, triton.cdiv(T, meta["BT"]), B * HQ)
 
-    delta = parallel_attn_bwd_preprocess(o, do)
+    delta = _wall_attn_bwd_preprocess(o, do)
 
     dq = torch.empty(B, T, HQ, K, dtype=k.dtype if H == HQ else torch.float, device=q.device)
     dk = torch.empty(B, T, HQ, K, dtype=k.dtype if H == HQ else torch.float, device=q.device)
@@ -1230,7 +1221,6 @@ def parallel_wall_attn_bwd(
         scale=scale,
         T=T,
         W=window_size,
-        B=B,
         H=H,
         HQ=HQ,
         G=G,
@@ -1258,7 +1248,6 @@ def parallel_wall_attn_bwd(
         scale=scale,
         T=T,
         W=window_size,
-        B=B,
         H=H,
         HQ=HQ,
         G=G,
@@ -1269,16 +1258,16 @@ def parallel_wall_attn_bwd(
         DIAG_BF16=_DKV_DIAG_BF16,
         **extra,
     )
-    dk = group_reduce(dk, G, k.dtype)
-    dv = group_reduce(dv, G, v.dtype)
-    add_inplace(dg_cumsum, dg_cumsum_k)
+    dk = _group_reduce(dk, G, k.dtype)
+    dv = _group_reduce(dv, G, v.dtype)
+    _add_inplace(dg_cumsum, dg_cumsum_k)
 
     if g_scalar_cumsum is not None:
-        add_inplace(dg_scalar_cumsum, dg_scalar_cumsum_k)
+        _add_inplace(dg_scalar_cumsum, dg_scalar_cumsum_k)
 
     dsink_bias = None
     if sink_bias is not None:
-        dsink_bias = sink_gradient(sink_bias, lse, delta)
+        dsink_bias = _sink_gradient(sink_bias, lse, delta)
 
     return dq, dk, dv, dg_cumsum, dsink_bias, dg_scalar_cumsum
 
@@ -1289,7 +1278,7 @@ class WallParallelAttentionFunction(torch.autograd.Function):
     :math:`R_n=P_{i_t\cdot BT,n}` inside :func:`parallel_wall_attn_fwd_kernel`."""
 
     @staticmethod
-    @input_guard
+    @_input_guard
     @torch.amp.custom_fwd(device_type="cuda")
     def forward(
         ctx,
@@ -1339,7 +1328,7 @@ class WallParallelAttentionFunction(torch.autograd.Function):
         else:
             c = None
 
-        sink_bias_scaled = copy_tensor(sink_bias, scale=RCP_LN2) if sink_bias is not None else None
+        sink_bias_scaled = _copy_tensor(sink_bias, scale=RCP_LN2) if sink_bias is not None else None
         o, lse = parallel_wall_attn_fwd(
             q=q,
             k=k,
@@ -1367,10 +1356,10 @@ class WallParallelAttentionFunction(torch.autograd.Function):
         ctx.cu_seqlens = cu_seqlens
         ctx.chunk_indices = chunk_indices
         ctx.has_scalar_g = g_scalar is not None
-        return copy_tensor(o, q.dtype)
+        return _copy_tensor(o, q.dtype)
 
     @staticmethod
-    @input_guard
+    @_input_guard
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, do):
         q, k, v, o, P, lse, sink_bias_scaled, c_or_empty = ctx.saved_tensors
@@ -1418,9 +1407,9 @@ class WallParallelAttentionFunction(torch.autograd.Function):
             dg_scalar = None
 
         return (
-            copy_tensor(dq, q.dtype),
-            copy_tensor(dk, k.dtype),
-            copy_tensor(dv, v.dtype),
+            _copy_tensor(dq, q.dtype),
+            _copy_tensor(dk, k.dtype),
+            _copy_tensor(dv, v.dtype),
             dg,
             dsink_bias,
             None,
@@ -1488,22 +1477,19 @@ def _parallel_wall_attn_default(
     )
 
 
-_FAST_T = frozenset((512, 1024, 2048, 4096))
-_FAST_H = frozenset((2, 8))
 _FAST_BF16_D = frozenset((64, 128))
 _LAST_ROUTE: ContextVar[str | None] = ContextVar("wall_attn_route", default=None)
 
 
 def get_last_route() -> str | None:
-    """Return the completed call's route in this context, for benchmark reporting."""
+    """Return the completed call's route in this context."""
     return _LAST_ROUTE.get()
 
 
 @lru_cache(maxsize=1)
 def _load_fwd_module():
     """Load cached-operand kernels after metadata accepts an inference call."""
-    module = import_module(f"{__package__}.parallel_fwd")
-    return module
+    return import_module(f"{__package__}.parallel_fwd")
 
 
 def _requires_backward(*tensors: torch.Tensor | None) -> bool:
@@ -1544,10 +1530,10 @@ def select_route(
         return "official_fallback"
 
     b, t, hq, d = q.shape
-    if b != 1 or t not in _FAST_T or hq != 8:
+    if b != 1 or t <= 0 or hq <= 0:
         return "official_fallback"
     h = k.shape[2]
-    if h not in _FAST_H or hq % h != 0:
+    if h <= 0 or hq % h != 0:
         return "official_fallback"
     if k.shape != (b, t, h, d) or v.shape != (b, t, h, d) or g.shape != q.shape:
         return "official_fallback"
@@ -1582,15 +1568,15 @@ def _parallel_wall_attn_fast_path(
     anchor = torch.empty((b, hq, d), device=q.device, dtype=torch.float32)
     output = torch.empty((b, t, hq, d), device=q.device, dtype=v.dtype)
     lse = torch.empty((b, t, hq), device=q.device, dtype=torch.float32)
-    unsafe = zero_flag(q.device)
+    unsafe = _create_zero_flag(q.device)
 
-    prefix = fwd.prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe)
+    prefix = fwd._prepare_qk_cache(q, k, g, q_cache, k_cache, anchor, unsafe)
 
     # Do not consume overflowing or underflowing rescaled Q/K operands.
     if unsafe.item():
         return None, prefix
 
-    fwd.parallel_wall_attn_fwd(q_cache, k_cache, v, output, lse, scale=scale)
+    fwd._wall_attn_fwd_from_cache(q_cache, k_cache, v, output, lse, scale=scale)
     return output, None
 
 

@@ -22,54 +22,44 @@ from .parallel import exp2, log2
 
 
 @triton.jit
-def _copy_scale(
+def _contiguous_copy_kernel(
     x,
     y,
     N: tl.constexpr,
     SHAPE: tl.constexpr,
     STRIDES: tl.constexpr,
-    SCALE: tl.constexpr,
-    ZERO: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    if ZERO:
-        value = tl.full((BLOCK,), 0, tl.float32)
-    else:
-        rem = i
-        offset = tl.full((BLOCK,), 0, tl.int64)
-        for axis in tl.static_range(len(SHAPE) - 1, -1, -1):
-            offset += (rem % SHAPE[axis]) * STRIDES[axis]
-            rem = rem // SHAPE[axis]
-        value = tl.load(x + offset, i < N, 0)
-        if SCALE != 1.0:
-            value = value.to(tl.float32) * SCALE
+    rem = i
+    offset = tl.full((BLOCK,), 0, tl.int64)
+    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):
+        offset += (rem % SHAPE[axis]) * STRIDES[axis]
+        rem = rem // SHAPE[axis]
+    value = tl.load(x + offset, i < N, 0)
     tl.store(y + i, value, i < N)
 
 
-def copy_tensor(x, dtype=None, scale=1.0):
-    dtype = x.dtype if dtype is None else dtype
-    if x.is_contiguous() and x.dtype == dtype and scale == 1.0:
+def _ensure_contiguous(x: torch.Tensor) -> torch.Tensor:
+    if x.is_contiguous():
         return x
-    result = torch.empty(x.shape, device=x.device, dtype=dtype)
+    result = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     if x.numel():
-        _copy_scale[(triton.cdiv(x.numel(), 256),)](
+        _contiguous_copy_kernel[(triton.cdiv(x.numel(), 256),)](
             x,
             result,
             x.numel(),
             tuple(x.shape),
             tuple(x.stride()),
-            scale,
-            False,
             256,
         )
     return result
 
 
-def resource_pruner(kernel_getter):
-    """Reject compiled configurations exceeding C550 launch resource limits."""
+def _make_decode_config_pruner(kernel_getter):
+    """Filter configurations that exceed launch resource limits."""
 
-    def prune(configs, named_args, **kwargs):
+    def _prune_decode_configs(configs, named_args, **kwargs):
         from triton.runtime.errors import OutOfResources
 
         valid = []
@@ -83,64 +73,48 @@ def resource_pruner(kernel_getter):
                     grid=(1, 1, 1),
                     warmup=True,
                 )
-                # Loading metadata does not execute the kernel. The MACA driver
-                # returns LOCAL_SIZE_BYTES / 4 as n_spills; C550 permits 4 KiB
-                # private storage per thread in the supported runtime.
+                # Initialize handles to validate launch resources without execution.
                 compiled._init_handles()
-                if compiled.n_spills * 4 <= 4096:
-                    valid.append(config)
+                valid.append(config)
             except OutOfResources:
                 continue
         return valid
 
-    return prune
+    return _prune_decode_configs
 
 
 @triton.jit
-def _cache(
+def _build_wall_kv_cache_kernel(
     k,
-    prefix,
-    kt,
-    anchor,
+    g_cumsum,
+    k_tilde,
+    r_cache,
     T: tl.constexpr,
     H: tl.constexpr,
     HQ: tl.constexpr,
-    D: tl.constexpr,
+    K: tl.constexpr,
     C: tl.constexpr,
     NC: tl.constexpr,
     N: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    d = i % D
-    head = (i // D) % HQ
-    token = (i // (D * HQ)) % T
-    batch = i // (D * HQ * T)
+    d = i % K
+    head = (i // K) % HQ
+    token = (i // (K * HQ)) % T
+    batch = i // (K * HQ * T)
     chunk = token // C
-    reference = tl.load(prefix + ((batch * T + chunk * C) * HQ + head) * D + d, i < N, 0).to(
+    reference = tl.load(g_cumsum + ((batch * T + chunk * C) * HQ + head) * K + d, i < N, 0).to(
         tl.float32
     )
-    p = tl.load(prefix + i, i < N, 0).to(tl.float32)
-    key = tl.load(k + ((batch * T + token) * H + head // (HQ // H)) * D + d, i < N, 0).to(
+    p = tl.load(g_cumsum + i, i < N, 0).to(tl.float32)
+    key = tl.load(k + ((batch * T + token) * H + head // (HQ // H)) * K + d, i < N, 0).to(
         tl.float32
     )
-    tl.store(kt + i, key * tl.exp2(reference - p), i < N)
+    tl.store(k_tilde + i, key * tl.exp2(reference - p), i < N)
     tl.store(
-        anchor + ((batch * NC + chunk) * HQ + head) * D + d, reference, (i < N) & (token % C == 0)
+        r_cache + ((batch * NC + chunk) * HQ + head) * K + d, reference, (i < N) & (token % C == 0)
     )
-
-
-def build_cache(k, prefix, chunk_size, dtype):
-    k, prefix = copy_tensor(k), copy_tensor(prefix)
-    b, t, h, d = k.shape
-    hq = prefix.shape[2]
-    nc = triton.cdiv(t, chunk_size)
-    kt = torch.empty((b, t, hq, d), device=k.device, dtype=dtype)
-    anchors = torch.empty((b, nc, hq, d), device=k.device, dtype=prefix.dtype)
-    _cache[(triton.cdiv(kt.numel(), 256),)](
-        k, prefix, kt, anchors, t, h, hq, d, chunk_size, nc, kt.numel(), 256
-    )
-    return kt, anchors
 
 
 WALL_DECODE_AUTOTUNE_CONFIGS = [
@@ -154,7 +128,7 @@ WALL_DECODE_AUTOTUNE_CONFIGS = [
 @triton.autotune(
     configs=WALL_DECODE_AUTOTUNE_CONFIGS,
     prune_configs_by={
-        "early_config_prune": resource_pruner(lambda: parallel_wall_attn_decode_kernel)
+        "early_config_prune": _make_decode_config_pruner(lambda: parallel_wall_attn_decode_kernel)
     },
     key=["KV_CHUNKS_BUCKET", "K", "V", "HQ", "H", "C"],
     **runtime.autotune_cache_kwargs(),
@@ -181,7 +155,6 @@ def parallel_wall_attn_decode_kernel(
     T_kv,
     NC,
     KV_CHUNKS_BUCKET,
-    B: tl.constexpr,
     H: tl.constexpr,
     HQ: tl.constexpr,
     G: tl.constexpr,
@@ -239,7 +212,7 @@ def parallel_wall_attn_decode_kernel(
         i_c = i_s // C
         o_k = (i_s + tl.arange(0, BS)).to(tl.int64)
         m_k = o_k < T_kv
-        # A one-dimensional anchor load avoids MACA's singleton shared layout.
+        # Load the current chunk's per-channel anchor.
         p_r = r_cache + ((bos_nc + i_c) * HQ + i_hq) * K + o_d
         b_R = tl.load(p_r, mask=(i_c < NC) & (o_d < K), other=0.0).to(tl.float32)[None, :]
         b_q_til = (b_q.to(tl.float32) * exp2(b_pq - b_R)).to(b_q.dtype)
@@ -289,12 +262,8 @@ def parallel_wall_attn_decode(
     scale: float,
     cache_chunk_size: int,
     g_scalar_cumsum: torch.Tensor | None = None,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     r"""Wall decode with a pre-rescaled KV cache.
-
-    Use this directly from modeling code; it does NOT share a signature with
-    `parallel_wall_attn_fwd`. The caller is responsible for picking which to
-    call (e.g. training vs. cached generation).
 
     Shapes:
         q        : ``[B, T_q,  HQ, K]``  current queries
@@ -304,7 +273,7 @@ def parallel_wall_attn_decode(
         r_cache  : ``[B, NC,   HQ, K]``  per-chunk anchors, ``NC = ceil(T_kv / C)``
         g_scalar_cumsum : ``[B, T_kv, HQ]`` or ``None``  optional FoX-style scalar gate
 
-    Returns ``(o, lse)`` with ``o.shape == [B, T_q, HQ, V]``.
+    Returns ``(o, lse)`` with shapes ``[B, T_q, HQ, V]`` and ``[B, T_q, HQ]``.
     """
     C = cache_chunk_size
     B, T_q, HQ, K = q.shape
@@ -332,14 +301,15 @@ def parallel_wall_attn_decode(
         raise ValueError("g_scalar_cumsum must be contiguous in the last dim")
 
     # The API permits outer-dimension views; the kernel uses packed strides.
-    q, v, p_curr, k_tilde, r_cache = (copy_tensor(t) for t in (q, v, p_curr, k_tilde, r_cache))
+    q, v, p_curr, k_tilde, r_cache = (
+        _ensure_contiguous(t) for t in (q, v, p_curr, k_tilde, r_cache)
+    )
     if g_scalar_cumsum is not None:
-        g_scalar_cumsum = copy_tensor(g_scalar_cumsum)
+        g_scalar_cumsum = _ensure_contiguous(g_scalar_cumsum)
     if sink_bias is not None:
-        sink_bias = copy_tensor(sink_bias)
+        sink_bias = _ensure_contiguous(sink_bias)
 
     BK = min(256, max(16, triton.next_power_of_2(K)))
-    # Keep the C550 value-channel tile at most 64 wide.
     BV = min(64, max(16, triton.next_power_of_2(V)))
     NV = triton.cdiv(V, BV)
     assert triton.cdiv(K, BK) == 1, "decode kernel requires K <= 256"
@@ -365,13 +335,12 @@ def parallel_wall_attn_decode(
         T_kv=T_kv,
         NC=NC,
         KV_CHUNKS_BUCKET=KV_CHUNKS_BUCKET,
-        B=B,
         H=H,
         HQ=HQ,
         G=G,
         K=K,
         V=V,
-        BS=triton.next_power_of_2(C),
+        BS=C,
         BK=BK,
         BV=BV,
         C=C,
@@ -381,7 +350,7 @@ def parallel_wall_attn_decode(
 
 def build_wall_kv_cache(
     k: torch.Tensor,  # [B, T, H, K]
-    g_cumsum: torch.Tensor,  # [B, T, HQ, K]   per-channel prefix P = cumsum(log_2 g)
+    g_cumsum: torch.Tensor,  # [B, T, HQ, K], per-channel prefix in log2 units
     chunk_size: int,
     *,
     out_dtype: torch.dtype | None = None,
@@ -409,4 +378,23 @@ def build_wall_kv_cache(
         raise ValueError(f"HQ ({HQ}) must be divisible by H ({H})")
     out_dtype = out_dtype if out_dtype is not None else k.dtype
 
-    return build_cache(k, g_cumsum, chunk_size, out_dtype)
+    k = _ensure_contiguous(k)
+    g_cumsum = _ensure_contiguous(g_cumsum)
+    NC = triton.cdiv(T, chunk_size)
+    k_tilde = torch.empty((B, T, HQ, K), device=k.device, dtype=out_dtype)
+    r_cache = torch.empty((B, NC, HQ, K), device=k.device, dtype=g_cumsum.dtype)
+    _build_wall_kv_cache_kernel[(triton.cdiv(k_tilde.numel(), 256),)](
+        k=k,
+        g_cumsum=g_cumsum,
+        k_tilde=k_tilde,
+        r_cache=r_cache,
+        T=T,
+        H=H,
+        HQ=HQ,
+        K=K,
+        C=chunk_size,
+        NC=NC,
+        N=k_tilde.numel(),
+        BLOCK=256,
+    )
+    return k_tilde, r_cache
