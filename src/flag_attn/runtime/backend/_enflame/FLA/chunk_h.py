@@ -178,13 +178,16 @@ def _chunk_fwd_local_state_kernel(
     i_k, i_v = i_kv // grid_v, i_kv % grid_v
     i_b, i_h = i_bh // H, i_bh % H
 
+    # Read the time-major [BT, BK] tiles contiguously and transpose in the
+    # kernel: the equivalent key-major block would issue BK separate narrow
+    # segments per transfer.
     p_k = tl.make_block_ptr(
         k + (i_b * T * H + i_h) * K,
-        (K, T),
-        (1, H * K),
-        (i_k * BK, i_t * BT),
-        (BK, BT),
-        (0, 1),
+        (T, K),
+        (H * K, 1),
+        (i_t * BT, i_k * BK),
+        (BT, BK),
+        (1, 0),
     )
     p_v = tl.make_block_ptr(
         v + (i_b * T * H + i_h) * V,
@@ -196,23 +199,23 @@ def _chunk_fwd_local_state_kernel(
     )
     p_gk = tl.make_block_ptr(
         gk + (i_b * T * H + i_h) * K,
-        (K, T),
-        (1, H * K),
-        (i_k * BK, i_t * BT),
-        (BK, BT),
-        (0, 1),
+        (T, K),
+        (H * K, 1),
+        (i_t * BT, i_k * BK),
+        (BT, BK),
+        (1, 0),
     )
     last_idx = min((i_t + 1) * BT, T) - 1
     o_k = i_k * BK + tl.arange(0, BK)
     p_gk_last = gk + ((i_b * T + last_idx) * H + i_h) * K + o_k
 
-    b_k = tl.load(p_k, boundary_check=(0, 1))
+    b_kt = tl.load(p_k, boundary_check=(0, 1))
     b_v = tl.load(p_v, boundary_check=(0, 1))
-    b_gk = tl.load(p_gk, boundary_check=(0, 1))
+    b_gkt = tl.load(p_gk, boundary_check=(0, 1))
     b_gk_last = tl.load(p_gk_last, mask=o_k < K, other=0.0)
-    b_k = (b_k * exp2(b_gk_last[:, None] - b_gk)).to(b_k.dtype)
+    b_kt = (b_kt * exp2(b_gk_last[None, :] - b_gkt)).to(b_kt.dtype)
     b_local = tl.zeros([BK, BV], dtype=tl.float32)
-    b_local = tl.dot(b_k, b_v, acc=b_local, out_dtype=tl.float32)
+    b_local = tl.dot(tl.trans(b_kt), b_v, acc=b_local, out_dtype=tl.float32)
 
     state_offset = ((i_b * N_CHUNKS + i_t) * H + i_h).to(tl.int64) * K * V
     p_local = tl.make_block_ptr(
