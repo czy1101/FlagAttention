@@ -940,6 +940,7 @@ def _assert_close(name, actual, expected, ratio, err_atol=1e-6):
         pytest.param(*c, id="B{}-T{}-H{}-D{}-gate_logit_normalizer{}-{}".format(*c))
         for c in [
             (1, 63, 1, 64, 1.0, torch.float16),
+            (1, 512, 4, 64, 1.0, torch.float16),
             (2, 1024, 4, 60, 1.0, torch.float16),
             (2, 1024, 8, 128, 0.1, torch.float16),
             (2, 1024, 8, 128, 1.0, torch.float16),
@@ -998,6 +999,88 @@ def test_chunk(B, T, H, D, dtype, gate_logit_normalizer):
     _assert_close("dv", ref_dv, tri_dv, 0.005)
     _assert_close("dg", ref_dg, tri_dg, 0.005)
     _assert_close("dh0", ref_dh0, tri_dh0, 0.005)
+
+
+@pytest.mark.chunk_gla
+@pytest.mark.parametrize(
+    ("K", "V"),
+    [
+        (32, 32), (32, 64), (48, 80), (64, 32), (64, 128),
+        (64, 256), (96, 128), (128, 64), (128, 128), (256, 64),
+        (64, 320), (320, 64),
+    ],
+)
+def test_chunk_fp16_parallel_state_shapes(K, V, monkeypatch):
+    """Check output, final state, and every gradient at the admitted shapes."""
+    import importlib
+
+    state_module = importlib.import_module(
+        "flag_attn.runtime.backend._enflame.FLA.chunk_h"
+    )
+    launches = {}
+
+    class LaunchProbe:
+        def __init__(self, name, kernel):
+            self.name = name
+            self.kernel = kernel
+
+        def __getitem__(self, grid):
+            launch = self.kernel[grid]
+
+            def counted_launch(*args, **kwargs):
+                launches[self.name] = launches.get(self.name, 0) + 1
+                return launch(*args, **kwargs)
+
+            return counted_launch
+
+    for name in (
+        "_chunk_fwd_local_state_kernel", "_chunk_bwd_local_state_kernel",
+        "chunk_fwd_kernel_h", "chunk_bwd_kernel_dh",
+    ):
+        monkeypatch.setattr(
+            state_module, name, LaunchProbe(name, getattr(state_module, name))
+        )
+
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    device = torch.device(test_backend.device)
+    B, T, H = 2, 256, 2
+    dtype = torch.float16
+
+    q = torch.rand(B, T, H, K, dtype=dtype, device=device).requires_grad_()
+    k = torch.rand(B, T, H, K, dtype=dtype, device=device).requires_grad_()
+    v = torch.rand(B, T, H, V, dtype=dtype, device=device).requires_grad_()
+    g = F.logsigmoid(torch.rand_like(q)).requires_grad_()
+    h0 = torch.rand(B, H, K, V, dtype=torch.float32, device=device).requires_grad_()
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
+    actual, actual_ht = chunk_gla(
+        q=q, k=k, v=v, g=g, scale=K**-0.5,
+        initial_state=h0, output_final_state=True,
+    )
+    ((actual * do).sum() + (actual_ht * dht).sum()).backward()
+    actual_grads = [x.grad.clone() for x in (q, k, v, g, h0)]
+    for x in (q, k, v, g, h0):
+        x.grad = None
+
+    expected, expected_ht = fused_recurrent_gla(
+        q=q, k=k, v=v, gk=g, initial_state=h0,
+        output_final_state=True,
+    )
+    ((expected * do).sum() + (expected_ht * dht).sum()).backward()
+    expected_grads = [x.grad for x in (q, k, v, g, h0)]
+
+    _assert_close("o", actual, expected, 0.004)
+    _assert_close("ht", actual_ht, expected_ht, 0.005)
+    for name, actual_grad, expected_grad in zip(
+        ("dq", "dk", "dv", "dg", "dh0"), actual_grads, expected_grads
+    ):
+        _assert_close(name, actual_grad, expected_grad, 0.005)
+    assert launches.get("_chunk_fwd_local_state_kernel", 0) > 0
+    assert launches.get("_chunk_bwd_local_state_kernel", 0) > 0
+    assert launches.get("chunk_fwd_kernel_h", 0) == 0
+    assert launches.get("chunk_bwd_kernel_dh", 0) == 0
 
 
 @pytest.mark.chunk_gla
