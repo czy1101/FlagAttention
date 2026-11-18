@@ -26,7 +26,7 @@ from .attention import (
     _triton_varlen_forward,
     _triton_varlen_func,
 )
-from flag_attn.FLA.moba.routing import (
+from .routing import (
     _build_dense_chunk_metadata_triton,
     _build_sparse_routes_device_triton,
     _build_sparse_routes_triton,
@@ -402,40 +402,37 @@ def parallel_moba(
     """
 
     with runtime.torch_device_fn.device(q.device):
-        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-            raise ValueError("q, k, and v must have shape [tokens, heads, head_dim]")
-        if k.shape != v.shape:
-            raise ValueError(f"k and v must have identical shapes, got {k.shape} and {v.shape}")
-        if q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2]:
-            raise ValueError(f"q and k/v must have the same token count and head dimension, got q={q.shape}, k={k.shape}")
+        if (
+            q.ndim != 3 or k.ndim != 3 or v.ndim != 3
+            or k.shape != v.shape
+            or q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2]
+            or 0 in q.shape or k.shape[1] == 0
+        ):
+            raise ValueError(
+                "q, k, and v must have non-empty shapes [tokens, heads, head_dim]; "
+                "k/v shapes and q/k/v token counts and head dimensions must match"
+            )
         if q.device != k.device or q.device != v.device or not q.is_cuda:
             raise ValueError("q, k, and v must be CUDA tensors on the same device")
-        if q.dtype != k.dtype or q.dtype != v.dtype:
-            raise TypeError("q, k, and v must have the same dtype")
-        if q.dtype not in (torch.float16, torch.bfloat16):
-            raise TypeError(f"only float16 and bfloat16 are supported, got {q.dtype}")
+        if q.dtype != k.dtype or q.dtype != v.dtype or q.dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError("q, k, and v must have the same dtype (float16 or bfloat16)")
         if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
             raise ValueError("cu_seqlens must be a one-dimensional tensor of length >= 2")
         if cu_seqlens.device != q.device or cu_seqlens.dtype != torch.int32:
             raise TypeError("cu_seqlens must be an int32 CUDA tensor on the q device")
-        if not isinstance(max_seqlen, int) or max_seqlen <= 0:
-            raise ValueError(f"max_seqlen must be a positive int, got {max_seqlen}")
-        if not isinstance(moba_chunk_size, int) or moba_chunk_size <= 0:
-            raise ValueError(f"moba_chunk_size must be a positive int, got {moba_chunk_size}")
-        if not isinstance(moba_topk, int) or moba_topk < 1:
-            raise ValueError(f"moba_topk must be a positive int, got {moba_topk}")
-        if moba_topk > 64:
-            raise ValueError(f"moba_topk must be <= 64 to match FlashMoBA, got {moba_topk}")
+        if not all(isinstance(value, int) and value > 0 for value in (max_seqlen, moba_chunk_size)):
+            raise ValueError("max_seqlen and moba_chunk_size must be positive integers")
+        if not isinstance(moba_topk, int) or not 1 <= moba_topk <= 64:
+            raise ValueError(f"moba_topk must be a positive int <= 64, got {moba_topk}")
 
         num_q_heads = q.shape[1]
         num_kv_heads = k.shape[1]
-        if q.shape[0] == 0 or num_q_heads == 0 or num_kv_heads == 0 or q.shape[2] == 0:
-            raise ValueError("q, k, and v dimensions must be non-zero")
-        if num_q_heads % num_kv_heads != 0:
-            raise ValueError(f"q heads ({num_q_heads}) must be divisible by kv heads ({num_kv_heads})")
         head_dim = q.shape[2]
-        if head_dim > 256:
-            raise ValueError(f"head_dim must be <= 256 to match FlashMoBA, got {head_dim}")
+        if num_q_heads % num_kv_heads != 0 or head_dim > 256:
+            raise ValueError(
+                "q heads must be divisible by kv heads and head_dim must be <= 256, "
+                f"got q heads={num_q_heads}, kv heads={num_kv_heads}, head_dim={head_dim}"
+            )
 
         # Inference is the deployment target and uses a separate fully device-side
         # dataflow.  Keeping the existing autograd path below avoids silently

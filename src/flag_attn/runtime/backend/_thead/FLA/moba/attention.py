@@ -1,28 +1,563 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
-"""T-Head launch policy for the shared Triton MoBA attention kernels."""
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Dense and routed attention kernels for Triton MoBA."""
 
 import torch
 import triton
+import triton.language as tl
 
-from flag_attn.FLA.moba.attention import (
-    _fused_merge_softmax_kernel as _merge_autotuner,
-    _routed_gqa_attn_fwd_kernel,
-    _varlen_attn_bwd_dkdv_kernel,
-    _varlen_attn_bwd_dq_kernel,
-    _varlen_attn_fwd_kernel,
-)
-from flag_attn.FLA.moba.routing import _copy_triton, cdiv
+from .routing import _copy_triton, cdiv
 
-# PPU uses a fixed merge tile instead of the NVIDIA autotuning key.
-_fused_merge_softmax_kernel = _merge_autotuner.fn
+
+_LOG2E = tl.constexpr(1.4426950408889634)
+
+
+@triton.jit
+def _varlen_attn_fwd_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    out_ptr,
+    lse_ptr,
+    cu_q_ptr,
+    cu_k_ptr,
+    stride_q_t,
+    stride_q_h,
+    stride_q_d,
+    stride_k_t,
+    stride_k_h,
+    stride_k_d,
+    stride_v_t,
+    stride_v_h,
+    stride_v_d,
+    stride_o_t,
+    stride_o_h,
+    stride_o_d,
+    stride_lse_h,
+    stride_lse_t,
+    num_heads: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    softmax_scale,
+    HEAD_DIM: tl.constexpr,
+    MAX_SEQLEN_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    program = tl.program_id(0)
+    query_block = program % NUM_BLOCKS
+    batch_head = program // NUM_BLOCKS
+    batch = batch_head // num_heads
+    head = batch_head - batch * num_heads
+    kv_head = head // GROUP_SIZE
+
+    q_start = tl.load(cu_q_ptr + batch)
+    q_end = tl.load(cu_q_ptr + batch + 1)
+    k_start = tl.load(cu_k_ptr + batch)
+    k_end = tl.load(cu_k_ptr + batch + 1)
+    q_len = q_end - q_start
+    k_len = k_end - k_start
+
+    offs_m = query_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < q_len
+    mask_d = offs_d < HEAD_DIM
+    q = tl.load(
+        q_ptr + (q_start + offs_m[:, None]) * stride_q_t + head * stride_q_h + offs_d[None, :] * stride_q_d,
+        mask=mask_m[:, None] & mask_d[None, :],
+        other=0.0,
+    )
+
+    row_max = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    row_sum = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+    scale_log2 = softmax_scale * _LOG2E
+
+    for n_start in tl.range(0, MAX_SEQLEN_K, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < k_len
+        k = tl.load(
+            k_ptr + (k_start + offs_n[:, None]) * stride_k_t + kv_head * stride_k_h + offs_d[None, :] * stride_k_d,
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale_log2
+        valid = mask_m[:, None] & mask_n[None, :]
+        if CAUSAL:
+            # FlashAttention uses a bottom-right aligned causal mask for
+            # unequal query/key lengths.  MoBA's causal branch has equal
+            # lengths, but retaining this definition keeps the primitive sane.
+            valid &= offs_n[None, :] <= (offs_m[:, None] + k_len - q_len)
+        scores = tl.where(valid, scores, -float("inf"))
+
+        block_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(row_max, block_max)
+        alpha = tl.exp2(row_max - new_max)
+        probabilities = tl.exp2(scores - new_max[:, None])
+        probabilities = tl.where(valid, probabilities, 0.0)
+        row_sum = row_sum * alpha + tl.sum(probabilities, axis=1)
+        acc *= alpha[:, None]
+
+        v = tl.load(
+            v_ptr + (k_start + offs_n[:, None]) * stride_v_t + kv_head * stride_v_h + offs_d[None, :] * stride_v_d,
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        acc += tl.dot(probabilities.to(v.dtype), v, out_dtype=tl.float32)
+        row_max = new_max
+
+    acc /= row_sum[:, None]
+    tl.store(
+        out_ptr + (q_start + offs_m[:, None]) * stride_o_t + head * stride_o_h + offs_d[None, :] * stride_o_d,
+        acc,
+        mask=mask_m[:, None] & mask_d[None, :],
+    )
+    lse = (row_max + tl.log2(row_sum)) / _LOG2E
+    tl.store(
+        lse_ptr + head * stride_lse_h + (q_start + offs_m) * stride_lse_t,
+        lse,
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def _varlen_attn_bwd_dq_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    out_ptr,
+    dout_ptr,
+    lse_ptr,
+    dq_ptr,
+    cu_q_ptr,
+    cu_k_ptr,
+    stride_q_t,
+    stride_q_h,
+    stride_q_d,
+    stride_k_t,
+    stride_k_h,
+    stride_k_d,
+    stride_v_t,
+    stride_v_h,
+    stride_v_d,
+    stride_o_t,
+    stride_o_h,
+    stride_o_d,
+    stride_do_t,
+    stride_do_h,
+    stride_do_d,
+    stride_lse_h,
+    stride_lse_t,
+    stride_dq_t,
+    stride_dq_h,
+    stride_dq_d,
+    num_heads: tl.constexpr,
+    softmax_scale,
+    HEAD_DIM: tl.constexpr,
+    MAX_SEQLEN_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    program = tl.program_id(0)
+    query_block = program % NUM_BLOCKS
+    batch_head = program // NUM_BLOCKS
+    batch = batch_head // num_heads
+    head = batch_head - batch * num_heads
+    q_start = tl.load(cu_q_ptr + batch)
+    q_end = tl.load(cu_q_ptr + batch + 1)
+    k_start = tl.load(cu_k_ptr + batch)
+    k_end = tl.load(cu_k_ptr + batch + 1)
+    q_len = q_end - q_start
+    k_len = k_end - k_start
+
+    offs_m = query_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < q_len
+    mask_d = offs_d < HEAD_DIM
+    q_offsets = (q_start + offs_m[:, None]) * stride_q_t + head * stride_q_h + offs_d[None, :] * stride_q_d
+    o_offsets = (q_start + offs_m[:, None]) * stride_o_t + head * stride_o_h + offs_d[None, :] * stride_o_d
+    do_offsets = (q_start + offs_m[:, None]) * stride_do_t + head * stride_do_h + offs_d[None, :] * stride_do_d
+    q = tl.load(q_ptr + q_offsets, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+    out = tl.load(out_ptr + o_offsets, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+    dout = tl.load(dout_ptr + do_offsets, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+    delta = tl.sum(out.to(tl.float32) * dout.to(tl.float32), axis=1)
+    lse = tl.load(
+        lse_ptr + head * stride_lse_h + (q_start + offs_m) * stride_lse_t,
+        mask=mask_m,
+        other=0.0,
+    )
+    dq = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+    scale_log2 = softmax_scale * _LOG2E
+
+    for n_start in tl.range(0, MAX_SEQLEN_K, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < k_len
+        k_offsets = (k_start + offs_n[:, None]) * stride_k_t + head * stride_k_h + offs_d[None, :] * stride_k_d
+        v_offsets = (k_start + offs_n[:, None]) * stride_v_t + head * stride_v_h + offs_d[None, :] * stride_v_d
+        k = tl.load(k_ptr + k_offsets, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+        v = tl.load(v_ptr + v_offsets, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale_log2
+        valid = mask_m[:, None] & mask_n[None, :]
+        if CAUSAL:
+            valid &= offs_n[None, :] <= offs_m[:, None] + k_len - q_len
+        p = tl.exp2(scores - lse[:, None] * _LOG2E)
+        p = tl.where(valid, p, 0.0)
+        dp = tl.dot(dout, tl.trans(v), out_dtype=tl.float32)
+        ds = p * (dp - delta[:, None])
+        dq += tl.dot(ds.to(q.dtype), k, out_dtype=tl.float32)
+
+    dq *= softmax_scale
+    tl.store(
+        dq_ptr + (q_start + offs_m[:, None]) * stride_dq_t + head * stride_dq_h + offs_d[None, :] * stride_dq_d,
+        dq,
+        mask=mask_m[:, None] & mask_d[None, :],
+    )
+
+
+@triton.jit
+def _varlen_attn_bwd_dkdv_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    out_ptr,
+    dout_ptr,
+    lse_ptr,
+    dk_ptr,
+    dv_ptr,
+    cu_q_ptr,
+    cu_k_ptr,
+    stride_q_t,
+    stride_q_h,
+    stride_q_d,
+    stride_k_t,
+    stride_k_h,
+    stride_k_d,
+    stride_v_t,
+    stride_v_h,
+    stride_v_d,
+    stride_o_t,
+    stride_o_h,
+    stride_o_d,
+    stride_do_t,
+    stride_do_h,
+    stride_do_d,
+    stride_lse_h,
+    stride_lse_t,
+    stride_dk_t,
+    stride_dk_h,
+    stride_dk_d,
+    stride_dv_t,
+    stride_dv_h,
+    stride_dv_d,
+    num_heads: tl.constexpr,
+    softmax_scale,
+    HEAD_DIM: tl.constexpr,
+    MAX_SEQLEN_Q: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    program = tl.program_id(0)
+    key_block = program % NUM_BLOCKS
+    batch_head = program // NUM_BLOCKS
+    batch = batch_head // num_heads
+    head = batch_head - batch * num_heads
+    q_start = tl.load(cu_q_ptr + batch)
+    q_end = tl.load(cu_q_ptr + batch + 1)
+    k_start = tl.load(cu_k_ptr + batch)
+    k_end = tl.load(cu_k_ptr + batch + 1)
+    q_len = q_end - q_start
+    k_len = k_end - k_start
+
+    offs_n = key_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_n = offs_n < k_len
+    mask_d = offs_d < HEAD_DIM
+    k_offsets = (k_start + offs_n[:, None]) * stride_k_t + head * stride_k_h + offs_d[None, :] * stride_k_d
+    k = tl.load(k_ptr + k_offsets, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+    dk = tl.zeros([BLOCK_N, BLOCK_D], tl.float32)
+    dv = tl.zeros([BLOCK_N, BLOCK_D], tl.float32)
+    scale_log2 = softmax_scale * _LOG2E
+
+    for m_start in tl.range(0, MAX_SEQLEN_Q, BLOCK_M):
+        offs_m = m_start + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < q_len
+        q_offsets = (q_start + offs_m[:, None]) * stride_q_t + head * stride_q_h + offs_d[None, :] * stride_q_d
+        o_offsets = (q_start + offs_m[:, None]) * stride_o_t + head * stride_o_h + offs_d[None, :] * stride_o_d
+        do_offsets = (q_start + offs_m[:, None]) * stride_do_t + head * stride_do_h + offs_d[None, :] * stride_do_d
+        q = tl.load(q_ptr + q_offsets, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+        out = tl.load(out_ptr + o_offsets, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+        dout = tl.load(dout_ptr + do_offsets, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+        delta = tl.sum(out.to(tl.float32) * dout.to(tl.float32), axis=1)
+        lse = tl.load(
+            lse_ptr + head * stride_lse_h + (q_start + offs_m) * stride_lse_t,
+            mask=mask_m,
+            other=0.0,
+        )
+        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale_log2
+        valid = mask_m[:, None] & mask_n[None, :]
+        if CAUSAL:
+            valid &= offs_n[None, :] <= offs_m[:, None] + k_len - q_len
+        p = tl.exp2(scores - lse[:, None] * _LOG2E)
+        p = tl.where(valid, p, 0.0)
+        dp = tl.dot(
+            dout,
+            tl.trans(
+                tl.load(
+                    v_ptr + (k_start + offs_n[:, None]) * stride_v_t + head * stride_v_h + offs_d[None, :] * stride_v_d,
+                    mask=mask_n[:, None] & mask_d[None, :],
+                    other=0.0,
+                )
+            ),
+            out_dtype=tl.float32,
+        )
+        ds = p * (dp - delta[:, None])
+        dk += tl.dot(tl.trans(ds.to(q.dtype)), q, out_dtype=tl.float32)
+        dv += tl.dot(tl.trans(p.to(dout.dtype)), dout, out_dtype=tl.float32)
+
+    dk *= softmax_scale
+    tl.store(
+        dk_ptr + (k_start + offs_n[:, None]) * stride_dk_t + head * stride_dk_h + offs_d[None, :] * stride_dk_d,
+        dk,
+        mask=mask_n[:, None] & mask_d[None, :],
+    )
+    tl.store(
+        dv_ptr + (k_start + offs_n[:, None]) * stride_dv_t + head * stride_dv_h + offs_d[None, :] * stride_dv_d,
+        dv,
+        mask=mask_n[:, None] & mask_d[None, :],
+    )
+
+
+@triton.jit
+def _routed_gqa_attn_fwd_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    query_indices_ptr,
+    expert_offsets_ptr,
+    descriptor_experts_ptr,
+    descriptor_starts_ptr,
+    cu_seqlens_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_q_t,
+    stride_q_h,
+    stride_q_d,
+    stride_k_t,
+    stride_k_h,
+    stride_k_d,
+    stride_v_t,
+    stride_v_h,
+    stride_v_d,
+    stride_out_t,
+    stride_out_d,
+    softmax_scale,
+    NUM_Q_HEADS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    MAX_CHUNKS_PER_SEQUENCE: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    descriptor = tl.program_id(0)
+    expert = tl.load(descriptor_experts_ptr + descriptor)
+    if expert < 0:
+        return
+    route_start = tl.load(descriptor_starts_ptr + descriptor)
+    expert_end = tl.load(expert_offsets_ptr + expert + 1)
+    q_head = expert % NUM_Q_HEADS
+    kv_head = q_head // GROUP_SIZE
+    chunk_slot = expert // NUM_Q_HEADS
+    batch = chunk_slot // MAX_CHUNKS_PER_SEQUENCE
+    local_chunk = chunk_slot - batch * MAX_CHUNKS_PER_SEQUENCE
+    sequence_start = tl.load(cu_seqlens_ptr + batch)
+    key_start = sequence_start + local_chunk * CHUNK_SIZE
+
+    offs_m = tl.arange(0, BLOCK_M)
+    route_positions = route_start + offs_m
+    mask_m = route_positions < expert_end
+    flat_query_indices = tl.load(query_indices_ptr + route_positions, mask=mask_m, other=0)
+    query_tokens = flat_query_indices // NUM_Q_HEADS
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < HEAD_DIM
+    q = tl.load(
+        q_ptr + query_tokens[:, None] * stride_q_t + q_head * stride_q_h + offs_d[None, :] * stride_q_d,
+        mask=mask_m[:, None] & mask_d[None, :],
+        other=0.0,
+    )
+
+    row_max = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    row_sum = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+    scale_log2 = softmax_scale * _LOG2E
+    for n_start in tl.range(0, CHUNK_SIZE, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < CHUNK_SIZE
+        k_values = tl.load(
+            k_ptr + (key_start + offs_n[:, None]) * stride_k_t + kv_head * stride_k_h + offs_d[None, :] * stride_k_d,
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        scores = tl.dot(q, tl.trans(k_values), out_dtype=tl.float32) * scale_log2
+        valid = mask_m[:, None] & mask_n[None, :]
+        scores = tl.where(valid, scores, -float("inf"))
+        block_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(row_max, block_max)
+        alpha = tl.exp2(row_max - new_max)
+        probabilities = tl.exp2(scores - new_max[:, None])
+        probabilities = tl.where(valid, probabilities, 0.0)
+        row_sum = row_sum * alpha + tl.sum(probabilities, axis=1)
+        acc *= alpha[:, None]
+        v_values = tl.load(
+            v_ptr + (key_start + offs_n[:, None]) * stride_v_t + kv_head * stride_v_h + offs_d[None, :] * stride_v_d,
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        acc += tl.dot(probabilities.to(v_values.dtype), v_values, out_dtype=tl.float32)
+        row_max = new_max
+
+    acc /= row_sum[:, None]
+    tl.store(
+        out_ptr + route_positions[:, None] * stride_out_t + offs_d[None, :] * stride_out_d,
+        acc,
+        mask=mask_m[:, None] & mask_d[None, :],
+    )
+    lse = (row_max + tl.log2(row_sum)) / _LOG2E
+    tl.store(lse_ptr + route_positions, lse, mask=mask_m)
+
+
+@triton.jit
+def _fused_merge_softmax_kernel(
+    self_out_ptr,
+    self_lse_ptr,
+    moba_out_ptr,
+    moba_lse_ptr,
+    route_positions_ptr,
+    out_ptr,
+    final_lse_ptr,
+    num_rows,
+    head_dim,
+    stride_self_row,
+    stride_self_d,
+    stride_self_lse_head,
+    stride_self_lse_token,
+    stride_moba_row,
+    stride_moba_d,
+    stride_route_rank,
+    stride_route_row,
+    stride_out_row,
+    stride_out_d,
+    stride_final_lse_head,
+    stride_final_lse_token,
+    num_heads: tl.constexpr,
+    ROW_BUCKET: tl.constexpr,
+    GPU_ARCH: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    TOPK: tl.constexpr,
+    NUM_ROUTES: tl.constexpr,
+):
+    """
+    Fused kernel to combine Self-Attention and MoBA-Attention results.
+
+    It performs the standard FlashAttention output merging:
+    O = (O_self * exp(LSE_self - LSE_max) + sum(O_moba * exp(LSE_moba - LSE_max))) / exp(LSE_new - LSE_max)
+
+    This avoids multiple passes of reading/writing large output tensors.
+    """
+    row_id = tl.program_id(0)
+    if row_id >= num_rows:
+        return
+
+    offs_k = tl.arange(0, TOPK)
+    route_mask = offs_k < NUM_ROUTES
+    positions = tl.load(
+        route_positions_ptr + offs_k * stride_route_rank + row_id * stride_route_row,
+        mask=route_mask,
+        other=-1,
+    )
+    mask_k = route_mask & (positions >= 0)
+    safe_positions = tl.where(mask_k, positions, 0)
+
+    token = row_id // num_heads
+    head = row_id - token * num_heads
+    # Load LSEs and compute global Max LSE
+    self_lse = tl.load(self_lse_ptr + head * stride_self_lse_head + token * stride_self_lse_token).to(tl.float32)
+    moba_lse = tl.load(
+        moba_lse_ptr + safe_positions,
+        mask=mask_k,
+        other=-float("inf"),
+    ).to(tl.float32)
+
+    max_moba = tl.max(moba_lse, axis=0)
+    max_lse = tl.maximum(self_lse, max_moba)
+
+    # Compute weights
+    self_se = tl.exp(self_lse - max_lse)
+    moba_se = tl.exp(moba_lse - max_lse)
+    moba_se = tl.where(mask_k, moba_se, 0.0)
+    total_se = self_se + tl.sum(moba_se, axis=0)
+    merged_lse = tl.log(total_se) + max_lse
+    tl.store(
+        final_lse_ptr + head * stride_final_lse_head + token * stride_final_lse_token,
+        merged_lse,
+    )
+
+    # Compute weighted output
+    inv_total = 1.0 / total_se
+    self_factor = self_se * inv_total
+    moba_factor = moba_se * inv_total
+
+    offs_d = tl.arange(0, BLOCK_D)
+
+    for d_start in range(0, head_dim, BLOCK_D):
+        mask_d = (d_start + offs_d) < head_dim
+
+        self_ptrs = self_out_ptr + row_id * stride_self_row + (d_start + offs_d) * stride_self_d
+        self_vals = tl.load(self_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+        acc = self_vals * self_factor
+
+        moba_ptrs = (
+            moba_out_ptr + safe_positions[:, None] * stride_moba_row + (d_start + offs_d)[None, :] * stride_moba_d
+        )
+        moba_vals = tl.load(
+            moba_ptrs,
+            mask=mask_k[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        scaled = moba_vals * moba_factor[:, None]
+        acc = acc + tl.sum(scaled, axis=0)
+
+        out_ptrs = out_ptr + row_id * stride_out_row + (d_start + offs_d) * stride_out_d
+        tl.store(out_ptrs, acc, mask=mask_d)
 
 
 def _attention_launch_config(
     head_dim: int,
     device: torch.device,
 ) -> tuple[int, int, int, int, int]:
-    """Use ordinary dot tiles on PPU for forward and backward attention."""
+    # tl.dot requires a reduction dimension of at least 16. Padding also lets
+    # the same kernels support every head dimension up to FlashMoBA's D=256.
     block_d = max(16, triton.next_power_of_2(head_dim))
     if head_dim <= 128:
         return 64, 64, block_d, 4, 1
@@ -42,8 +577,6 @@ def _triton_varlen_forward(
 ):
     total_q, num_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
-    if num_heads % num_kv_heads != 0:
-        raise ValueError(f"q heads ({num_heads}) must be divisible by kv heads ({num_kv_heads})")
     group_size = num_heads // num_kv_heads
     num_sequences = cu_seqlens_q.numel() - 1
     out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
