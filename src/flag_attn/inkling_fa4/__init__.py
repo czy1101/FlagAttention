@@ -14,13 +14,36 @@
 
 """Inkling FA4 paged relative attention with Triton and optional Hopper TLE."""
 
-from .relative_attention import (
-    get_backend,
-    inkling_fa4_rel_attention,
-    inkling_fa4_rel_attention_tle,
-    inkling_fa4_rel_attention_triton,
-    tle_available,
-)
+from flag_attn.runtime.backend import resolve_operator
+
+_OPERATOR_EXPORTS = {
+    "get_backend": (
+        "inkling_fa4_get_backend", "flag_attn.inkling_fa4.relative_attention", "get_backend"
+    ),
+    "inkling_fa4_rel_attention": (
+        "inkling_fa4_rel_attention", "flag_attn.inkling_fa4.relative_attention", "inkling_fa4_rel_attention"
+    ),
+    "inkling_fa4_rel_attention_tle": (
+        "inkling_fa4_rel_attention_tle", "flag_attn.inkling_fa4.relative_attention", "inkling_fa4_rel_attention_tle"
+    ),
+    "inkling_fa4_rel_attention_triton": (
+        "inkling_fa4_rel_attention_triton", "flag_attn.inkling_fa4.relative_attention", "inkling_fa4_rel_attention_triton"
+    ),
+    "tle_available": (
+        "inkling_fa4_tle_available", "flag_attn.inkling_fa4.relative_attention", "tle_available"
+    ),
+}
+
+
+def __getattr__(name: str):
+    try:
+        operator, module, symbol = _OPERATOR_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = resolve_operator(operator, module, symbol)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "get_backend",
