@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "parallel_moba": (".FLA.moba", "parallel_moba"),
     "SPARSE_BLOCK_SIZE": (".minimax_sparse_attention.index_topk", "SPARSE_BLOCK_SIZE"),
     "minimax_m3_index_decode": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode"),
     "minimax_m3_index_decode_score": (
