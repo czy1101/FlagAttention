@@ -295,6 +295,10 @@ def forgetting_attention(
 
 def get_fwd_config(B, H, M, N, D, causal):
     assert causal
+    from flag_attn.runtime.backend import is_metax_backend
+
+    if is_metax_backend():
+        return (64, 32, 3, 4) if D <= 64 else (128, 32, 1, 4)
     if torch.cuda.get_device_capability() == (8, 0):
         if D <= 64:
             BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 32, 3, 4
