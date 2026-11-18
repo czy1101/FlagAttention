@@ -1,32 +1,8 @@
 # Copyright (c) 2026 Parallax authors.
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-"""Single-token Parallax decode written in Triton.
-
-This is the Triton counterpart of the CuTeDSL SM90 decode shipped by the
-external ``parallax-kernel`` package (https://github.com/Yifei-Zuo/Parallax).
-It uses the same ``(B, 1, H_q, D)`` query and ``(B, L, H_kv, D)`` cache layouts
-and evaluates the same composite Parallax attention formula::
-
-    s1_j = scale * dot(q, k_j)
-    s2_j = dot(r, k_j)
-    p1   = exp(s1)
-    p2   = p1 * s2
-    out  = O1 / d1 * (1 + d2 / d1) - O2 / d1
-
-where ``d1=sum(p1)``, ``d2=sum(p2)``, ``O1=sum(p1*v)`` and
-``O2=sum(p2*v)``.  All online-softmax state and the split merge are fp32.
-
-The implementation has two forward-only paths:
-
-* one CTA per ``(batch, query-head)`` for short caches, sliding windows and
-  runtime ``seqused_k``;
-* split-KV partial reductions followed by a log-sum-exp merge for long-cache,
-  low-occupancy decode.
-
-"""
-
 from __future__ import annotations
 
 import math

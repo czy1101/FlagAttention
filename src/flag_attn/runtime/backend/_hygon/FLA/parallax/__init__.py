@@ -12,22 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Parameterized local linear attention implemented with Triton kernels."""
+from flag_attn.runtime.backend._hygon.FLA.parallax.parallel import parallel_parallax
 
-from flag_attn.runtime.backend._hygon.FLA.parallax.decode import HAS_TLE, parallax_attn_with_kvcache, parallax_decode
-from flag_attn.runtime.backend._hygon.FLA.parallax.parallel import (
-    ParallaxFunction,
-    parallel_parallax,
-    parallel_parallax_bwd,
-    parallel_parallax_fwd,
-)
-
-__all__ = [
-    "HAS_TLE",
-    "ParallaxFunction",
-    "parallax_attn_with_kvcache",
-    "parallax_decode",
-    "parallel_parallax",
-    "parallel_parallax_bwd",
-    "parallel_parallax_fwd",
-]
+__all__ = ["parallel_parallax"]
