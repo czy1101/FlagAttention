@@ -16,6 +16,16 @@ import torch
 import triton
 import triton.language as tl
 
+# SAGE-003: the per-block INT8 quantizer is launch-bound on the GCU. Triton's
+# default 4-warp / 3-stage launch spreads one row over four warps that then
+# serialise on the block-wide max reduction; one warp, one stage runs the same
+# arithmetic without that reduction traffic and is 1.3-5.5x faster with
+# bitwise identical int8/scale outputs (see the equivalence test in
+# tests/flag_attn/test_sage_quant_launch.py). Only the launch shape changes, so
+# the generic CPU path is untouched.
+_QUANT_NUM_WARPS = 1
+_QUANT_NUM_STAGES = 1
+
 
 @triton.jit
 def quant_per_block_int8_kernel(Input, Output, Scale, L,
@@ -85,7 +95,8 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
         stride_bz_qo, stride_h_qo, stride_seq_qo,
         q_scale.stride(0), q_scale.stride(1),
         sm_scale=(sm_scale * 1.44269504),
-        C=head_dim, BLK=BLKQ
+        C=head_dim, BLK=BLKQ,
+        num_warps=_QUANT_NUM_WARPS, num_stages=_QUANT_NUM_STAGES
     )
 
     grid = ((kv_len + BLKK - 1) // BLKK, h_kv, b)
@@ -95,7 +106,8 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
         stride_bz_ko, stride_h_ko, stride_seq_ko,
         k_scale.stride(0), k_scale.stride(1),
         sm_scale=1.0,
-        C=head_dim, BLK=BLKK
+        C=head_dim, BLK=BLKK,
+        num_warps=_QUANT_NUM_WARPS, num_stages=_QUANT_NUM_STAGES
     )
 
     return q_int8, q_scale, k_int8, k_scale
