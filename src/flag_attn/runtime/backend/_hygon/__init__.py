@@ -39,6 +39,7 @@ _OPERATOR_EXPORTS = {
     "chunk_kda_fwd_infer": (".FLA.kda.chunk_kda", "chunk_kda_fwd_infer"),
     "parallel_nsa": (".FLA.nsa.parallel_nsa", "parallel_nsa"),
     "parallel_nsa_compression": (".FLA.nsa.parallel_nsa_compression", "parallel_nsa_compression"),
+    "parallel_wall_attn": (".FLA.wall_attn", "parallel_wall_attn"),
     "chunk_gla": (".FLA.gla", "chunk_gla"),
     "fused_attnres": (".FLA.attnres", "fused_attnres"),
     "minimax_m3_index_decode": (".msa", "minimax_m3_index_decode"),
