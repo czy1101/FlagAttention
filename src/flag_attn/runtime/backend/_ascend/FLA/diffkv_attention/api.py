@@ -37,11 +37,18 @@ _PPG = 8
 _BLOCK_N = 256
 #: Default decode path: "auto", "paged" or "dense".
 _MODE = "auto"
-#: With at most this many KV tokens to read, reading the paged cache directly
-#: (one launch) beats paying for the de-page pass.  Measured crossover:
-#: b1/l512 (2k) and b8/l512 (16k) favour paged, swa b1/l2048 (16k, 8 KV
-#: heads) and b8/l2048 (65k) favour dense.
-_DENSE_MIN_TOKENS = 16384
+#: Routing bound, in ``programs * pages``.  The paged path is a single launch
+#: (the dense path is two, and a launch costs ~45 us on this backend), but it
+#: needs one dot pair per 16-token page, so it only wins while the KV run is
+#: short.  Measured winner by ``batch * kv_heads * pages``: 128, 256, 512 and
+#: 1024 favour paged (b8/l512 and b1/l4096 sit exactly on 1024 and still favour
+#: paged by 1.5x and 1.06x); 2048, 4096 and up favour dense (b1/l8192: 348 us
+#: dense vs 660 paged).
+_PAGED_MAX_PAGES_PER_UNIT = 1024
+#: ... and the small-N (16-token) dots of the paged path only pay off while the
+#: query group is wide.  With 8 KV heads (group 8) it loses even at 1024
+#: (b1/l2048: 636 us paged vs 337 dense), so it is restricted to wide groups.
+_PAGED_MIN_GROUP = 16
 
 
 def _supported(query, key_cache, value_cache, context_lens, block_tables, window_size):
@@ -193,10 +200,10 @@ def diffkv_attention(
     else:
         splits = _choose_splits(batch, num_kv_heads, tables.shape[1])
 
-    if _MODE == "dense" or (
-        _MODE == "auto"
-        and batch * num_kv_heads * tables.shape[1] * key_cache.shape[1] >= _DENSE_MIN_TOKENS
-    ):
+    group = num_q_heads // num_kv_heads
+    use_paged = (batch * num_kv_heads * tables.shape[1] <= _PAGED_MAX_PAGES_PER_UNIT
+                 and group >= _PAGED_MIN_GROUP)
+    if _MODE == "dense" or (_MODE == "auto" and not use_paged):
         o_part, m_part, l_part = _dense(query, key_cache, value_cache, lengths,
                                         tables, attn_scale, window_size,
                                         splits, out)
