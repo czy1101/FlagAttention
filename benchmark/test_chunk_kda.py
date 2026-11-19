@@ -198,11 +198,6 @@ class ChunkKDABenchmark(Benchmark):
     ]
     DEFAULT_SHAPE_DESC = "seq_lens..., H, D"
 
-    def init_user_config(self):
-        super().init_user_config()
-        if any(len(shape) < 3 for shape in self.shapes):
-            self.shapes = self.DEFAULT_SHAPES
-
     def get_input_iter(self, cur_dtype):
         for shape in self.shapes:
             *seq_lens, H, D = shape
@@ -279,5 +274,5 @@ def test_chunk_kda(record_property):
         op_name="chunk_kda",
         torch_op=_chunk_kda_torch_reference_op,
     )
-    bench.set_gems(_chunk_kda_inference_op)
+    bench.set_flagattn(_chunk_kda_inference_op)
     bench.run(record_property)
