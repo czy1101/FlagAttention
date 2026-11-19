@@ -94,10 +94,15 @@ def _diffkv_decode_kernel(
         b_o = b_o * alpha[:, None] + tl.dot(b_p.to(b_v.dtype), b_v)
         b_m = m_new
 
-    row = (i_b * HQ + h) * SPLITS + i_s
-    tl.store(o_part + row[:, None] * DV + rv[None, :], b_o)
-    tl.store(m_part + row, b_m)
-    tl.store(l_part + row, b_l)
+    if FINAL:
+        b_o = b_o / tl.where(b_l > 0.0, b_l, 1.0)[:, None]
+        tl.store(o_part + (i_b * HQ + h)[:, None] * DV + rv[None, :],
+                 b_o.to(o_part.dtype.element_ty))
+    else:
+        row = (i_b * HQ + h) * SPLITS + i_s
+        tl.store(o_part + row[:, None] * DV + rv[None, :], b_o)
+        tl.store(m_part + row, b_m)
+        tl.store(l_part + row, b_l)
 
 
 @triton.jit
@@ -200,8 +205,14 @@ def _diffkv_decode_dense_kernel(
     SPLITS: tl.constexpr,
     LSTRIDE: tl.constexpr,
     WINDOW: tl.constexpr,
+    FINAL: tl.constexpr,
 ):
-    """Split-KV decode over a de-paged, contiguous KV buffer."""
+    """Split-KV decode over a de-paged, contiguous KV buffer.
+
+    ``FINAL`` means the program owns the whole KV range, so it normalises and
+    writes the output itself instead of leaving partials for a reduce kernel
+    (saves one launch, which on this backend costs more than the work).
+    """
     i_s = tl.program_id(0)
     i_kv = tl.program_id(1)
     i_b = tl.program_id(2)
@@ -253,7 +264,12 @@ def _diffkv_decode_dense_kernel(
         b_o = b_o * alpha[:, None] + tl.dot(b_p.to(b_v.dtype), b_v)
         b_m = m_new
 
-    row = (i_b * HQ + h) * SPLITS + i_s
-    tl.store(o_part + row[:, None] * DV + rv[None, :], b_o)
-    tl.store(m_part + row, b_m)
-    tl.store(l_part + row, b_l)
+    if FINAL:
+        b_o = b_o / tl.where(b_l > 0.0, b_l, 1.0)[:, None]
+        tl.store(o_part + (i_b * HQ + h)[:, None] * DV + rv[None, :],
+                 b_o.to(o_part.dtype.element_ty))
+    else:
+        row = (i_b * HQ + h) * SPLITS + i_s
+        tl.store(o_part + row[:, None] * DV + rv[None, :], b_o)
+        tl.store(m_part + row, b_m)
+        tl.store(l_part + row, b_l)

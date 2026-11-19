@@ -74,10 +74,15 @@ def _supported(query, key_cache, value_cache, context_lens, block_tables, window
 
 
 def _choose_splits(batch, num_kv_heads, max_pages):
-    """Split count from the block-table bound only (no device sync)."""
-    base = max(batch * num_kv_heads, 1)
-    want = (_TARGET_PROGRAMS + base - 1) // base
-    return int(max(1, min(want, _MAX_SPLITS, max(max_pages, 1))))
+    """Split count.
+
+    Measured on this backend: one split per (sequence, KV head) wins even at
+    batch=1, because every extra split duplicates the program prologue and adds
+    a reduce launch, while the decode kernel gets no extra parallelism back
+    (full b1/l8192: 557 us at one split vs 1096 us at eight).  So the dense path
+    always uses a single split and finalises in the decode kernel itself.
+    """
+    return 1
 
 
 def _workspace(query, batch, num_q_heads, head_v, splits):
@@ -106,7 +111,7 @@ def _paged(query, key_cache, value_cache, lengths, tables, attn_scale,
 
 
 def _dense(query, key_cache, value_cache, lengths, tables, attn_scale,
-           window_size, splits):
+           window_size, splits, out):
     batch, num_q_heads, head_qk = query.shape
     num_kv_heads = key_cache.shape[2]
     head_v = value_cache.shape[3]
@@ -126,13 +131,18 @@ def _dense(query, key_cache, value_cache, lengths, tables, attn_scale,
         BS=block_size, BT_STRIDE=tables.stride(0), LSTRIDE=len_bound, PPG=_PPG,
         WINDOW=window_size,
     )
-    o_part, m_part, l_part = _workspace(query, batch, num_q_heads, head_v, splits)
+    final = splits == 1
+    if final:
+        o_part = out
+        m_part = l_part = out
+    else:
+        o_part, m_part, l_part = _workspace(query, batch, num_q_heads, head_v, splits)
     _diffkv_decode_dense_kernel[(splits, num_kv_heads, batch)](
         query, k_dense, v_dense, lengths, o_part, m_part, l_part, attn_scale,
         HQ=num_q_heads, HKV=num_kv_heads, GROUP=num_q_heads // num_kv_heads,
         DQK=head_qk, DPAD=triton.next_power_of_2(head_qk), DV=head_v,
         BN=_BLOCK_N, BS_PAGE=block_size, SPLITS=splits, LSTRIDE=len_bound,
-        WINDOW=window_size,
+        WINDOW=window_size, FINAL=final,
     )
     return o_part, m_part, l_part
 
@@ -167,12 +177,20 @@ def diffkv_attention(
 
     if num_segments is not None:
         splits = int(max(1, min(int(num_segments), _MAX_SPLITS)))
+    elif _MODE == "dense":
+        splits = 1
     else:
         splits = _choose_splits(batch, num_kv_heads, tables.shape[1])
 
-    run = _dense if _MODE == "dense" else _paged
-    o_part, m_part, l_part = run(query, key_cache, value_cache, lengths, tables,
-                                 attn_scale, window_size, splits)
+    if _MODE == "dense":
+        o_part, m_part, l_part = _dense(query, key_cache, value_cache, lengths,
+                                        tables, attn_scale, window_size,
+                                        splits, out)
+        if splits == 1:
+            return out
+    else:
+        o_part, m_part, l_part = _paged(query, key_cache, value_cache, lengths,
+                                        tables, attn_scale, window_size, splits)
     _diffkv_reduce_kernel[(batch * num_q_heads,)](
         o_part, m_part, l_part, out,
         DV=head_v, SPLITS=splits, SPAD=triton.next_power_of_2(splits),
