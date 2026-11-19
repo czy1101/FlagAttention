@@ -116,20 +116,22 @@ def _dense(query, key_cache, value_cache, lengths, tables, attn_scale,
     num_kv_heads = key_cache.shape[2]
     head_v = value_cache.shape[3]
     block_size = key_cache.shape[1]
-    len_bound = tables.shape[1] * block_size
-
-    k_dense = torch.empty((batch, len_bound, num_kv_heads, head_qk),
+    # one BLOCK_N of slack: the decode loop reads whole blocks, and with a
+    # short window the last block can run past the sequence's own pages
+    len_alloc = tables.shape[1] * block_size + _BLOCK_N
+    k_dense = torch.empty((batch, len_alloc, num_kv_heads, head_qk),
                           device=query.device, dtype=query.dtype)
-    v_dense = torch.empty((batch, len_bound, num_kv_heads, head_v),
+    v_dense = torch.empty((batch, len_alloc, num_kv_heads, head_v),
                           device=query.device, dtype=query.dtype)
-    max_pages = triton.cdiv(len_bound, block_size)
+    max_pages = triton.cdiv(len_alloc, block_size)
     _diffkv_depage_kernel[(triton.cdiv(max_pages, _PPG), batch)](
         key_cache, value_cache, tables, lengths, k_dense, v_dense,
         HKV=num_kv_heads, DQK=head_qk,
         KFLAT=triton.next_power_of_2(num_kv_heads * head_qk),
         DV=head_v, VFLAT=triton.next_power_of_2(num_kv_heads * head_v),
-        BS=block_size, BT_STRIDE=tables.stride(0), LSTRIDE=len_bound, PPG=_PPG,
-        WINDOW=window_size,
+        BS=block_size, BT_STRIDE=tables.stride(0), LSTRIDE=len_alloc, PPG=_PPG,
+        WINDOW=window_size, BN=_BLOCK_N,
+        NPAGES_MAX=max_pages,
     )
     final = splits == 1
     if final:
@@ -141,7 +143,7 @@ def _dense(query, key_cache, value_cache, lengths, tables, attn_scale,
         query, k_dense, v_dense, lengths, o_part, m_part, l_part, attn_scale,
         HQ=num_q_heads, HKV=num_kv_heads, GROUP=num_q_heads // num_kv_heads,
         DQK=head_qk, DPAD=triton.next_power_of_2(head_qk), DV=head_v,
-        BN=_BLOCK_N, BS_PAGE=block_size, SPLITS=splits, LSTRIDE=len_bound,
+        BN=_BLOCK_N, BS_PAGE=block_size, SPLITS=splits, LSTRIDE=len_alloc,
         WINDOW=window_size, FINAL=final,
     )
     return o_part, m_part, l_part

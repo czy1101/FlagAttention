@@ -153,6 +153,8 @@ def _diffkv_depage_kernel(
     LSTRIDE: tl.constexpr,   # elements per token in the dense buffer
     PPG: tl.constexpr,       # pages per program
     WINDOW: tl.constexpr,
+    BN: tl.constexpr,        # decode tile: the tail it may address is zeroed
+    NPAGES_MAX: tl.constexpr,  # capacity of the dense buffer, in pages
 ):
     """De-page the cache: one program copies PPG contiguous pages.
 
@@ -166,6 +168,10 @@ def _diffkv_depage_kernel(
     length = tl.load(lens + i_b).to(tl.int32)
     n_pages = (length + BS - 1) // BS
     p_start = tl.maximum(0, length - WINDOW) // BS if WINDOW > 0 else 0
+    # the decode loop reads whole BN-token blocks, so everything from `length`
+    # up to the end of the last block must be defined memory (zeros keep the
+    # masked-out lanes from dragging NaN through 0 * x)
+    n_zero = tl.minimum(tl.cdiv(length + BN + BS, BS), NPAGES_MAX)
 
     rt = tl.arange(0, BS)
     rk = tl.arange(0, KFLAT)
@@ -174,7 +180,14 @@ def _diffkv_depage_kernel(
 
     for j in tl.static_range(PPG):
         p = i_pg * PPG + j
-        if (p >= p_start) & (p < n_pages):
+        if (p >= n_pages) & (p < n_zero):
+            zk = tl.zeros([BS, KFLAT], dtype=k_dense.dtype.element_ty)
+            zr = tl.arange(0, BS)
+            tl.store(k_dense + ((i_b * LSTRIDE + p * BS) + zr)[:, None] * (HKV * DQK) + rk[None, :],
+                     zk, mask=msk_k[None, :])
+            zv = tl.zeros([BS, VFLAT], dtype=v_dense.dtype.element_ty)
+            tl.store(v_dense + ((i_b * LSTRIDE + p * BS) + zr)[:, None] * (HKV * DV) + rv[None, :], zv)
+        elif (p >= p_start) & (p < n_pages):
             pid = tl.load(block_table + i_b * BT_STRIDE + p).to(tl.int64)
             b_k = tl.load(k_cache + pid * (BS * HKV * DQK) + rt[:, None] * (HKV * DQK) + rk[None, :],
                           mask=msk_k[None, :], other=0.0)
@@ -247,10 +260,10 @@ def _diffkv_decode_dense_kernel(
     n_blocks = tl.cdiv(t_hi - t_lo, BN)
     for i_t in tl.range(0, n_blocks):
         t0 = t_lo + i_t * BN
-        b_k = tl.load(k_base + (t0 + rt)[None, :] * (HKV * DQK) + rd[:, None],
+        pos = t0 + rt
+        b_k = tl.load(k_base + pos[None, :] * (HKV * DQK) + rd[:, None],
                       mask=msk_d[:, None], other=0.0)          # [DPAD, BN]
         b_s = tl.dot(b_q, b_k)                                 # [GROUP, BN]
-        pos = t0 + rt
         valid = (pos >= start) & (pos < t_hi)
         b_s = tl.where(valid[None, :], b_s, _NEG)
 
@@ -260,7 +273,7 @@ def _diffkv_decode_dense_kernel(
         b_p = tl.where(valid[None, :], b_p, 0.0)
         b_l = b_l * alpha + tl.sum(b_p, 1)
 
-        b_v = tl.load(v_base + (t0 + rt)[:, None] * (HKV * DV) + rv[None, :])
+        b_v = tl.load(v_base + pos[:, None] * (HKV * DV) + rv[None, :])
         b_o = b_o * alpha[:, None] + tl.dot(b_p.to(b_v.dtype), b_v)
         b_m = m_new
 
