@@ -73,9 +73,25 @@ chunk_gla_bwd_kernel_inter:
 - {META: {BK: 32, BV: 32}, num_warps: 4, num_stages: 3}
 - {META: {BK: 32, BV: 32}, num_warps: 8, num_stages: 4}
 
-# Curated launch settings for AttnRes. The first entry is selected directly
-# by the Hygon wrapper; this kernel does not run runtime autotuning.
+# Curated launch settings for AttnRes.
 _fused_attnres_fwd_kernel:
   - META: {}
     num_warps: 4
     num_stages: 2
+
+# Curated Hygon Parallax decode launch settings.
+_parallax_decode_kernel:
+  - META:
+      BN: 128
+      MAX_SPLITS: 32
+    num_warps: 4
+    num_stages: 3
+_parallax_decode_split_kernel:
+  - META:
+      BN: 128
+    num_warps: 4
+    num_stages: 3
+_parallax_decode_merge_kernel:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
