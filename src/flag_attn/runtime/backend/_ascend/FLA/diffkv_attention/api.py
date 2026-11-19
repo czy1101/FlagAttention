@@ -34,7 +34,7 @@ _MAX_SPLITS = 32
 #: Pages de-paged per program in the de-page pass.
 _PPG = 8
 #: Tokens per loop iteration in the dense path.
-_BLOCK_N = 128
+_BLOCK_N = 256
 #: Default decode path: "paged" or "dense".
 _MODE = "dense"
 
@@ -124,13 +124,15 @@ def _dense(query, key_cache, value_cache, lengths, tables, attn_scale,
         KFLAT=triton.next_power_of_2(num_kv_heads * head_qk),
         DV=head_v, VFLAT=triton.next_power_of_2(num_kv_heads * head_v),
         BS=block_size, BT_STRIDE=tables.stride(0), LSTRIDE=len_bound, PPG=_PPG,
+        WINDOW=window_size,
     )
     o_part, m_part, l_part = _workspace(query, batch, num_q_heads, head_v, splits)
     _diffkv_decode_dense_kernel[(splits, num_kv_heads, batch)](
         query, k_dense, v_dense, lengths, o_part, m_part, l_part, attn_scale,
         HQ=num_q_heads, HKV=num_kv_heads, GROUP=num_q_heads // num_kv_heads,
         DQK=head_qk, DPAD=triton.next_power_of_2(head_qk), DV=head_v,
-        BN=_BLOCK_N, SPLITS=splits, LSTRIDE=len_bound, WINDOW=window_size,
+        BN=_BLOCK_N, BS_PAGE=block_size, SPLITS=splits, LSTRIDE=len_bound,
+        WINDOW=window_size,
     )
     return o_part, m_part, l_part
 

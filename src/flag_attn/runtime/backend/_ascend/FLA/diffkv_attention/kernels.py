@@ -80,7 +80,7 @@ def _diffkv_decode_kernel(
                       mask=msk_d[:, None], other=0.0)
         b_s = tl.dot(b_q, b_k)                       # [GROUP, BS]
         pos = i_p * BS + rt
-        valid = (pos >= t_lo) & (pos < t_hi)
+        valid = (pos >= start) & (pos < t_hi)
         b_s = tl.where(valid[None, :], b_s, _NEG)
 
         m_new = tl.maximum(b_m, tl.max(b_s, 1))
@@ -147,13 +147,20 @@ def _diffkv_depage_kernel(
     BT_STRIDE: tl.constexpr,
     LSTRIDE: tl.constexpr,   # elements per token in the dense buffer
     PPG: tl.constexpr,       # pages per program
+    WINDOW: tl.constexpr,
 ):
-    """De-page the cache: one program copies PPG contiguous pages."""
+    """De-page the cache: one program copies PPG contiguous pages.
+
+    Only the pages a sequence can actually read are copied: with a sliding
+    window that is the tail of the sequence, which keeps the extra pass
+    proportional to the work rather than to the cache length.
+    """
     i_pg = tl.program_id(0)
     i_b = tl.program_id(1)
 
     length = tl.load(lens + i_b).to(tl.int32)
     n_pages = (length + BS - 1) // BS
+    p_start = tl.maximum(0, length - WINDOW) // BS if WINDOW > 0 else 0
 
     rt = tl.arange(0, BS)
     rk = tl.arange(0, KFLAT)
@@ -162,7 +169,7 @@ def _diffkv_depage_kernel(
 
     for j in tl.static_range(PPG):
         p = i_pg * PPG + j
-        if p < n_pages:
+        if (p >= p_start) & (p < n_pages):
             pid = tl.load(block_table + i_b * BT_STRIDE + p).to(tl.int64)
             b_k = tl.load(k_cache + pid * (BS * HKV * DQK) + rt[:, None] * (HKV * DQK) + rk[None, :],
                           mask=msk_k[None, :], other=0.0)
@@ -189,6 +196,7 @@ def _diffkv_decode_dense_kernel(
     DPAD: tl.constexpr,
     DV: tl.constexpr,
     BN: tl.constexpr,
+    BS_PAGE: tl.constexpr,
     SPLITS: tl.constexpr,
     LSTRIDE: tl.constexpr,
     WINDOW: tl.constexpr,
@@ -201,8 +209,11 @@ def _diffkv_decode_dense_kernel(
     length = tl.load(lens + i_b).to(tl.int32)
     start = tl.maximum(0, length - WINDOW) if WINDOW > 0 else 0
     total = tl.maximum(length - start, 0)
-    chunk = (total + SPLITS - 1) // SPLITS
-    t_lo = start + i_s * chunk
+    # the de-page pass fills whole pages from the window start, so the token
+    # base is page-aligned to guarantee every address it touches was written
+    t_base = (start // BS_PAGE) * BS_PAGE
+    chunk = (length - t_base + SPLITS - 1) // SPLITS
+    t_lo = t_base + i_s * chunk
     t_hi = tl.minimum(t_lo + chunk, length)
 
     rg = tl.arange(0, GROUP)
@@ -229,7 +240,7 @@ def _diffkv_decode_dense_kernel(
                       mask=msk_d[:, None], other=0.0)          # [DPAD, BN]
         b_s = tl.dot(b_q, b_k)                                 # [GROUP, BN]
         pos = t0 + rt
-        valid = (pos >= t_lo) & (pos < t_hi)
+        valid = (pos >= start) & (pos < t_hi)
         b_s = tl.where(valid[None, :], b_s, _NEG)
 
         m_new = tl.maximum(b_m, tl.max(b_s, 1))
