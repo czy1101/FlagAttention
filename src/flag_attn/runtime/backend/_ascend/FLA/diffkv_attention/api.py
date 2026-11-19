@@ -35,8 +35,12 @@ _MAX_SPLITS = 32
 _PPG = 8
 #: Tokens per loop iteration in the dense path.
 _BLOCK_N = 256
-#: Default decode path: "paged" or "dense".
-_MODE = "dense"
+#: Default decode path: "auto", "paged" or "dense".
+_MODE = "auto"
+#: With at most this many KV tokens to read, reading the paged cache directly
+#: (one launch) beats paying for the de-page pass.  Measured crossover:
+#: b1/l2048 (8k tokens) and b8/l512 (16k) favour paged, b8/l2048 (65k) dense.
+_DENSE_MIN_TOKENS = 32768
 
 
 def _supported(query, key_cache, value_cache, context_lens, block_tables, window_size):
@@ -94,18 +98,22 @@ def _workspace(query, batch, num_q_heads, head_v, splits):
 
 
 def _paged(query, key_cache, value_cache, lengths, tables, attn_scale,
-           window_size, splits):
+           window_size, splits, out):
     batch, num_q_heads, head_qk = query.shape
     num_kv_heads = key_cache.shape[2]
     head_v = value_cache.shape[3]
-    o_part, m_part, l_part = _workspace(query, batch, num_q_heads, head_v, splits)
+    if splits == 1:
+        o_part = out
+        m_part = l_part = out
+    else:
+        o_part, m_part, l_part = _workspace(query, batch, num_q_heads, head_v, splits)
     _diffkv_decode_kernel[(splits, num_kv_heads, batch)](
         query, key_cache, value_cache, tables, lengths,
         o_part, m_part, l_part, attn_scale,
         HQ=num_q_heads, HKV=num_kv_heads, GROUP=num_q_heads // num_kv_heads,
         DQK=head_qk, DPAD=triton.next_power_of_2(head_qk), DV=head_v,
         BS=key_cache.shape[1], SPLITS=splits, BT_STRIDE=tables.stride(0),
-        WINDOW=window_size,
+        WINDOW=window_size, FINAL=splits == 1,
     )
     return o_part, m_part, l_part
 
@@ -184,7 +192,10 @@ def diffkv_attention(
     else:
         splits = _choose_splits(batch, num_kv_heads, tables.shape[1])
 
-    if _MODE == "dense":
+    if _MODE == "dense" or (
+        _MODE == "auto"
+        and batch * num_kv_heads * tables.shape[1] * key_cache.shape[1] > _DENSE_MIN_TOKENS
+    ):
         o_part, m_part, l_part = _dense(query, key_cache, value_cache, lengths,
                                         tables, attn_scale, window_size,
                                         splits, out)
@@ -192,7 +203,9 @@ def diffkv_attention(
             return out
     else:
         o_part, m_part, l_part = _paged(query, key_cache, value_cache, lengths,
-                                        tables, attn_scale, window_size, splits)
+                                        tables, attn_scale, window_size, splits, out)
+        if splits == 1:
+            return out
     _diffkv_reduce_kernel[(batch * num_q_heads,)](
         o_part, m_part, l_part, out,
         DV=head_v, SPLITS=splits, SPAD=triton.next_power_of_2(splits),

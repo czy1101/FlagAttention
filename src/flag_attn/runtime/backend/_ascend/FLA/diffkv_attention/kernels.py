@@ -41,6 +41,7 @@ def _diffkv_decode_kernel(
     SPLITS: tl.constexpr,
     BT_STRIDE: tl.constexpr,
     WINDOW: tl.constexpr,
+    FINAL: tl.constexpr,
 ):
     i_s = tl.program_id(0)
     i_kv = tl.program_id(1)
