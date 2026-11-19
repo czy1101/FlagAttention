@@ -16,9 +16,6 @@
 
 from __future__ import annotations
 
-import os
-from typing import Any
-
 import torch
 import triton
 import triton.language as tl
@@ -114,7 +111,7 @@ def get_auto_num_splits(
 
 
 @torch.no_grad()
-def inkling_fa4_rel_attention_triton(
+def inkling_fa4_rel_attention(
     q: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -130,8 +127,9 @@ def inkling_fa4_rel_attention_triton(
     rel_logits: torch.Tensor,
     num_splits: int = 1,
     out: torch.Tensor | None = None,
+    backend: str = "triton",
 ) -> torch.Tensor:
-    """Apply paged varlen attention with Inkling relative-position logits.
+    """Apply Hygon paged varlen attention with Inkling relative-position logits.
 
     Args mirror vLLM's ``inkling_fa4_rel_attention`` operator. ``q`` and
     ``rel_logits`` are packed by Query sequence, while ``key_cache`` and
@@ -142,7 +140,15 @@ def inkling_fa4_rel_attention_triton(
     This is an inference-only implementation. Explicit split counts are honored;
     a requested count of one may be increased for short-query decode workloads
     with long KV ranges when the query grid would otherwise underfill the device.
+    The Hygon implementation accepts ``backend="triton"`` and runs this path
+    directly.
     """
+    if backend != "triton":
+        raise ValueError(f"Hygon Inkling FA4 only supports backend='triton', got {backend!r}")
+
+    if not current_platform.is_hygon():
+        raise RuntimeError("Hygon Inkling FA4 requires an active Hygon Triton target")
+
     _validate_inputs(
         q=q,
         key_cache=key_cache,
@@ -773,22 +779,3 @@ def _combine_split_kv_kernel(
     out_ptrs = out_ptr + q_global * stride_out_t + q_head * stride_out_h + off_d * stride_out_d
 
     tl.store(out_ptrs, output, mask=d_valid)
-
-
-def inkling_fa4_rel_attention(
-    *args: Any,
-    backend: str | None = None,
-    **kwargs: Any,
-) -> torch.Tensor:
-    """Run the Hygon FA4 Triton path through the public operator signature."""
-    selected = (backend or os.getenv("INKLING_FA4_BACKEND", "auto")).strip().lower()
-    if selected in {"auto", "hygon", "triton", "triton_hygon"}:
-        if not current_platform.is_hygon():
-            raise RuntimeError("Hygon Inkling FA4 requires an active Hygon Triton target")
-        return inkling_fa4_rel_attention_triton(*args, **kwargs)
-    if selected == "tle":
-        raise NotImplementedError("Inkling FA4 TLE is unavailable on the Hygon backend")
-    raise ValueError(
-        f"unknown Hygon Inkling FA4 backend={selected!r}; "
-        "choose from auto, hygon, or triton"
-    )
