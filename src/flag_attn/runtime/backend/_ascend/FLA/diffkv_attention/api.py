@@ -39,8 +39,9 @@ _BLOCK_N = 256
 _MODE = "auto"
 #: With at most this many KV tokens to read, reading the paged cache directly
 #: (one launch) beats paying for the de-page pass.  Measured crossover:
-#: b1/l2048 (8k tokens) and b8/l512 (16k) favour paged, b8/l2048 (65k) dense.
-_DENSE_MIN_TOKENS = 32768
+#: b1/l512 (2k) and b8/l512 (16k) favour paged, swa b1/l2048 (16k, 8 KV
+#: heads) and b8/l2048 (65k) favour dense.
+_DENSE_MIN_TOKENS = 16384
 
 
 def _supported(query, key_cache, value_cache, context_lens, block_tables, window_size):
@@ -194,7 +195,7 @@ def diffkv_attention(
 
     if _MODE == "dense" or (
         _MODE == "auto"
-        and batch * num_kv_heads * tables.shape[1] * key_cache.shape[1] > _DENSE_MIN_TOKENS
+        and batch * num_kv_heads * tables.shape[1] * key_cache.shape[1] >= _DENSE_MIN_TOKENS
     ):
         o_part, m_part, l_part = _dense(query, key_cache, value_cache, lengths,
                                         tables, attn_scale, window_size,
