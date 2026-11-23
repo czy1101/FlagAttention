@@ -21,6 +21,8 @@ import importlib
 _OPERATOR_EXPORTS = {
     "inkling_fa4_rel_attention": (".inkling_fa4.relative_attention", "inkling_fa4_rel_attention"),
     "SPARSE_BLOCK_SIZE": (".minimax_sparse_attention.index_topk", "SPARSE_BLOCK_SIZE"),
+    "infllmv2_attention": (".infllmv2", "infllmv2_attention"),
+    "infllmv2_decode": (".infllmv2", "infllmv2_decode"),
     "minimax_m3_index_decode": (".minimax_sparse_attention.index_topk", "minimax_m3_index_decode"),
     "minimax_m3_index_decode_score": (
         ".minimax_sparse_attention.index_topk",
