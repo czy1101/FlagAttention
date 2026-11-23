@@ -1,23 +1,70 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Ascend Triton kernels for paged DiffKV decode attention.
-
-Design notes (backend lessons):
-
-* one physical page per loop iteration, so both loads stay affine (the page
-  base is a scalar from ``block_table``); a multi-page tile would need a
-  gather, and gathers serialise on this backend;
-* the inner tile is exactly one page, so the page-table lookup stays scalar;
-* boundaries are an ``-inf`` score mask, never a masked load;
-* fp32 accumulation, dot in the input dtype;
-* KV split across programs, partials combined by a separate reduce kernel.
-"""
+"""Triton kernels for paged DiffKV decode attention."""
 
 import triton
 import triton.language as tl
 
 _LOG2E = tl.constexpr(1.4426950216)
 _NEG = tl.constexpr(-1.0e30)
+
+
+@triton.jit
+def _diffkv_decode_window_kernel(
+    q,
+    k_cache,
+    v_cache,
+    lens,
+    block_table,
+    out,
+    scale,
+    HQ: tl.constexpr,
+    GROUP: tl.constexpr,
+    BS: tl.constexpr,
+    BT_STRIDE: tl.constexpr,
+    K_STRIDES: tl.constexpr,
+    V_STRIDES: tl.constexpr,
+    WINDOW: tl.constexpr,
+    DQK: tl.constexpr,
+    DPAD: tl.constexpr,
+    DV: tl.constexpr,
+    BN: tl.constexpr,
+):
+    """Gather the active window into one tile and normalize it in place."""
+    i_b = tl.program_id(0)
+    i_kv = tl.program_id(1)
+    length = tl.load(lens + i_b)
+    start = tl.maximum(0, length - WINDOW)
+    pos = start + tl.arange(0, BN)
+    valid = pos < length
+    page = tl.load(
+        block_table + i_b.to(tl.int64) * BT_STRIDE + pos // BS,
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    token = pos % BS
+    h = i_kv * GROUP + tl.arange(0, GROUP)
+    rd = tl.arange(0, DPAD)
+    rv = tl.arange(0, DV)
+    b_q = tl.load(
+        q + (i_b * HQ + h[:, None]) * DQK + rd[None, :],
+        mask=rd[None, :] < DQK,
+        other=0.0,
+    )
+    k_base = page * K_STRIDES[0] + token * K_STRIDES[1] + i_kv * K_STRIDES[2]
+    b_k = tl.load(
+        k_cache + k_base[:, None] + rd[None, :],
+        mask=valid[:, None] & (rd[None, :] < DQK),
+        other=0.0,
+    )
+    b_s = tl.where(valid[None, :], tl.dot(b_q, tl.trans(b_k)) * scale, _NEG)
+    b_m = tl.max(b_s, 1)
+    b_p = tl.where(valid[None, :], tl.exp(b_s - b_m[:, None]), 0.0)
+    b_l = tl.sum(b_p, 1)
+    v_base = page * V_STRIDES[0] + token * V_STRIDES[1] + i_kv * V_STRIDES[2]
+    b_v = tl.load(v_cache + v_base[:, None] + rv[None, :], mask=valid[:, None], other=0.0)
+    b_o = tl.dot(b_p.to(b_v.dtype), b_v) / tl.where(b_l > 0.0, b_l, 1.0)[:, None]
+    tl.store(out + (i_b * HQ + h[:, None]) * DV + rv[None, :], b_o)
 
 
 @triton.jit
@@ -38,6 +85,8 @@ def _diffkv_decode_kernel(
     DPAD: tl.constexpr,
     DV: tl.constexpr,
     BS: tl.constexpr,
+    K_STRIDES: tl.constexpr,
+    V_STRIDES: tl.constexpr,
     SPLITS: tl.constexpr,
     BT_STRIDE: tl.constexpr,
     WINDOW: tl.constexpr,
@@ -65,23 +114,22 @@ def _diffkv_decode_kernel(
     msk_d = rd < DQK
     b_q = tl.load(q + (i_b * HQ + h)[:, None] * DQK + rd[None, :],
                   mask=msk_d[None, :], other=0.0)
-    b_q = (b_q.to(tl.float32) * scale).to(b_q.dtype)
 
     b_m = tl.full([GROUP], _NEG, tl.float32)
     b_l = tl.zeros([GROUP], tl.float32)
     b_o = tl.zeros([GROUP, DV], tl.float32)
 
-    n_pages = (t_hi + BS - 1) // BS
+    n_pages = tl.where(t_hi > t_lo, tl.cdiv(t_hi, BS), 0)
     p0 = t_lo // BS
     for i_p in tl.range(p0, n_pages):
-        pid = tl.load(block_table + i_b * BT_STRIDE + i_p).to(tl.int64)
+        pid = tl.load(block_table + i_b.to(tl.int64) * BT_STRIDE + i_p).to(tl.int64)
         # key page loaded transposed: [DPAD, BS]
-        b_k = tl.load(k_cache + pid * (BS * HKV * DQK) + i_kv * DQK
-                      + rt[None, :] * (HKV * DQK) + rd[:, None],
+        b_k = tl.load(k_cache + pid * K_STRIDES[0] + i_kv * K_STRIDES[2]
+                      + rt[None, :] * K_STRIDES[1] + rd[:, None],
                       mask=msk_d[:, None], other=0.0)
-        b_s = tl.dot(b_q, b_k)                       # [GROUP, BS]
+        b_s = tl.dot(b_q, b_k) * scale                       # [GROUP, BS]
         pos = i_p * BS + rt
-        valid = (pos >= start) & (pos < t_hi)
+        valid = (pos >= t_lo) & (pos < t_hi)
         b_s = tl.where(valid[None, :], b_s, _NEG)
 
         m_new = tl.maximum(b_m, tl.max(b_s, 1))
@@ -90,8 +138,9 @@ def _diffkv_decode_kernel(
         b_p = tl.where(valid[None, :], b_p, 0.0)
         b_l = b_l * alpha + tl.sum(b_p, 1)
 
-        b_v = tl.load(v_cache + pid * (BS * HKV * DV) + i_kv * DV
-                      + rt[:, None] * (HKV * DV) + rv[None, :])
+        b_v = tl.load(v_cache + pid * V_STRIDES[0] + i_kv * V_STRIDES[2]
+                      + rt[:, None] * V_STRIDES[1] + rv[None, :],
+                      mask=valid[:, None], other=0.0)
         b_o = b_o * alpha[:, None] + tl.dot(b_p.to(b_v.dtype), b_v)
         b_m = m_new
 
@@ -146,56 +195,60 @@ def _diffkv_depage_kernel(
     v_dense,
     HKV: tl.constexpr,
     DQK: tl.constexpr,
-    KFLAT: tl.constexpr,     # next_pow2(HKV * DQK)
     DV: tl.constexpr,
-    VFLAT: tl.constexpr,     # next_pow2(HKV * DV)
+    K_STRIDES: tl.constexpr,
+    V_STRIDES: tl.constexpr,
+    HEAD_MAJOR: tl.constexpr,
     BS: tl.constexpr,
     BT_STRIDE: tl.constexpr,
-    LSTRIDE: tl.constexpr,   # elements per token in the dense buffer
-    PPG: tl.constexpr,       # pages per program
+    LSTRIDE: tl.constexpr,
+    PPG: tl.constexpr,
     WINDOW: tl.constexpr,
-    BN: tl.constexpr,        # decode tile: the tail it may address is zeroed
-    NPAGES_MAX: tl.constexpr,  # capacity of the dense buffer, in pages
+    BN: tl.constexpr,
+    NPAGES_MAX: tl.constexpr,
 ):
-    """De-page the cache: one program copies PPG contiguous pages.
-
-    Only the pages a sequence can actually read are copied: with a sliding
-    window that is the tail of the sequence, which keeps the extra pass
-    proportional to the work rather than to the cache length.
-    """
     i_pg = tl.program_id(0)
     i_b = tl.program_id(1)
+    if HEAD_MAJOR:
+        i_kv = tl.program_id(2)
+        K_WIDTH: tl.constexpr = DQK
+        V_WIDTH: tl.constexpr = DV
+        dense_base = (i_b * HKV + i_kv).to(tl.int64) * LSTRIDE
+    else:
+        i_kv = 0
+        K_WIDTH: tl.constexpr = HKV * DQK
+        V_WIDTH: tl.constexpr = HKV * DV
+        dense_base = i_b.to(tl.int64) * LSTRIDE
 
-    length = tl.load(lens + i_b).to(tl.int32)
-    n_pages = (length + BS - 1) // BS
-    p_start = tl.maximum(0, length - WINDOW) // BS if WINDOW > 0 else 0
-    # the decode loop reads whole BN-token blocks, so everything from `length`
-    # up to the end of the last block must be defined memory (zeros keep the
-    # masked-out lanes from dragging NaN through 0 * x)
-    n_zero = tl.minimum(tl.cdiv(length + BN + BS, BS), NPAGES_MAX)
-
+    length = tl.load(lens + i_b)
+    start = tl.maximum(0, length - WINDOW) if WINDOW > 0 else 0
+    p_start = start // BS
+    n_pages = tl.cdiv(length, BS) - p_start
+    # Dense decode reads a whole tile at the tail, before masking its scores.
+    n_zero = tl.minimum(n_pages + tl.cdiv(BN, BS), NPAGES_MAX)
     rt = tl.arange(0, BS)
-    rk = tl.arange(0, KFLAT)
-    rv = tl.arange(0, VFLAT)
-    msk_k = rk < HKV * DQK
+    rk = tl.arange(0, triton.next_power_of_2(K_WIDTH))
+    rv = tl.arange(0, triton.next_power_of_2(V_WIDTH))
 
     for j in tl.static_range(PPG):
         p = i_pg * PPG + j
-        if (p >= n_pages) & (p < n_zero):
-            zk = tl.zeros([BS, KFLAT], dtype=k_dense.dtype.element_ty)
-            zr = tl.arange(0, BS)
-            tl.store(k_dense + ((i_b * LSTRIDE + p * BS) + zr)[:, None] * (HKV * DQK) + rk[None, :],
-                     zk, mask=msk_k[None, :])
-            zv = tl.zeros([BS, VFLAT], dtype=v_dense.dtype.element_ty)
-            tl.store(v_dense + ((i_b * LSTRIDE + p * BS) + zr)[:, None] * (HKV * DV) + rv[None, :], zv)
-        elif (p >= p_start) & (p < n_pages):
-            pid = tl.load(block_table + i_b * BT_STRIDE + p).to(tl.int64)
-            b_k = tl.load(k_cache + pid * (BS * HKV * DQK) + rt[:, None] * (HKV * DQK) + rk[None, :],
-                          mask=msk_k[None, :], other=0.0)
-            tl.store(k_dense + ((i_b * LSTRIDE + p * BS) + rt)[:, None] * (HKV * DQK) + rk[None, :],
-                     b_k, mask=msk_k[None, :])
-            b_v = tl.load(v_cache + pid * (BS * HKV * DV) + rt[:, None] * (HKV * DV) + rv[None, :])
-            tl.store(v_dense + ((i_b * LSTRIDE + p * BS) + rt)[:, None] * (HKV * DV) + rv[None, :], b_v)
+        tokens = dense_base + p * BS + rt
+        dst_k = k_dense + tokens[:, None] * K_WIDTH + rk[None, :]
+        dst_v = v_dense + tokens[:, None] * V_WIDTH + rv[None, :]
+        if p < n_pages:
+            logical_page = p_start + p
+            pid = tl.load(block_table + i_b.to(tl.int64) * BT_STRIDE + logical_page).to(tl.int64)
+            src_k = k_cache + pid * K_STRIDES[0] + i_kv * K_STRIDES[2]
+            src_v = v_cache + pid * V_STRIDES[0] + i_kv * V_STRIDES[2]
+            b_k = tl.load(src_k + rt[:, None] * K_STRIDES[1] + rk[None, :],
+                          mask=rk[None, :] < K_WIDTH, other=0.0)
+            b_v = tl.load(src_v + rt[:, None] * V_STRIDES[1] + rv[None, :],
+                          mask=rv[None, :] < V_WIDTH, other=0.0)
+            tl.store(dst_k, b_k, mask=rk[None, :] < K_WIDTH)
+            tl.store(dst_v, b_v, mask=rv[None, :] < V_WIDTH)
+        elif p < n_zero:
+            tl.store(dst_k, 0.0, mask=rk[None, :] < K_WIDTH)
+            tl.store(dst_v, 0.0, mask=rv[None, :] < V_WIDTH)
 
 
 @triton.jit
@@ -216,6 +269,7 @@ def _diffkv_decode_dense_kernel(
     DV: tl.constexpr,
     BN: tl.constexpr,
     BS_PAGE: tl.constexpr,
+    HEAD_MAJOR: tl.constexpr,
     SPLITS: tl.constexpr,
     LSTRIDE: tl.constexpr,
     WINDOW: tl.constexpr,
@@ -233,12 +287,13 @@ def _diffkv_decode_dense_kernel(
 
     length = tl.load(lens + i_b).to(tl.int32)
     start = tl.maximum(0, length - WINDOW) if WINDOW > 0 else 0
-    total = tl.maximum(length - start, 0)
-    # the de-page pass fills whole pages from the window start, so the token
+    # The de-page pass fills whole pages from the window start, so the token
     # base is page-aligned to guarantee every address it touches was written
     t_base = (start // BS_PAGE) * BS_PAGE
-    chunk = (length - t_base + SPLITS - 1) // SPLITS
-    t_lo = t_base + i_s * chunk
+    start -= t_base
+    length -= t_base
+    chunk = tl.cdiv(length, SPLITS)
+    t_lo = i_s * chunk
     t_hi = tl.minimum(t_lo + chunk, length)
 
     rg = tl.arange(0, GROUP)
@@ -250,21 +305,30 @@ def _diffkv_decode_dense_kernel(
     msk_d = rd < DQK
     b_q = tl.load(q + (i_b * HQ + h)[:, None] * DQK + rd[None, :],
                   mask=msk_d[None, :], other=0.0)
-    b_q = (b_q.to(tl.float32) * scale).to(b_q.dtype)
 
     b_m = tl.full([GROUP], _NEG, tl.float32)
     b_l = tl.zeros([GROUP], tl.float32)
     b_o = tl.zeros([GROUP, DV], tl.float32)
 
-    k_base = k_dense + i_b * LSTRIDE * HKV * DQK + i_kv * DQK
-    v_base = v_dense + i_b * LSTRIDE * HKV * DV + i_kv * DV
+    if HEAD_MAJOR:
+        dense_base = (i_b * HKV + i_kv).to(tl.int64) * LSTRIDE
+        K_TOKEN: tl.constexpr = DQK
+        V_TOKEN: tl.constexpr = DV
+        k_base = k_dense + dense_base * DQK
+        v_base = v_dense + dense_base * DV
+    else:
+        dense_base = i_b.to(tl.int64) * LSTRIDE
+        K_TOKEN: tl.constexpr = HKV * DQK
+        V_TOKEN: tl.constexpr = HKV * DV
+        k_base = k_dense + dense_base * K_TOKEN + i_kv * DQK
+        v_base = v_dense + dense_base * V_TOKEN + i_kv * DV
     n_blocks = tl.cdiv(t_hi - t_lo, BN)
     for i_t in tl.range(0, n_blocks):
         t0 = t_lo + i_t * BN
         pos = t0 + rt
-        b_k = tl.load(k_base + pos[None, :] * (HKV * DQK) + rd[:, None],
+        b_k = tl.load(k_base + pos[None, :] * K_TOKEN + rd[:, None],
                       mask=msk_d[:, None], other=0.0)          # [DPAD, BN]
-        b_s = tl.dot(b_q, b_k)                                 # [GROUP, BN]
+        b_s = tl.dot(b_q, b_k) * scale
         valid = (pos >= start) & (pos < t_hi)
         b_s = tl.where(valid[None, :], b_s, _NEG)
 
@@ -274,7 +338,8 @@ def _diffkv_decode_dense_kernel(
         b_p = tl.where(valid[None, :], b_p, 0.0)
         b_l = b_l * alpha + tl.sum(b_p, 1)
 
-        b_v = tl.load(v_base + pos[:, None] * (HKV * DV) + rv[None, :])
+        b_v = tl.load(v_base + pos[:, None] * V_TOKEN + rv[None, :])
+        b_v = tl.where(valid[:, None], b_v, 0.0)
         b_o = b_o * alpha[:, None] + tl.dot(b_p.to(b_v.dtype), b_v)
         b_m = m_new
 
