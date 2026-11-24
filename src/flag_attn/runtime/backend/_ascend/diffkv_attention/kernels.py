@@ -30,7 +30,7 @@ def _diffkv_decode_window_kernel(
     DV: tl.constexpr,
     BN: tl.constexpr,
 ):
-    """Gather the active window into one tile and normalize it in place."""
+    """Compute attention over the active window in a single tile."""
     i_b = tl.program_id(0)
     i_kv = tl.program_id(1)
     length = tl.load(lens + i_b)
@@ -100,7 +100,7 @@ def _diffkv_decode_kernel(
     start = tl.maximum(0, length - WINDOW) if WINDOW > 0 else 0
     total = tl.maximum(length - start, 0)
 
-    # tokens per split, rounded up to whole pages
+    # Round each split's token count up to a page multiple.
     chunk = ((total + SPLITS - 1) // SPLITS + BS - 1) // BS * BS
     t_lo = start + i_s * chunk
     t_hi = tl.minimum(t_lo + chunk, length)
@@ -123,7 +123,7 @@ def _diffkv_decode_kernel(
     p0 = t_lo // BS
     for i_p in tl.range(p0, n_pages):
         pid = tl.load(block_table + i_b.to(tl.int64) * BT_STRIDE + i_p).to(tl.int64)
-        # key page loaded transposed: [DPAD, BS]
+        # Load the key page as [DPAD, BS].
         b_k = tl.load(k_cache + pid * K_STRIDES[0] + i_kv * K_STRIDES[2]
                       + rt[None, :] * K_STRIDES[1] + rd[:, None],
                       mask=msk_d[:, None], other=0.0)
@@ -277,9 +277,8 @@ def _diffkv_decode_dense_kernel(
 ):
     """Split-KV decode over a de-paged, contiguous KV buffer.
 
-    ``FINAL`` means the program owns the whole KV range, so it normalises and
-    writes the output itself instead of leaving partials for a reduce kernel
-    (saves one launch, which on this backend costs more than the work).
+    With ``FINAL``, a single split writes the normalized output. Otherwise
+    each split writes its accumulator, row maximum, and denominator for reduction.
     """
     i_s = tl.program_id(0)
     i_kv = tl.program_id(1)
@@ -287,8 +286,7 @@ def _diffkv_decode_dense_kernel(
 
     length = tl.load(lens + i_b).to(tl.int32)
     start = tl.maximum(0, length - WINDOW) if WINDOW > 0 else 0
-    # The de-page pass fills whole pages from the window start, so the token
-    # base is page-aligned to guarantee every address it touches was written
+    # Dense storage starts at the first page that intersects the window.
     t_base = (start // BS_PAGE) * BS_PAGE
     start -= t_base
     length -= t_base
