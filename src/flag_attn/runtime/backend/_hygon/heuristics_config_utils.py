@@ -19,4 +19,29 @@ HEURISTICS_CONFIGS = {
         "default": {"join_reductions_max_rows": 1024},
         "by_sm_count": {},
     },
+    "forgetting_attention": {
+        "default": {
+            "fused_start_max_m": 128,
+            "fused_binary_start_min_m": 129,
+            "fused_binary_start_max_query_tiles": 16,
+        },
+        # Add CU-count overrides here after measuring on the target SKU.
+        "by_sm_count": {},
+    },
 }
+
+
+def get_heuristics_config(op_name: str) -> dict:
+    """Return defaults merged with overrides for the active Hygon device."""
+    op_config = HEURISTICS_CONFIGS.get(op_name, {})
+    config = dict(op_config.get("default", {}))
+    if not op_config:
+        return config
+
+    from flag_attn.runtime.backend._hygon.device_info import get_device_info
+
+    sm_count = get_device_info().sm_count
+    overrides = op_config.get("by_sm_count", {}).get(
+        sm_count, op_config.get("by_sm_count", {}).get(str(sm_count), {})
+    )
+    return config | overrides
