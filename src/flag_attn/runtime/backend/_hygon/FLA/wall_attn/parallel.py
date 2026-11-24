@@ -38,7 +38,9 @@ import triton
 import triton.language as tl
 
 from flag_attn import runtime
-from flag_attn.FLA.wall_attn.parallel import _LAST_ROUTE, get_last_route, select_route
+from flag_attn.FLA.wall_attn.parallel import _LAST_ROUTE
+from flag_attn.FLA.wall_attn.parallel import get_last_route as get_last_route
+from flag_attn.FLA.wall_attn.parallel import select_route as select_route
 from flag_attn.FLA.cumsum import chunk_global_cumsum
 from flag_attn.FLA.index import prepare_chunk_indices
 from flag_attn.parallel_nsa.bwd_preprocess import parallel_attn_bwd_preprocess
@@ -1103,6 +1105,3 @@ def parallel_wall_attn(
     )
     _LAST_ROUTE.set("official_fallback")
     return output
-
-
-__all__ = ["parallel_wall_attn", "select_route", "get_last_route"]
