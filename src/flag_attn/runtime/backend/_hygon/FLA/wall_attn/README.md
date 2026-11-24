@@ -97,7 +97,7 @@ The official tests retain their original assertions and tolerances. External bin
 - Launcher reuse for short, medium, and long sequences depends on the validated HCU FlagTree / Triton runtime. Changes to the distribution or ABI require revalidation.
 - Calls enter compatibility paths when Graph capture or runtime checks do not satisfy the specialized dispatch conditions. Existing guards for Graph capture, hooks, and special execution contexts remain active.
 - GQA gate prefixes depend on the query head, so pre-rescaled keys are stored per query head. Workspace requirements grow with T, HQ, and head dimension.
-- As agreed for this task, the Triton `FLA_baseline` was established and frozen. Performance comparisons use this baseline, the official H100 TLE results, and the final BW1000 implementation.
+- `Triton_v0` is the minimally adapted Triton version on BW1000. Performance comparisons use this baseline, the official H100 TLE results, and the final BW1000 implementation.
 
 ## Performance
 
@@ -115,16 +115,16 @@ The H100 comparison uses the final A42 BF16 / A43 FP16 TLE versions from PR #88 
 
 | Implementation | Data source |
 | --- | --- |
-| `FLA_baseline` | The minimally adapted and frozen official Triton implementation on BW1000, using its latest official benchmark rerun from 2026-11-18 |
+| `Triton_v0` | The minimally adapted Triton version on BW1000, measured on 2026-11-18 |
 | H100 TLE | The Final Optimized Version in FlagAttention PR #88, matched by dtype, MHA/GQA, and T |
 | Final BW1000 | Official benchmark results from the organized release commit `b0f84400ac5add60a5cdf2217fd5c073149be6c0`, measured on 2026-11-19 |
 
 The three columns use the recorded runs described above. The BW1000 baseline and final implementation use the same official benchmark. The H100 comparison also involves differences in hardware and software environments. Latencies are in ms, with lower values indicating faster execution. All ratios are calculated per shape from unrounded latencies and displayed to three decimal places.
 
-- **Speedup versus FLA_baseline = FLA_baseline latency / final BW1000 latency.**
+- **Speedup versus Triton_v0 = Triton_v0 latency / final BW1000 latency.**
 - **Speedup versus H100 TLE = H100 TLE latency / final BW1000 latency.**
 
-| Precision | Family | T | FLA_baseline ms | H100 TLE ms | Final BW1000 ms | FLA_baseline / Final BW1000 | H100 TLE / Final BW1000 |
+| Precision | Family | T | Triton_v0 ms | H100 TLE ms | Final BW1000 ms | Triton_v0 / Final BW1000 | H100 TLE / Final BW1000 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | BF16 | MHA | 512 | 0.461919 | 0.032160 | 0.168320 | 2.744× | 0.191× |
 | BF16 | MHA | 1024 | 0.585440 | 0.051232 | 0.218080 | 2.685× | 0.235× |
@@ -143,4 +143,4 @@ The three columns use the recorded runs described above. The BW1000 baseline and
 | FP16 | GQA | 2048 | 0.810079 | 0.093712 | 0.329120 | 2.461× | 0.285× |
 | FP16 | GQA | 4096 | 1.578879 | 0.209376 | 0.639520 | 2.469× | 0.327× |
 
-The final BW1000 implementation achieves **2.461–2.868×** speedup over `FLA_baseline` across all 16 shapes. H100 TLE latency divided by final BW1000 latency is **0.184–0.327×**. H100 TLE has lower latency than the final BW1000 implementation for all 16 shapes.
+The final BW1000 implementation achieves **2.461–2.868×** speedup over `Triton_v0` across all 16 shapes. H100 TLE latency divided by final BW1000 latency is **0.184–0.327×**. H100 TLE has lower latency than the final BW1000 implementation for all 16 shapes.
