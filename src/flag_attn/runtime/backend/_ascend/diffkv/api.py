@@ -5,7 +5,7 @@
 import torch
 import triton
 
-from .kernels import (
+from .decode import (
     _diffkv_decode_dense_kernel,
     _diffkv_decode_kernel,
     _diffkv_decode_window_kernel,

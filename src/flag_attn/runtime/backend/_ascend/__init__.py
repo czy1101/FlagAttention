@@ -15,7 +15,7 @@ _OPERATOR_EXPORTS = {
         "fused_recurrent_gated_delta_rule_packed_decode",
     ),
     "chunk_gdn2": (".gdn2", "chunk_gdn2"),
-    "diffkv_attention": (".diffkv_attention", "diffkv_attention"),
+    "diffkv_attention": (".diffkv.api", "diffkv_attention"),
     "parallel_parallax": (".parallax", "parallel_parallax"),
     "parallax_decode": (".parallax", "parallax_decode"),
     "parallax_attn_with_kvcache": (".parallax", "parallax_attn_with_kvcache"),
@@ -28,10 +28,6 @@ _OPERATOR_EXPORTS = {
 }
 
 __all__ = sorted(_OPERATOR_EXPORTS)
-
-# Load the namespace before exposing the same-named callable.
-importlib.import_module(".diffkv_attention", __name__)
-globals().pop("diffkv_attention", None)
 
 
 def __getattr__(name):
