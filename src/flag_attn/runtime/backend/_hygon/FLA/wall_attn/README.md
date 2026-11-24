@@ -14,8 +14,6 @@ This change adds a Hygon BW1000 backend for the Wall Attention operator in FlagA
 
 The core computation uses Triton. Sampled BW1000 compilation artifacts contain precision-specific `v_mmac_*` matrix instructions. Softmax states and output accumulation use FP32. Pre-rescaled historical keys have numerical validity flags, and the main kernel selects the computation path using safety conditions for the current queries and cached blocks.
 
-The release follows the five-file structure of the project's official `FLA/wall_attn` package. Relative to the official snapshot used for this adaptation, `866c86a40b79c7f616cac8e4921d08385a58fe52`, the source diff consists of five Hygon implementation files and one backend registration entry. Integrity checks confirm matching hashes for the official tests, benchmark, and common Wall Attention files.
-
 ### Scope and Interfaces
 
 | Item | Description |
