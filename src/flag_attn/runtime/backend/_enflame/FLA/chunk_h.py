@@ -36,8 +36,6 @@ PARALLEL_STATE_ENABLED = (
 PARALLEL_BWD_STATE_ENABLED = (
     os.environ.get("FLAGGEMS_ENFLAME_GLA_PARALLEL_BWD_STATE", "1") != "0"
 )
-
-
 @triton.jit(do_not_specialize=["N"])
 def _prepare_chunk_offsets_kernel(
     cu_seqlens,
@@ -1156,8 +1154,9 @@ def chunk_fwd_h(
         # with the independently controlled parallel backward-state path.
         and (not states_in_fp32 or PARALLEL_BWD_STATE_ENABLED)
         and not state_v_first
-        and k.dtype == torch.bfloat16
-        and v.dtype == torch.bfloat16
+        # FP16 and BF16 use the same local-state kernels when semantic guards hold.
+        and k.dtype in (torch.bfloat16, torch.float16)
+        and v.dtype == k.dtype
         and g is None
         and g_gamma is None
         and gk is not None
@@ -1386,9 +1385,10 @@ def chunk_bwd_dh(
         and BT == 64
         and HQ == H
         and not state_v_first
-        and q.dtype == torch.bfloat16
-        and k.dtype == torch.bfloat16
-        and do.dtype == torch.bfloat16
+        # Match the forward dtype admission for the backward state pass.
+        and k.dtype in (torch.bfloat16, torch.float16)
+        and q.dtype == k.dtype
+        and do.dtype == k.dtype
         and g is None
         and g_gamma is None
         and gk is not None
