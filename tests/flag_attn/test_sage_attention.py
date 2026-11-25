@@ -20,7 +20,7 @@ import torch
 
 from flag_attn.testing import backend as test_backend
 from flag_attn import sage_attention
-from flag_attn.sage_attention import per_block_int8
+from flag_attn.sageattention import per_block_int8
 
 
 pytestmark = pytest.mark.skipif(not test_backend.supports_operator("sage_attention"), reason=test_backend.skip_reason("sage_attention"))
@@ -142,7 +142,6 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len):
         k_scale,
         attn_mask=attn_mask,
         return_lse=True,
-        maxnreg=168,
     )
     expected, expected_lse = _reference(
         q_int8,
