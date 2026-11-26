@@ -33,6 +33,8 @@ error = _Error()
 
 
 _OPERATOR_EXPORTS = {
+    "log_linear_attn": (".log_linear_attn", "log_linear_attn"),
+    "chunk_log_linear_attn": (".log_linear_attn", "chunk_log_linear_attn"),
     "sage_attention": (".sageattention.attn_qk_int8_per_block", "forward"),
     "sage_attention_forward": (".sageattention.attn_qk_int8_per_block", "forward"),
     "SPARSE_BLOCK_SIZE": (".msa.index_topk", "SPARSE_BLOCK_SIZE"),
