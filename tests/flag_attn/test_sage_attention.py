@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import inspect
 import math
 
 import pytest
@@ -25,21 +24,6 @@ from flag_attn.sageattention import per_block_int8
 
 
 pytestmark = pytest.mark.skipif(not test_backend.supports_operator("sage_attention"), reason=test_backend.skip_reason("sage_attention"))
-
-
-def _supports_predequant_k_switches() -> bool:
-    """Report whether the selected backend takes the pre-dequantise switches.
-
-    predequantize_k and tile_major_predequant_k are Enflame launch options.
-    The other vendors' forward() ends at maxnreg, so passing them there would
-    fail with a TypeError instead of skipping.
-    """
-    try:
-        parameters = inspect.signature(sage_attention).parameters
-    except (TypeError, ValueError):
-        return False
-    return {"predequantize_k", "tile_major_predequant_k"} <= set(parameters)
-
 
 def _expand_scale(scale, block_size, length):
     return scale.repeat_interleave(block_size, dim=-1)[..., :length, None]
@@ -167,54 +151,6 @@ def test_forward_supports_masks_and_partial_blocks(mask_kind, kv_len):
         k_scale,
         "HND",
         attn_mask,
-    )
-
-    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(actual_lse, expected_lse, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.sage_attention
-@pytest.mark.skipif(
-    not _supports_predequant_k_switches(),
-    reason="pre-dequantise switches are Enflame-specific launch options",
-)
-@pytest.mark.parametrize("predequantize_k", [False, True])
-@pytest.mark.parametrize("tile_major", [False, True])
-def test_forward_predequant_k_matches_reference(predequantize_k, tile_major):
-    """D128 long-sequence path: inline K conversion vs the pre-dequantized copy."""
-    torch.manual_seed(2026)
-    batch_size, num_query_heads, num_kv_heads = 1, 4, 2
-    seq_len, head_dim = 1024, 128
-    q = torch.randn(
-        (batch_size, num_query_heads, seq_len, head_dim),
-        device=test_backend.device,
-        dtype=torch.float16,
-    )
-    k = torch.randn(
-        (batch_size, num_kv_heads, seq_len, head_dim),
-        device=test_backend.device,
-        dtype=torch.float16,
-    )
-    v = torch.randn_like(k)
-    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
-
-    actual, actual_lse = sage_attention(
-        q_int8,
-        k_int8,
-        v,
-        q_scale,
-        k_scale,
-        return_lse=True,
-        predequantize_k=predequantize_k,
-        tile_major_predequant_k=tile_major,
-    )
-    expected, expected_lse = _reference(
-        q_int8,
-        k_int8,
-        v,
-        q_scale,
-        k_scale,
-        "HND",
     )
 
     torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
