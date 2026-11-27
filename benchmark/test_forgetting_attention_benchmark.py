@@ -60,7 +60,7 @@ def benchmark_case(case, warmup=40, rep=400, rounds=3, seed=0):
         raise ValueError("rounds must be positive")
     inputs = make_inputs(case, seed)
     providers = {"flag_attn": lambda: call_optimized(inputs, case)}
-    compare_official = test_backend.device == "cuda"
+    compare_official = test_backend.is_nvidia()
     if compare_official:
         expected = call_official(inputs, case)
         assert_bitwise(call_optimized(inputs, case), expected)
