@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib
 
 _OPERATOR_EXPORTS = {
+    "parallel_moba": (".FLA.moba.parallel", "parallel_moba"),
     "SPARSE_BLOCK_SIZE": (".msa.index_topk", "SPARSE_BLOCK_SIZE"),
     "chunk_gdn2": (".FLA.gdn2", "chunk_gdn2"),
     "chunk_gla": (".FLA.gla", "chunk_gla"),
