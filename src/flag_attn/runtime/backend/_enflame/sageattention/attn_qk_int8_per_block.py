@@ -724,10 +724,7 @@ def forward(
     # one linear preprocessing kernel and an FP16 temporary for a simpler QK
     # matrix path in every attention program.
     k_reuse_blocks = triton.cdiv(qo_len, BLOCK_M) * num_kv_groups
-    # D64 amortizes preprocessing from 32 reuse blocks onward.  An earlier
-    # D128 note required 64 reuse blocks because the 32-reuse/T4096 shape
-    # was slower with the then-current temporary path; re-measured on the
-    # current S60 toolchain that shape gains from preprocessing (see below).
+    # D64 amortizes preprocessing from 32 reuse blocks onward; D128 from 8.
     # Measured on S60 (B4 H32 D128, HND, no mask): pre-dequantising K once
     # beats the inline per-Q-block conversion already at 8 reuse blocks
     # (T1024/2048/4096 attention -11%/-19%/-22%).  D64 keeps its old
