@@ -1661,9 +1661,6 @@ def chunk_gla_fwd_intra_gk(
         )
 
     use_grid_remap = requires_grid_remap(NT, NC, B * H)
-    # Batch consecutive chunks per program on the dense path.  A per-program
-    # prologue and schedule is a measurable share of this kernel, and the
-    # grid-remapped path needs the unbatched chunk index for its linear decode.
     chunks_per_program = (
         2 if cu_seqlens is None and not use_grid_remap and NT >= 2 else 1
     )
@@ -1766,9 +1763,6 @@ def chunk_gla_fwd_o_gk(
     o = torch.empty_like(v) if cu_seqlens is None else torch.zeros_like(v)
 
     use_grid_remap = requires_grid_remap(triton.cdiv(V, 64), NT, B * HV)
-    # Batch consecutive chunks per program on the dense path so the per-program
-    # prologue/schedule is amortized and the next chunk's transfers can overlap
-    # the current one.  The remapped path keeps the unbatched chunk index.
     chunks_per_program = (
         2 if cu_seqlens is None and not use_grid_remap and NT >= 2 else 1
     )
