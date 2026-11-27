@@ -23,6 +23,7 @@ from ..accelerator import _is_available, _load_backend
 
 _VENDOR_DEVICES = {
     "nvidia": "cuda",
+    "kunlunxin": "cuda",
     "amd": "cuda",
     "hygon": "cuda",
     "iluvatar": "cuda",
@@ -82,7 +83,12 @@ def _cuda_vendor() -> str:
     try:
         import triton
 
-        target = triton.runtime.driver.active.get_current_target()
+        driver = triton.runtime.driver.active
+        target = driver.get_current_target()
+        # FlagTree exposes Kunlunxin through CUDA but selects its XPU launcher.
+        launcher = getattr(driver, "launcher_cls", None)
+        if getattr(launcher, "__module__", None) == "triton.backends.xpu.driver":
+            return "kunlunxin"
         backend = str(target.backend).lower()
         vendor = _TRITON_VENDORS.get(backend)
         if vendor:
