@@ -957,12 +957,9 @@ def minimax_m3_index_topk(
         )
         return topk_idx
 
-    # Small TopK selections stay on the reduction path, where every query row
-    # used to take one program.  The rows kernel above runs the same bounded
-    # scan for BLOCK_SIZE_Q rows per program, so grouping rows cuts the launch
-    # by that factor and amortizes per-program overhead without changing the
-    # selection, tie-break or -1 padding semantics.  Wide block counts keep the
-    # original per-row path to bound the live FP32 tile.
+    # Same bounded scan as the rows kernel above, BLOCK_SIZE_Q rows per program:
+    # grouping rows cuts the launch without changing selection, tie-break or -1
+    # padding. Wide block counts keep the per-row path to bound the FP32 tile.
     if _batched_reduction_rows(topk, max_blocks, batch, num_heads):
         row_tile = _REDUCTION_ROW_TILE
         _prefill_topk_rows_enflame[(triton.cdiv(max_query_len, row_tile), batch, num_heads)](
