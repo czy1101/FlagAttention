@@ -53,6 +53,7 @@ def test_unknown_attribute():
     "vendor, device",
     [
         ("nvidia", "cuda"),
+        ("kunlunxin", "cuda"),
         ("amd", "cuda"),
         ("hygon", "cuda"),
         ("iluvatar", "cuda"),
@@ -136,6 +137,19 @@ def test_cuda_compatible_vendors(
     driver = SimpleNamespace(active=SimpleNamespace(get_current_target=lambda: target))
     monkeypatch.setattr(triton.runtime, "driver", driver)
     assert device_finder.detect_vendor() == vendor
+
+
+def test_flagtree_xpu_launcher_identifies_kunlunxin(automatic_vendor, monkeypatch):
+    monkeypatch.setattr(device_finder, "_is_available", lambda name: name == "cuda")
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "GPU")
+    target = SimpleNamespace(backend="cuda", arch=3, warp_size=1)
+    launcher = SimpleNamespace(__module__="triton.backends.xpu.driver")
+    active = SimpleNamespace(get_current_target=lambda: target, launcher_cls=launcher)
+    monkeypatch.setattr(triton.runtime, "driver", SimpleNamespace(active=active))
+
+    detected = device_finder.DeviceDetector()
+    assert detected.vendor_name == "kunlunxin"
+    assert detected.name == "cuda"
 
 
 def test_missing_triton_driver_does_not_break_metadata(automatic_vendor, monkeypatch):
