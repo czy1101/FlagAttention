@@ -38,10 +38,10 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from benchmark.base import Benchmark
+    from benchmark.base import Benchmark, BenchmarkConfig
     from benchmark.recording import BenchmarkRecorder
 except ModuleNotFoundError:
-    from base import Benchmark
+    from base import Benchmark, BenchmarkConfig
     from recording import BenchmarkRecorder
 
 from flag_attn.testing import backend as test_backend
@@ -326,6 +326,7 @@ class InklingFA4Benchmark(Benchmark):
     def __init__(self, args):
         super().__init__(
             op_name="inkling_fa4_rel_attention", torch_op=None, dtypes=[DTYPE],
+            config=BenchmarkConfig(warmup_ms=args.warmup, rep_ms=args.rep),
         )
         self.args = args
         self.cases = [
@@ -350,10 +351,7 @@ class InklingFA4Benchmark(Benchmark):
         for _ in range(3):
             run()
         test_backend.device_fn.synchronize()
-        return float(test_backend.do_bench(
-            run, warmup=self.args.warmup, rep=self.args.rep,
-            return_mode="median",
-        ))
+        return super().get_latency(run)
 
     def run(self, record_property=None) -> None:
         if not test_backend.supports_operator(self.op_name):
@@ -368,8 +366,8 @@ class InklingFA4Benchmark(Benchmark):
             self.backends["official_cute"].fn
             if "official_cute" in self.backends else None
         )
-        self.set_gems(self.backends["triton"].fn if "triton" in self.backends else None)
-        self.init_user_config()
+        if "triton" in self.backends:
+            self.set_flagattn(self.backends["triton"].fn)
         prepared = {
             data.config.name: data
             for (data,) in self.get_input_iter(DTYPE)
@@ -398,7 +396,7 @@ class InklingFA4Benchmark(Benchmark):
                         "case": case.name,
                         **{f"{name} (ms)": value for name, value in latencies.items()},
                     })
-                    if self.gems_op is not None:
+                    if self.flagattn_op is not None:
                         recorder.add(
                             shape_detail={
                                 "case": case.name, "num_splits": splits,
